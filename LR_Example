@@ -1,0 +1,25 @@
+import numpy as np
+from sklearn.linear_model import LinearRegression
+
+def forecast_next_value(values):
+    # Reshape the input array if it's one-dimensional
+    if len(values.shape) == 1:
+        values = values.reshape(-1, 1)
+
+    # Extract features and target values
+    X = np.arange(1, len(values) + 1).reshape(-1, 1)
+    y = values
+
+    # Initialize and fit the linear regression model
+    model = LinearRegression()
+    model.fit(X, y)
+
+    # Forecast the next value
+    next_value = model.predict([[len(values) + 1]])
+
+    return next_value[0]
+
+# Example usage
+data = np.array([10, 20, 30, 40])  # Input array of 4 values
+forecast = forecast_next_value(data)
+print("Forecasted next value:", forecast)
