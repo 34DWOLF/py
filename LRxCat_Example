@@ -1,0 +1,49 @@
+from sklearn.linear_model import LinearRegression
+from sklearn.model_selection import train_test_split
+import pandas as pd
+import numpy as np
+
+# Prepare the input data
+data = [
+    ('2023-01-01', 10, 'A'),
+    ('2023-01-02', 15, 'B'),
+    ('2023-01-03', 20, 'C'),
+    ('2023-01-04', 12, 'A'),
+    ('2023-01-05', 18, 'B'),
+    ('2023-01-06', 25, 'C'),
+    # ...
+]
+
+# Convert the input data to a DataFrame
+df = pd.DataFrame(data, columns=['date', 'value', 'category'])
+
+# Create lagged features
+df['lagged_value'] = df.groupby('category')['value'].shift(1)
+
+# Drop rows with missing lagged values
+df.dropna(inplace=True)
+
+# Split the data into features (X) and target (y)
+X = df[['lagged_value']]
+y = df['value']
+
+# Split the data into training and testing sets
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+
+# Create and train the lagged linear regression model
+model = LinearRegression()
+model.fit(X_train, y_train)
+
+# Get the last date for each category
+last_dates = df.groupby('category')['date'].last()
+
+results = []
+for category, last_date in last_dates.items():
+    last_value = df[(df['category'] == category) & (df['date'] == last_date)]['value'].iloc[0]
+    next_value = model.predict([[last_value]])[0]
+    results.append((last_date, next_value, category))
+
+# Create a DataFrame with the predicted results
+result_df = pd.DataFrame(results, columns=['date', 'predicted_value', 'category'])
+
+print(result_df)
