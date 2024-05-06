@@ -40,7 +40,7 @@ last_dates = df.groupby('category')['date'].last()
 results = []
 for category, last_date in last_dates.items():
     last_value = df[(df['category'] == category) & (df['date'] == last_date)]['value'].iloc[0]
-    next_value = model.predict([[last_value]])[0]
+    next_value = model.predict(pd.DataFrame([[last_value]], columns=['lagged_value']))[0]
     results.append((last_date, next_value, category))
 
 # Create a DataFrame with the predicted results
