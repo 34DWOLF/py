@@ -1,49 +1,53 @@
-from sklearn.linear_model import LinearRegression
-from sklearn.model_selection import train_test_split
 import pandas as pd
-import numpy as np
+from sklearn.linear_model import LinearRegression
 
-# Prepare the input data
-data = [
-    ('2023-01-01', 10, 'A'),
-    ('2023-01-02', 15, 'B'),
-    ('2023-01-03', 20, 'C'),
-    ('2023-01-04', 12, 'A'),
-    ('2023-01-05', 18, 'B'),
-    ('2023-01-06', 25, 'C'),
-    # ...
-]
+# Create a DataFrame from the given data
+data = []
 
-# Convert the input data to a DataFrame
-df = pd.DataFrame(data, columns=['date', 'value', 'category'])
+df = pd.DataFrame(data, columns=['Date', 'Value', 'Category'])
+df['Date'] = pd.to_datetime(df['Date'])
 
 # Create lagged features
-df['lagged_value'] = df.groupby('category')['value'].shift(1)
+lagged_df = pd.DataFrame()
+for i in range(1, 4):
+    lagged_df[f'Lag_{i}'] = df.groupby('Category')['Value'].shift(i)
 
-# Drop rows with missing lagged values
-df.dropna(inplace=True)
+# Merge lagged features with the original DataFrame
+df_with_lags = pd.concat([df, lagged_df], axis=1)
 
-# Split the data into features (X) and target (y)
-X = df[['lagged_value']]
-y = df['value']
+# Remove rows with missing values
+df_with_lags = df_with_lags.dropna()
 
-# Split the data into training and testing sets
-X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+# Create features (X) and target (y)
+X = df_with_lags[['Lag_1', 'Lag_2', 'Lag_3']]
+y = df_with_lags['Value']
 
-# Create and train the lagged linear regression model
+# Create and train the model
 model = LinearRegression()
-model.fit(X_train, y_train)
+model.fit(X, y)
 
-# Get the last date for each category
-last_dates = df.groupby('category')['date'].last()
+# Get the next date for prediction
+next_date = df['Date'].max() + pd.Timedelta(days=1)
 
-results = []
-for category, last_date in last_dates.items():
-    last_value = df[(df['category'] == category) & (df['date'] == last_date)]['value'].iloc[0]
-    next_value = model.predict(pd.DataFrame([[last_value]], columns=['lagged_value']))[0]
-    results.append((last_date, next_value, category))
+# Create a DataFrame to store the predicted values
+predictions_df = pd.DataFrame(columns=['Date', 'Category', 'Value'])
 
-# Create a DataFrame with the predicted results
-result_df = pd.DataFrame(results, columns=['date', 'predicted_value', 'category'])
+# Predict the next value for each category
+for category in df['Category'].unique():
+    # Get the last 3 values for the category
+    last_values = df[df['Category'] == category]['Value'].tail(3)
+    
+    # Create the input features for prediction
+    input_features = last_values.values.reshape(1, -1)
+    
+    # Create a DataFrame with the input features and set the column names
+    input_df = pd.DataFrame(input_features, columns=['Lag_1', 'Lag_2', 'Lag_3'])
+    
+    # Predict the next value
+    next_value = model.predict(input_df)[0]
+    
+    # Append the predicted value to the predictions DataFrame
+    predictions_df = pd.concat([predictions_df, pd.DataFrame({'Date': [next_date], 'Category': [category], 'Value': [next_value]})], ignore_index=True)
 
-print(result_df)
+# Print the predictions DataFrame
+print(predictions_df)
