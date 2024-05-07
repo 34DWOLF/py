@@ -48,4 +48,11 @@ for difficulty in df['Difficulty'].unique():
     new_row = pd.DataFrame({'Date': [next_date], 'Difficulty': [difficulty], 'Rate': [next_value]})
     
     # Filter out empty or all-NA columns before concatenation
-    valid_colu
+    valid_columns = new_row.columns[new_row.notna().any()]
+    new_row = new_row[valid_columns]
+    
+    # Concatenate the new row to the predictions DataFrame
+    predictions_df = pd.concat([predictions_df, new_row], ignore_index=True)
+
+# Rename the 'predictions_df' DataFrame to 'predicted_table'
+predicted_table = predictions_df
