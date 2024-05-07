@@ -33,23 +33,19 @@ predictions_df = pd.DataFrame(columns=['Date', 'Difficulty', 'Rate'])
 # Predict the next value for each category
 for difficulty in df['Difficulty'].unique():
     # Get the last 3 values for the difficulty
-    last_values = df_with_lags[df_with_lags['Difficulty'] == difficulty][['Lag_1', 'Lag_2', 'Lag_3']].iloc[-1]
+    last_values = df_with_lags[df_with_lags['Difficulty'] == difficulty][['Lag_1', 'Lag_2', 'Lag_3']].tail(1)
     
     # Create the input features for prediction
     input_features = last_values.values.reshape(1, -1)
     
+    # Create a DataFrame with the input features and set the column names
+    input_df = pd.DataFrame(input_features, columns=['Lag_1', 'Lag_2', 'Lag_3'])
+    
     # Predict the next value
-    next_value = model.predict(input_features)[0]
+    next_value = model.predict(input_df)[0]
     
     # Create a new DataFrame with the predicted value
     new_row = pd.DataFrame({'Date': [next_date], 'Difficulty': [difficulty], 'Rate': [next_value]})
     
     # Filter out empty or all-NA columns before concatenation
-    valid_columns = new_row.columns[new_row.notna().any()]
-    new_row = new_row[valid_columns]
-    
-    # Concatenate the new row to the predictions DataFrame
-    predictions_df = pd.concat([predictions_df, new_row], ignore_index=True)
-
-# Rename the 'predictions_df' DataFrame to 'predicted_table'
-predicted_table = predictions_df
+    valid_colu
