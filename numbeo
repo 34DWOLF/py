@@ -1,0 +1,324 @@
+##https://www.numbeo.com/crime/country_result.jsp
+import time
+import requests
+from bs4 import BeautifulSoup
+import pandas as pd
+from urllib.parse import quote_plus
+
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/100.0.0.0 Safari/537.36"
+    )
+}
+
+def get_numbeo_crime_data(country_name):
+    url = (
+        "https://www.numbeo.com/crime/"
+        f"country_result.jsp?country={quote_plus(country_name)}"
+    )
+    resp = requests.get(url, headers=HEADERS, timeout=10)
+    resp.raise_for_status()
+    soup = BeautifulSoup(resp.text, "html.parser")
+
+    # Top-level indices
+    idxs = soup.select("div.indexcrime")
+    crime_idx  = idxs[0].get_text(strip=True) if len(idxs) > 0 else None
+    safety_idx = idxs[1].get_text(strip=True) if len(idxs) > 1 else None
+
+    # Detailed sub-indices
+    sub_idx = {}
+    for table in soup.find_all("table", class_="table_indices"):
+        for row in table.find_all("tr"):
+            cols = row.find_all("td")
+            if not cols:
+                continue
+
+            label = cols[0].get_text(strip=True).rstrip(":")
+            if len(cols) == 2:
+                value = cols[1].get_text(strip=True)
+            elif len(cols) == 3:
+                num   = cols[1].get_text(strip=True)
+                rate  = cols[2].get_text(strip=True)
+                value = f"{num} {rate}"
+            else:
+                value = " | ".join(td.get_text(strip=True) for td in cols[1:])
+
+            sub_idx[label] = value
+
+    return {
+        "Country":      country_name,
+        "Crime Index":  crime_idx,
+        "Safety Index": safety_idx,
+        **sub_idx
+    }
+
+def country_list():
+    # ---- HARD-CODED LIST OF COUNTRIES ----
+    #countries = ["Afghanistan", "Aland Islands", "Albania", "Alderney", "Algeria", "American Samoa", "Andorra", "Angola", "Anguilla", "Antigua And Barbuda", "Argentina", "Armenia", "Aruba", "Australia", "Austria", "Azerbaijan", "Bahamas", "Bahrain", "Bangladesh", "Barbados", "Belarus", "Belgium", "Belize", "Benin", "Bermuda", "Bhutan", "Bolivia", "Bonaire", "Bosnia And Herzegovina", "Botswana", "Brazil", "British Virgin Islands", "Brunei", "Bulgaria", "Burkina Faso", "Burundi", "Cambodia", "Cameroon", "Canada", "Cape Verde", "Cayman Islands", "Central African Republic", "Chad", "Chile", "China", "Colombia", "Comoros", "Cook Islands", "Costa Rica", "Croatia", "Cuba", "Curacao", "Cyprus", "Czech Republic", "Democratic Republic of the Congo", "Denmark", "Djibouti", "Dominica", "Dominican Republic", "Ecuador", "Egypt", "El Salvador", "Equatorial Guinea", "Eritrea", "Estonia", "Eswatini", "Ethiopia", "Falkland Islands", "Faroe Islands", "Fiji", "Finland", "France", "French Guiana", "French Polynesia", "French Southern Territories", "Gabon", "Gambia", "Georgia", "Germany", "Ghana", "Gibraltar", "Greece", "Greenland", "Grenada", "Guadeloupe", "Guam", "Guatemala", "Guernsey", "Guinea", "Guinea-Bissau", "Guyana", "Haiti", "Honduras", "Hong Kong (China)", "Hungary", "Iceland", "India", "Indonesia", "Iran", "Iraq", "Ireland", "Isle Of Man", "Israel", "Italy", "Ivory Coast", "Jamaica", "Japan", "Jersey", "Jordan", "Kazakhstan", "Kenya", "Kiribati", "Kosovo (Disputed Territory)", "Kuwait", "Kyrgyzstan", "Laos", "Latvia", "Lebanon", "Lesotho", "Liberia", "Libya", "Liechtenstein", "Lithuania", "Luxembourg", "Macao (China)", "Madagascar", "Malawi", "Malaysia", "Maldives", "Mali", "Malta", "Marshall Islands", "Martinique", "Mauritania", "Mauritius", "Mexico", "Micronesia", "Moldova", "Monaco", "Mongolia", "Montenegro", "Montserrat", "Morocco", "Mozambique", "Myanmar", "Namibia", "Nauru", "Nepal", "Netherlands", "New Caledonia", "New Zealand", "Nicaragua", "Niger", "Nigeria", "Niue", "North Korea", "North Macedonia", "Northern Mariana Islands", "Norway", "Oman", "Pakistan", "Palau", "Palestine", "Panama", "Papua New Guinea", "Paraguay", "Peru", "Philippines", "Poland", "Portugal", "Puerto Rico", "Qatar", "Republic of the Congo", "Reunion", "Romania", "Russia", "Rwanda", "Saint Helena", "Saint Kitts And Nevis", "Saint Lucia", "Saint Vincent And The Grenadines", "Saint-Pierre And Miquelon", "Samoa", "San Marino", "Sao Tome And Principe", "Saudi Arabia", "Senegal", "Serbia", "Seychelles", "Sierra Leone", "Singapore", "Sint Maarten", "Slovakia", "Slovenia", "Solomon Islands", "Somalia", "South Africa", "South Korea", "South Sudan", "Spain", "Sri Lanka", "Sudan", "Suriname", "Sweden", "Switzerland", "Syria", "Taiwan", "Tajikistan", "Tanzania", "Thailand", "Timor-Leste", "Togo", "Tonga", "Trinidad And Tobago", "Tunisia", "Turkey", "Turkmenistan", "Turks And Caicos Islands", "Uganda", "Ukraine", "United Arab Emirates", "United Kingdom", "United States", "Uruguay", "Us Virgin Islands", "Uzbekistan", "Vanuatu", "Venezuela", "Vietnam", "Wallis And Futuna", "Western Sahara", "Yemen", "Zambia", "Zimbabwe", 
+
+    records = []
+    for i, country in enumerate(countries, 1):
+        try:
+            print(f"[{i}/{len(countries)}] Fetching {country}...")
+            rec = get_numbeo_crime_data(country)
+            records.append(rec)
+        except Exception as e:
+            print(f"  → Error fetching {country}: {e}")
+        time.sleep(1)  # be polite
+
+    # Build DataFrame & print
+    df = pd.DataFrame(records)
+    pd.set_option('display.max_rows',    None)
+    pd.set_option('display.max_columns', None)
+    pd.set_option('display.width',       None)
+
+    print("\n=== Numbeo Crime & Safety Data ===\n")
+    print(df)
+
+df = country_list()
+display(df)
+
+
+
+
+
+
+"""
+                              Country Crime Index Safety Index
+0                         Afghanistan       75.23        24.77
+1                       Aland Islands       28.31        71.69
+2                             Albania       44.02        55.98
+3                            Alderney       16.21        83.79
+4                             Algeria       52.98        47.02
+5                      American Samoa       45.59        54.41
+6                             Andorra       15.20        84.80
+7                              Angola       66.29        33.71
+8                            Anguilla       24.56        75.44
+9                 Antigua And Barbuda       51.10        48.90
+10                          Argentina       63.27        36.73
+11                            Armenia       22.17        77.83
+12                              Aruba       30.81        69.19
+13                          Australia       47.39        52.61
+14                            Austria       29.02        70.98
+15                         Azerbaijan       31.64        68.36
+16                            Bahamas       56.94        43.06
+17                            Bahrain       24.46        75.54
+18                         Bangladesh       61.47        38.53
+19                           Barbados       44.86        55.14
+20                            Belarus       49.34        50.66
+21                            Belgium       49.38        50.62
+22                             Belize       52.71        47.29
+23                              Benin       42.00        58.00
+24                            Bermuda       36.04        63.96
+25                             Bhutan       29.55        70.45
+26                            Bolivia       64.74        35.26
+27                            Bonaire       37.05        62.95
+28             Bosnia And Herzegovina       41.30        58.70
+29                           Botswana       50.92        49.08
+30                             Brazil       64.29        35.71
+31             British Virgin Islands       40.69        59.31
+32                             Brunei       29.36        70.64
+33                           Bulgaria       35.89        64.11
+34                       Burkina Faso       42.41        57.59
+35                            Burundi       56.56        43.44
+36                           Cambodia       50.09        49.91
+37                           Cameroon       65.47        34.53
+38                             Canada       45.82        54.18
+39                         Cape Verde       50.96        49.04
+40                     Cayman Islands       30.59        69.41
+41           Central African Republic       84.11        15.89
+42                               Chad       63.80        36.20
+43                              Chile       60.49        39.51
+44                              China       23.68        76.32
+45                           Colombia       60.87        39.13
+46                            Comoros       47.06        52.94
+47                       Cook Islands       30.92        69.08
+48                         Costa Rica       53.89        46.11
+49                            Croatia       25.40        74.60
+50                               Cuba       34.00        66.00
+51                            Curacao       54.70        45.30
+52                             Cyprus       33.35        66.65
+53                     Czech Republic       26.58        73.42
+54   Democratic Republic of the Congo       66.16        33.84
+55                            Denmark       26.02        73.98
+56                           Djibouti       55.80        44.20
+57                           Dominica       53.58        46.42
+58                 Dominican Republic       60.51        39.49
+59                            Ecuador       62.62        37.38
+60                              Egypt       47.12        52.88
+61                        El Salvador       57.43        42.57
+62                  Equatorial Guinea       40.97        59.03
+63                            Eritrea       27.14        72.86
+64                            Estonia       23.55        76.45
+65                           Eswatini       43.55        56.45
+66                           Ethiopia       50.55        49.45
+67                   Falkland Islands       44.36        55.64
+68                      Faroe Islands       16.22        83.78
+69                               Fiji       56.56        43.44
+70                            Finland       26.50        73.50
+71                             France       55.62        44.38
+72                      French Guiana       63.13        36.87
+73                   French Polynesia       20.96        79.04
+74        French Southern Territories       46.32        53.68
+75                              Gabon       59.60        40.40
+76                             Gambia       60.71        39.29
+77                            Georgia       26.20        73.80
+78                            Germany       39.60        60.40
+79                              Ghana       45.27        54.73
+80                          Gibraltar       20.23        79.77
+81                             Greece       46.33        53.67
+82                          Greenland       40.42        59.58
+83                            Grenada       24.93        75.07
+84                         Guadeloupe       27.82        72.18
+85                               Guam       63.66        36.34
+86                          Guatemala       57.67        42.33
+87                           Guernsey       23.24        76.76
+88                             Guinea       60.05        39.95
+89                      Guinea-Bissau       52.23        47.77
+90                             Guyana       66.06        33.94
+91                              Haiti       80.46        19.54
+92                           Honduras       72.03        27.97
+93                  Hong Kong (China)       21.35        78.65
+94                            Hungary       33.67        66.33
+95                            Iceland       25.70        74.30
+96                              India       44.25        55.75
+97                          Indonesia       46.05        53.95
+98                               Iran       50.57        49.43
+99                               Iraq       42.11        57.89
+100                           Ireland       47.60        52.40
+101                       Isle Of Man       20.90        79.10
+102                            Israel       31.79        68.21
+103                             Italy       47.16        52.84
+104                       Ivory Coast       56.43        43.57
+105                           Jamaica       67.55        32.45
+106                             Japan       22.78        77.22
+107                            Jersey       25.68        74.32
+108                            Jordan       39.93        60.07
+109                        Kazakhstan       45.15        54.85
+110                             Kenya       55.86        44.14
+111                          Kiribati       18.14        81.86
+112       Kosovo (Disputed Territory)       40.91        59.09
+113                            Kuwait       32.67        67.33
+114                        Kyrgyzstan       52.49        47.51
+115                              Laos       36.28        63.72
+116                            Latvia       36.92        63.08
+117                           Lebanon       46.80        53.20
+118                           Lesotho       67.25        32.75
+119                           Liberia       79.34        20.66
+120                             Libya       56.30        43.70
+121                     Liechtenstein        7.10        92.90
+122                         Lithuania       32.79        67.21
+123                        Luxembourg       33.96        66.04
+124                     Macao (China)       18.52        81.48
+125                        Madagascar       64.41        35.59
+126                            Malawi       56.11        43.89
+127                          Malaysia       48.65        51.35
+128                          Maldives       54.13        45.87
+129                              Mali       47.08        52.92
+130                             Malta       42.85        57.15
+131                  Marshall Islands       27.45        72.55
+132                        Martinique       62.86        37.14
+133                        Mauritania       38.49        61.51
+134                         Mauritius       50.03        49.97
+135                            Mexico       53.32        46.68
+136                        Micronesia       44.13        55.87
+137                           Moldova       44.67        55.33
+138                            Monaco       23.63        76.37
+139                          Mongolia       52.06        47.94
+140                        Montenegro       35.50        64.50
+141                        Montserrat        6.62        93.38
+142                           Morocco       47.85        52.15
+143                        Mozambique       60.47        39.53
+144                           Myanmar       50.91        49.09
+145                           Namibia       63.49        36.51
+146                             Nauru       50.95        49.05
+147                             Nepal       36.38        63.62
+148                       Netherlands       25.88        74.12
+149                     New Caledonia       63.77        36.23
+150                       New Zealand       48.33        51.67
+151                         Nicaragua       50.75        49.25
+152                             Niger       69.12        30.88
+153                           Nigeria       66.75        33.25
+154                              Niue           ?            ?
+155                       North Korea       37.51        62.49
+156                   North Macedonia       40.92        59.08
+157          Northern Mariana Islands       35.97        64.03
+158                            Norway       33.08        66.92
+159                              Oman       18.56        81.44
+160                          Pakistan       43.85        56.15
+161                             Palau       22.89        77.11
+162                         Palestine       43.43        56.57
+163                            Panama       42.68        57.32
+164                  Papua New Guinea       79.97        20.03
+165                          Paraguay       60.16        39.84
+166                              Peru       66.77        33.23
+167                       Philippines       43.38        56.62
+168                            Poland       28.80        71.20
+169                          Portugal       32.37        67.63
+170                       Puerto Rico       61.20        38.80
+171                             Qatar       15.47        84.53
+172             Republic of the Congo       54.29        45.71
+173                           Reunion       46.99        53.01
+174                           Romania       32.54        67.46
+175                            Russia       38.50        61.50
+176                            Rwanda       26.57        73.43
+177                      Saint Helena        7.35        92.65
+178             Saint Kitts And Nevis       40.02        59.98
+179                       Saint Lucia       62.48        37.52
+180  Saint Vincent And The Grenadines       37.78        62.22
+181         Saint-Pierre And Miquelon           ?            ?
+182                             Samoa       42.06        57.94
+183                        San Marino       22.99        77.01
+184             Sao Tome And Principe       17.44        82.56
+185                      Saudi Arabia       23.71        76.29
+186                           Senegal       52.09        47.91
+187                            Serbia       37.11        62.89
+188                        Seychelles       44.99        55.01
+189                      Sierra Leone       57.10        42.90
+190                         Singapore       22.65        77.35
+191                      Sint Maarten       33.30        66.70
+192                          Slovakia       31.02        68.98
+193                          Slovenia       24.10        75.90
+194                   Solomon Islands       63.87        36.13
+195                           Somalia       62.76        37.24
+196                      South Africa       74.70        25.30
+197                       South Korea       26.10        73.90
+198                       South Sudan       80.15        19.85
+199                             Spain       37.01        62.99
+200                         Sri Lanka       42.26        57.74
+201                             Sudan       45.10        54.90
+202                          Suriname       52.88        47.12
+203                            Sweden       48.06        51.94
+204                       Switzerland       26.81        73.19
+205                             Syria       68.42        31.58
+206                            Taiwan       17.11        82.89
+207                        Tajikistan       50.79        49.21
+208                          Tanzania       53.36        46.64
+209                          Thailand       36.90        63.10
+210                       Timor-Leste       41.32        58.68
+211                              Togo       45.16        54.84
+212                             Tonga       60.98        39.02
+213               Trinidad And Tobago       70.80        29.20
+214                           Tunisia       45.08        54.92
+215                            Turkey       41.30        58.70
+216                      Turkmenistan       47.32        52.68
+217          Turks And Caicos Islands       48.88        51.12
+218                            Uganda       54.12        45.88
+219                           Ukraine       47.09        52.91
+220              United Arab Emirates       14.81        85.19
+221                    United Kingdom       48.32        51.68
+222                     United States       49.20        50.80
+223                           Uruguay       52.30        47.70
+224                 Us Virgin Islands       59.17        40.83
+225                        Uzbekistan       27.21        72.79
+226                           Vanuatu       41.65        58.35
+227                         Venezuela       80.50        19.50
+228                           Vietnam       40.44        59.56
+229                 Wallis And Futuna       52.94        47.06
+230                    Western Sahara       26.68        73.32
+231                             Yemen       62.95        37.05
+232                            Zambia       45.61        54.39
+233                          Zimbabwe       60.70        39.30
+"""
