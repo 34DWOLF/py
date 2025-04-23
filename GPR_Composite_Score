@@ -3,42 +3,14 @@ import numpy as np
 from statsmodels.tsa.arima.model import ARIMA
 import re
 import warnings
-import sqlalchemy
 warnings.filterwarnings('ignore')
 
-def get_data_from_sql(connection_string, query):
-    """
-    Retrieve GPR data from a SQL database.
-    
-    Parameters:
-    connection_string (str): SQLAlchemy connection string
-    query (str): SQL query to retrieve the GPR data
-    
-    Returns:
-    pandas.DataFrame: DataFrame containing the GPR data
-    """
-    try:
-        # Create SQLAlchemy engine
-        engine = sqlalchemy.create_engine(connection_string)
-        
-        # Execute query and load results into DataFrame
-        df = pd.read_sql(query, engine)
-        
-        print(f"Data loaded from SQL with {len(df)} rows")
-        return df
-    
-    except Exception as e:
-        print(f"Error retrieving data from SQL: {e}")
-        raise
-
-def create_composite_gpr(connection_string=None, query=None, df=None, weights=None):
+def create_composite_gpr(file_path, weights=None):
     """
     Create a composite GPR rating using the Dario Caldara and Matteo Iacoviello Geopolitical Risk data.
     
     Parameters:
-    connection_string (str, optional): SQLAlchemy connection string
-    query (str, optional): SQL query to retrieve the GPR data
-    df (pandas.DataFrame, optional): DataFrame containing the GPR data (if already loaded)
+    file_path (str): Path to the CSV file containing GPR data
     weights (dict): Dictionary containing weights for each component of the composite score
     
     Returns:
@@ -60,23 +32,12 @@ def create_composite_gpr(connection_string=None, query=None, df=None, weights=No
         for key in weights:
             weights[key] = weights[key] / weight_sum
     
-    # Get data from SQL if DataFrame not provided
-    if df is None:
-        if connection_string is None or query is None:
-            raise ValueError("Either a DataFrame or connection string and query must be provided")
-        
-        df = get_data_from_sql(connection_string, query)
-    else:
-        print(f"Using provided DataFrame with {len(df)} rows")
+    # Read the data
+    df = pd.read_csv(file_path)
+    print(f"Data loaded with {len(df)} rows")
     
-    # Ensure date column exists
-    if 'date' not in df.columns:
-        if 'month' in df.columns:
-            df['date'] = pd.to_datetime(df['month'])
-        else:
-            raise ValueError("DataFrame must contain either 'date' or 'month' column")
-    elif not pd.api.types.is_datetime64_any_dtype(df['date']):
-        df['date'] = pd.to_datetime(df['date'])
+    # Convert month column to datetime
+    df['date'] = pd.to_datetime(df['month'])
     
     # Get all country codes from columns
     current_gpr_cols = [col for col in df.columns if col.startswith('GPRC_')]
@@ -224,46 +185,8 @@ def create_composite_gpr(connection_string=None, query=None, df=None, weights=No
     return result_df
 
 def main():
-    # SQL Connection string
-    # Format: "dialect+driver://username:password@host:port/database"
-    connection_string = "mssql+pyodbc://username:password@server/database?driver=ODBC+Driver+17+for+SQL+Server"
-    
-    # SQL query to retrieve GPR data
-    query = """
-    SELECT 
-        month, 
-        GPR, GPRT, GPRA, GPRH, GPRHT, GPRHA, 
-        SHARE_GPR, N10, SHARE_GPRH, N3H, 
-        GPRH_NOEW, GPR_NOEW, GPRH_AND, GPR_AND, 
-        GPRH_BASIC, GPR_BASIC, 
-        SHAREH_CAT_1, SHAREH_CAT_2, SHAREH_CAT_3, 
-        SHAREH_CAT_4, SHAREH_CAT_5, SHAREH_CAT_6, 
-        SHAREH_CAT_7, SHAREH_CAT_8,
-        -- Country GPR columns
-        GPRC_ARG, GPRC_AUS, GPRC_BEL, GPRC_BRA, GPRC_CAN, 
-        GPRC_CHE, GPRC_CHL, GPRC_CHN, GPRC_COL, GPRC_DEU, 
-        GPRC_DNK, GPRC_EGY, GPRC_ESP, GPRC_FIN, GPRC_FRA, 
-        GPRC_GBR, GPRC_HKG, GPRC_HUN, GPRC_IDN, GPRC_IND, 
-        GPRC_ISR, GPRC_ITA, GPRC_JPN, GPRC_KOR, GPRC_MEX, 
-        GPRC_MYS, GPRC_NLD, GPRC_NOR, GPRC_PER, GPRC_PHL, 
-        GPRC_POL, GPRC_PRT, GPRC_RUS, GPRC_SAU, GPRC_SWE, 
-        GPRC_THA, GPRC_TUN, GPRC_TUR, GPRC_TWN, GPRC_UKR, 
-        GPRC_USA, GPRC_VEN, GPRC_VNM, GPRC_ZAF,
-        -- Country Historical GPR columns
-        GPRHC_ARG, GPRHC_AUS, GPRHC_BEL, GPRHC_BRA, GPRHC_CAN, 
-        GPRHC_CHE, GPRHC_CHL, GPRHC_CHN, GPRHC_COL, GPRHC_DEU, 
-        GPRHC_DNK, GPRHC_EGY, GPRHC_ESP, GPRHC_FIN, GPRHC_FRA, 
-        GPRHC_GBR, GPRHC_HKG, GPRHC_HUN, GPRHC_IDN, GPRHC_IND, 
-        GPRHC_ISR, GPRHC_ITA, GPRHC_JPN, GPRHC_KOR, GPRHC_MEX, 
-        GPRHC_MYS, GPRHC_NLD, GPRHC_NOR, GPRHC_PER, GPRHC_PHL, 
-        GPRHC_POL, GPRHC_PRT, GPRHC_RUS, GPRHC_SAU, GPRHC_SWE, 
-        GPRHC_THA, GPRHC_TUN, GPRHC_TUR, GPRHC_TWN, GPRHC_UKR, 
-        GPRHC_USA, GPRHC_VEN, GPRHC_VNM, GPRHC_ZAF,
-        -- Variable metadata
-        var_name, var_label
-    FROM 
-        gpr_data
-    """
+    # File path to the GPR data
+    file_path = ''
     
     # Define weights (can be adjusted by user)
     weights = {
@@ -274,34 +197,16 @@ def main():
         'forecast': 0.2           # Weight for forecasted GPR
     }
     
-    # Create composite GPR from SQL database
-    try:
-        result_df = create_composite_gpr(connection_string=connection_string, query=query, weights=weights)
-        
-        # Display results
-        print(f"Composite GPR Ratings (weights: {weights})")
-        print(f"Total countries analyzed: {len(result_df)}")
-        display(result_df)
-        
-        # Return the result dataframe (though it's not saved as per requirements)
-        return result_df
+    # Create composite GPR
+    result_df = create_composite_gpr(file_path, weights)
     
-    except Exception as e:
-        print(f"Error creating composite GPR rating: {e}")
-        return None
-
-def create_composite_gpr_from_existing_df(df, weights=None):
-    """
-    Convenience wrapper to create composite GPR from an existing DataFrame
+    # Display results
+    print(f"Composite GPR Ratings (weights: {weights})")
+    print(f"Total countries analyzed: {len(result_df)}")
+    display(result_df)
     
-    Parameters:
-    df (pandas.DataFrame): DataFrame containing the GPR data
-    weights (dict): Dictionary containing weights for each component of the composite score
-    
-    Returns:
-    pandas.DataFrame: DataFrame containing the composite GPR scores
-    """
-    return create_composite_gpr(df=df, weights=weights)
+    # Return the result dataframe (though it's not saved as per requirements)
+    return result_df
 
 if __name__ == "__main__":
     main()
