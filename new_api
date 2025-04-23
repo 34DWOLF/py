@@ -1,0 +1,282 @@
+from newsapi import NewsApiClient
+import pandas as pd
+from datetime import datetime, timedelta
+from IPython.display import display, HTML
+import re
+
+# Init
+newsapi = NewsApiClient(api_key='3670e7abb17046868bdba56e01af3449')
+
+# =======================================
+# USER CONFIGURATION - MODIFY HERE ONLY
+# =======================================
+# List of places to search for (countries, states, cities, etc.)
+PLACES = ["Mexico", "China", "Ireland"]
+
+# List of keywords to search for (with regex patterns to match variations)
+KEYWORDS = {
+    "Terrorism": r"terroris[tm]|terror attack"
+    ,"Cartel": r"cartel"
+    ,"Violence": r"violen[ct]"
+    # ,"Trump": r"trump"
+}
+
+# Words to exclude (articles containing these will be filtered out)
+EXCLUDE_WORDS = ["Test"]
+
+# Number of days to look back
+DAYS_LOOKBACK = 30
+
+# Number of results per page
+RESULTS_PER_PAGE = 100
+# =======================================
+
+# Calculate dates for the search period
+today = datetime.now()
+past_date = today - timedelta(days=DAYS_LOOKBACK)
+from_date = past_date.strftime('%Y-%m-%d')
+to_date = today.strftime('%Y-%m-%d')
+
+print(f"Searching for articles from {from_date} to {to_date}\n")
+print(f"Places to search: {', '.join(PLACES)}")
+print(f"Keywords of interest (with regex patterns):")
+for keyword, pattern in KEYWORDS.items():
+    print(f"  - {keyword}: {pattern}")
+print(f"\nExcluding articles containing: {', '.join(EXCLUDE_WORDS)}")
+print()
+
+# Create an empty DataFrame to store all results
+all_results_df = pd.DataFrame()
+
+# Function to better display DataFrames
+def pretty_display(df, max_rows=10):
+    # Set pandas display options for better formatting
+    with pd.option_context('display.max_colwidth', 40, 
+                          'display.max_rows', max_rows):
+        # Display full DataFrame with better formatting
+        display(HTML(df.to_html(escape=False)))
+
+# Function to check if text contains a pattern (with regex)
+def contains_pattern(text, pattern):
+    if not isinstance(text, str):
+        return False
+    return bool(re.search(pattern, text, re.IGNORECASE))
+
+# Loop through each place
+for place in PLACES:
+    print(f"\n{'='*50}")
+    print(f"SEARCHING FOR: {place}")
+    print(f"{'='*50}")
+    
+    # Create the query string with all keywords using OR
+    keywords_or = " OR ".join(KEYWORDS.keys())
+    query = f"{place} AND ({keywords_or})"
+    
+    print(f"Query: {query}")
+    
+    # Search for articles
+    try:
+        articles = newsapi.get_everything(
+            q=query,
+            language='en',
+            sort_by='publishedAt',
+            page=1,
+            page_size=RESULTS_PER_PAGE,
+            from_param=from_date,
+            to=to_date
+        )
+        
+        print(f"Total Results: {articles.get('totalResults', 0)}")
+        
+        # Check if we have articles
+        if articles.get('articles') and len(articles['articles']) > 0:
+            # Get the first article to display available columns
+            if place == PLACES[0] and len(articles['articles']) > 0:
+                print("\nAvailable columns from the API:")
+                first_article = articles['articles'][0]
+                
+                # Create a DataFrame to display column structure clearly
+                api_structure = []
+                for key, value in first_article.items():
+                    if isinstance(value, dict):
+                        for subkey, subvalue in value.items():
+                            api_structure.append({
+                                'Column': f"{key}.{subkey}",
+                                'Type': type(subvalue).__name__,
+                                'Example': str(subvalue)[:40] + ('...' if str(subvalue) and len(str(subvalue)) > 40 else '')
+                            })
+                    else:
+                        api_structure.append({
+                            'Column': key,
+                            'Type': type(value).__name__,
+                            'Example': str(value)[:40] + ('...' if str(value) and len(str(value)) > 40 else '')
+                        })
+                
+                api_df = pd.DataFrame(api_structure)
+                pretty_display(api_df)
+            
+            # Convert to DataFrame
+            df_articles = pd.DataFrame(articles['articles'])
+            
+            # Add place column for tracking
+            df_articles['search_place'] = place
+            
+            # Extract source name from the nested dictionary
+            df_articles['source_name'] = df_articles.apply(
+                lambda row: row['source']['name'] if isinstance(row.get('source'), dict) and 'name' in row['source'] else None, 
+                axis=1
+            )
+            
+            # Check if title or description actually contains the place name
+            df_articles['contains_place'] = df_articles.apply(
+                lambda row: (
+                    contains_pattern(row.get('title', ''), place) or
+                    contains_pattern(row.get('description', ''), place)
+                ),
+                axis=1
+            )
+            
+            # Check if article contains any excluded words
+            df_articles['contains_excluded_word'] = df_articles.apply(
+                lambda row: any(
+                    contains_pattern(row.get('title', ''), word) or 
+                    contains_pattern(row.get('description', ''), word) 
+                    for word in EXCLUDE_WORDS
+                ),
+                axis=1
+            )
+            
+            # Initialize matched_keywords column
+            df_articles['matched_keywords'] = ''
+            df_articles['matched_patterns'] = ''
+            
+            # Check for each keyword individually using regex and update matched_keywords
+            for keyword, pattern in KEYWORDS.items():
+                keyword_col = f"has_{keyword.lower()}"
+                
+                # Check keyword presence using regex
+                df_articles[keyword_col] = df_articles.apply(
+                    lambda row: (
+                        contains_pattern(row.get('title', ''), pattern) or
+                        contains_pattern(row.get('description', ''), pattern)
+                    ),
+                    axis=1
+                )
+                
+                # For matched articles, find actual matched patterns
+                for idx, row in df_articles[df_articles[keyword_col]].iterrows():
+                    matches = set()
+                    
+                    # Check title
+                    if isinstance(row.get('title'), str):
+                        title_matches = re.finditer(pattern, row['title'], re.IGNORECASE)
+                        matches.update([m.group() for m in title_matches])
+                    
+                    # Check description
+                    if isinstance(row.get('description'), str):
+                        desc_matches = re.finditer(pattern, row['description'], re.IGNORECASE)
+                        matches.update([m.group() for m in desc_matches])
+                    
+                    # Update matched patterns
+                    if matches:
+                        matched_patterns = ', '.join(matches)
+                        if df_articles.at[idx, 'matched_patterns'] == '':
+                            df_articles.at[idx, 'matched_patterns'] = f"{keyword}: {matched_patterns}"
+                        else:
+                            df_articles.at[idx, 'matched_patterns'] += f"; {keyword}: {matched_patterns}"
+                    
+                    # Update matched keywords
+                    if df_articles.at[idx, 'matched_keywords'] == '':
+                        df_articles.at[idx, 'matched_keywords'] = keyword
+                    else:
+                        df_articles.at[idx, 'matched_keywords'] += f", {keyword}"
+            
+            # Create contains_keyword column - true if any keyword was found
+            df_articles['contains_keyword'] = df_articles.apply(
+                lambda row: row['matched_keywords'] != '',
+                axis=1
+            )
+            
+            # Filter to only include articles that: 
+            # 1. Contain the place name
+            # 2. Contain at least one keyword
+            # 3. Do NOT contain any excluded words
+            df_filtered = df_articles[
+                df_articles['contains_place'] & 
+                df_articles['contains_keyword'] & 
+                ~df_articles['contains_excluded_word']
+            ].copy()
+            
+            # Display summary for this place
+            print(f"\nFound {len(df_articles)} total articles for {place}")
+            print(f"After filtering by keywords and exclusions: {len(df_filtered)} articles")
+            
+            # Display count by keyword for filtered articles
+            for keyword in KEYWORDS.keys():
+                keyword_col = f"has_{keyword.lower()}"
+                keyword_count = df_filtered[keyword_col].sum()
+                print(f"  - Articles mentioning '{keyword}': {keyword_count}")
+            
+            # Count excluded articles
+            excluded_count = df_articles[
+                df_articles['contains_place'] & 
+                df_articles['contains_keyword'] & 
+                df_articles['contains_excluded_word']
+            ].shape[0]
+            
+            print(f"  - Articles excluded due to exclusion words: {excluded_count}")
+            
+            # Make URLs clickable
+            df_filtered['url'] = df_filtered['url'].apply(
+                lambda x: f'<a href="{x}" target="_blank">{x[:30]}...</a>' if x else '')
+            
+            # Display the first 3 articles with better formatting
+            print(f"\nFirst 3 filtered articles for {place}:")
+            display_cols = ['title', 'publishedAt', 'source_name', 'matched_keywords', 'matched_patterns', 'url']
+            display_cols = [col for col in display_cols if col in df_filtered.columns]
+            
+            if len(df_filtered) > 0:
+                pretty_display(df_filtered[display_cols].head(3))
+            else:
+                print(f"No articles found for {place} that meet all criteria.")
+            
+            # Append to all results
+            all_results_df = pd.concat([all_results_df, df_filtered], ignore_index=True)
+            
+        else:
+            print(f"No articles found for {place} with the specified keywords.")
+    
+    except Exception as e:
+        print(f"Error searching for {place}: {str(e)}")
+
+# Final output
+if len(all_results_df) > 0:
+    print(f"\n{'='*50}")
+    print(f"FINAL RESULTS")
+    print(f"{'='*50}")
+    print(f"Total articles found across all searches: {len(all_results_df)}")
+    
+    # Count by place
+    print("\nArticles by place:")
+    place_counts = all_results_df['search_place'].value_counts()
+    for place, count in place_counts.items():
+        print(f"  - {place}: {count}")
+    
+    # Count by keyword across all places
+    print("\nArticles by keyword (across all places):")
+    for keyword in KEYWORDS.keys():
+        keyword_col = f"has_{keyword.lower()}"
+        keyword_count = all_results_df[keyword_col].sum()
+        print(f"  - '{keyword}': {keyword_count}")
+    
+    # Display final DataFrame
+    print("\nFinal DataFrame - showing first 10 rows:")
+    
+    # Select columns for final display
+    final_display_cols = ['search_place', 'title', 'publishedAt', 'source_name', 'matched_keywords', 'matched_patterns', 'url']
+    final_display_cols = [col for col in final_display_cols if col in all_results_df.columns]
+    
+    # Display with better formatting
+    pretty_display(all_results_df[final_display_cols].head(25))
+else:
+    print("\nNo articles found matching the criteria.")
