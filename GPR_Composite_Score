@@ -1,0 +1,307 @@
+import pandas as pd
+import numpy as np
+from statsmodels.tsa.arima.model import ARIMA
+import re
+import warnings
+import sqlalchemy
+warnings.filterwarnings('ignore')
+
+def get_data_from_sql(connection_string, query):
+    """
+    Retrieve GPR data from a SQL database.
+    
+    Parameters:
+    connection_string (str): SQLAlchemy connection string
+    query (str): SQL query to retrieve the GPR data
+    
+    Returns:
+    pandas.DataFrame: DataFrame containing the GPR data
+    """
+    try:
+        # Create SQLAlchemy engine
+        engine = sqlalchemy.create_engine(connection_string)
+        
+        # Execute query and load results into DataFrame
+        df = pd.read_sql(query, engine)
+        
+        print(f"Data loaded from SQL with {len(df)} rows")
+        return df
+    
+    except Exception as e:
+        print(f"Error retrieving data from SQL: {e}")
+        raise
+
+def create_composite_gpr(connection_string=None, query=None, df=None, weights=None):
+    """
+    Create a composite GPR rating using the Dario Caldara and Matteo Iacoviello Geopolitical Risk data.
+    
+    Parameters:
+    connection_string (str, optional): SQLAlchemy connection string
+    query (str, optional): SQL query to retrieve the GPR data
+    df (pandas.DataFrame, optional): DataFrame containing the GPR data (if already loaded)
+    weights (dict): Dictionary containing weights for each component of the composite score
+    
+    Returns:
+    pandas.DataFrame: DataFrame containing the composite GPR scores
+    """
+    # Default weights if not provided
+    if weights is None:
+        weights = {
+            'current_gpr': 0.3,
+            'historic_gpr': 0.15,
+            'global_relative': 0.2,
+            'historic_relative': 0.15,
+            'forecast': 0.2
+        }
+    
+    # Ensure weights sum to 1
+    weight_sum = sum(weights.values())
+    if weight_sum != 1.0:
+        for key in weights:
+            weights[key] = weights[key] / weight_sum
+    
+    # Get data from SQL if DataFrame not provided
+    if df is None:
+        if connection_string is None or query is None:
+            raise ValueError("Either a DataFrame or connection string and query must be provided")
+        
+        df = get_data_from_sql(connection_string, query)
+    else:
+        print(f"Using provided DataFrame with {len(df)} rows")
+    
+    # Ensure date column exists
+    if 'date' not in df.columns:
+        if 'month' in df.columns:
+            df['date'] = pd.to_datetime(df['month'])
+        else:
+            raise ValueError("DataFrame must contain either 'date' or 'month' column")
+    elif not pd.api.types.is_datetime64_any_dtype(df['date']):
+        df['date'] = pd.to_datetime(df['date'])
+    
+    # Get all country codes from columns
+    current_gpr_cols = [col for col in df.columns if col.startswith('GPRC_')]
+    historic_gpr_cols = [col for col in df.columns if col.startswith('GPRHC_')]
+    
+    # Extract country codes
+    country_codes = [col.split('_')[1] for col in current_gpr_cols]
+    print(f"Found {len(country_codes)} countries")
+    
+    # Create mapping of country codes to country names using var_name and var_label
+    country_names = {}
+    
+    # Create a mapping of var_name to var_label
+    var_name_to_label = {}
+    
+    # Only do this if var_name and var_label columns exist
+    if 'var_name' in df.columns and 'var_label' in df.columns:
+        for _, row in df.drop_duplicates('var_name').iterrows():
+            if isinstance(row['var_name'], str) and isinstance(row['var_label'], str):
+                var_name_to_label[row['var_name']] = row['var_label']
+                
+                # If this is a current GPR country column, extract the country name
+                if row['var_name'].startswith('GPRC_'):
+                    country_code = row['var_name'].split('_')[1]
+                    country_name_match = re.search(r'\((.*?)\)$', row['var_label'])
+                    if country_name_match:
+                        country_name = country_name_match.group(1)
+                        country_names[country_code] = country_name
+    
+    # If we couldn't extract country names from var_label, use the country codes
+    if not country_names:
+        for code in country_codes:
+            country_names[code] = code
+    
+    # Get the most recent 24 months for forecasting purposes
+    recent_dates = sorted(df['date'].unique())[-24:]
+    recent_df = df[df['date'].isin(recent_dates)]
+    
+    # Get the latest date with data
+    latest_date = recent_df['date'].max()
+    latest_df = df[df['date'] == latest_date]
+    
+    # Initialize result dataframe
+    result_columns = ['Date', 'Country', 'Composite GPR', 'Current GPR', 'Historic GPR', 
+                      'Average GPR over time', 'Average GPR of the rest of the countries', 'Forecasted GPR']
+    result_df = pd.DataFrame(columns=result_columns)
+    
+    # Process each country
+    for i, country_code in enumerate(country_codes):
+        print(f"Processing country {i+1}/{len(country_codes)}: {country_code}")
+        
+        current_gpr_col = f'GPRC_{country_code}'
+        historic_gpr_col = f'GPRHC_{country_code}'
+        
+        # Get current and historic GPR values for the latest date
+        if len(latest_df) > 0:
+            latest_row = latest_df.iloc[0]
+            current_gpr = latest_row[current_gpr_col]
+            historic_gpr = latest_row[historic_gpr_col]
+        else:
+            print(f"No data for the latest date for {country_code}, skipping")
+            continue
+        
+        # Calculate average GPR over time for this country
+        avg_gpr_over_time = df[current_gpr_col].mean()
+        
+        # Calculate average GPR of the rest of the countries for the latest date
+        other_countries_cols = [col for col in current_gpr_cols if col != current_gpr_col]
+        avg_gpr_rest = latest_row[other_countries_cols].mean()
+        
+        # Forecast the GPR for next month using ARIMA
+        try:
+            # Get GPR time series for the last 24 months
+            country_gpr_series = recent_df[current_gpr_col].dropna()
+            
+            if len(country_gpr_series) >= 12:  # Need enough data for forecasting
+                model = ARIMA(country_gpr_series, order=(1, 1, 1))
+                model_fit = model.fit()
+                forecast = model_fit.forecast(steps=1)[0]
+            else:
+                # Use simple moving average if not enough data
+                forecast = country_gpr_series.rolling(window=min(3, len(country_gpr_series))).mean().iloc[-1]
+        except Exception as e:
+            print(f"Forecasting error for {country_code}: {e}")
+            # Fallback to last value if forecasting fails
+            forecast = current_gpr
+        
+        # Find min and max across all countries for normalization
+        all_gpr_values = []
+        for col in current_gpr_cols + historic_gpr_cols:
+            all_gpr_values.extend(df[col].dropna().tolist())
+        
+        global_min = min(all_gpr_values)
+        global_max = max(all_gpr_values)
+        
+        # Normalize function (min-max scaling to 1-10)
+        def normalize(value, min_val, max_val):
+            if pd.isna(value) or pd.isna(min_val) or pd.isna(max_val) or max_val == min_val:
+                return 5.0  # Default to middle value if unable to normalize
+            return 1 + 9 * (value - min_val) / (max_val - min_val)
+        
+        # Normalize all components
+        norm_current_gpr = normalize(current_gpr, global_min, global_max)
+        norm_historic_gpr = normalize(historic_gpr, global_min, global_max)
+        
+        # For global relative, higher values mean higher risk compared to others
+        current_gpr_values = [latest_row[col] for col in current_gpr_cols]
+        global_min_current = min(current_gpr_values)
+        global_max_current = max(current_gpr_values)
+        global_relative = normalize(current_gpr, global_min_current, global_max_current)
+                                   
+        # For historic relative, higher values mean higher risk compared to country's history
+        country_min = df[current_gpr_col].min()
+        country_max = df[current_gpr_col].max()
+        historic_relative = normalize(current_gpr, country_min, country_max)
+                                     
+        # Normalize forecast
+        norm_forecast = normalize(forecast, global_min, global_max)
+        
+        # Calculate composite score using weights
+        composite_score = (
+            weights['current_gpr'] * norm_current_gpr +
+            weights['historic_gpr'] * norm_historic_gpr +
+            weights['global_relative'] * global_relative +
+            weights['historic_relative'] * historic_relative +
+            weights['forecast'] * norm_forecast
+        )
+        
+        # Add to result dataframe
+        new_row = {
+            'Date': latest_date,
+            'Country': country_names.get(country_code, country_code),
+            'Composite GPR': round(composite_score, 2),
+            'Current GPR': round(norm_current_gpr, 2),
+            'Historic GPR': round(norm_historic_gpr, 2),
+            'Average GPR over time': round(normalize(avg_gpr_over_time, global_min, global_max), 2),
+            'Average GPR of the rest of the countries': round(normalize(avg_gpr_rest, global_min, global_max), 2),
+            'Forecasted GPR': round(norm_forecast, 2)
+        }
+        result_df = pd.concat([result_df, pd.DataFrame([new_row])], ignore_index=True)
+    
+    # Sort by Composite GPR (descending)
+    result_df = result_df.sort_values('Composite GPR', ascending=False)
+    
+    return result_df
+
+def main():
+    # SQL Connection string
+    # Format: "dialect+driver://username:password@host:port/database"
+    connection_string = "mssql+pyodbc://username:password@server/database?driver=ODBC+Driver+17+for+SQL+Server"
+    
+    # SQL query to retrieve GPR data
+    query = """
+    SELECT 
+        month, 
+        GPR, GPRT, GPRA, GPRH, GPRHT, GPRHA, 
+        SHARE_GPR, N10, SHARE_GPRH, N3H, 
+        GPRH_NOEW, GPR_NOEW, GPRH_AND, GPR_AND, 
+        GPRH_BASIC, GPR_BASIC, 
+        SHAREH_CAT_1, SHAREH_CAT_2, SHAREH_CAT_3, 
+        SHAREH_CAT_4, SHAREH_CAT_5, SHAREH_CAT_6, 
+        SHAREH_CAT_7, SHAREH_CAT_8,
+        -- Country GPR columns
+        GPRC_ARG, GPRC_AUS, GPRC_BEL, GPRC_BRA, GPRC_CAN, 
+        GPRC_CHE, GPRC_CHL, GPRC_CHN, GPRC_COL, GPRC_DEU, 
+        GPRC_DNK, GPRC_EGY, GPRC_ESP, GPRC_FIN, GPRC_FRA, 
+        GPRC_GBR, GPRC_HKG, GPRC_HUN, GPRC_IDN, GPRC_IND, 
+        GPRC_ISR, GPRC_ITA, GPRC_JPN, GPRC_KOR, GPRC_MEX, 
+        GPRC_MYS, GPRC_NLD, GPRC_NOR, GPRC_PER, GPRC_PHL, 
+        GPRC_POL, GPRC_PRT, GPRC_RUS, GPRC_SAU, GPRC_SWE, 
+        GPRC_THA, GPRC_TUN, GPRC_TUR, GPRC_TWN, GPRC_UKR, 
+        GPRC_USA, GPRC_VEN, GPRC_VNM, GPRC_ZAF,
+        -- Country Historical GPR columns
+        GPRHC_ARG, GPRHC_AUS, GPRHC_BEL, GPRHC_BRA, GPRHC_CAN, 
+        GPRHC_CHE, GPRHC_CHL, GPRHC_CHN, GPRHC_COL, GPRHC_DEU, 
+        GPRHC_DNK, GPRHC_EGY, GPRHC_ESP, GPRHC_FIN, GPRHC_FRA, 
+        GPRHC_GBR, GPRHC_HKG, GPRHC_HUN, GPRHC_IDN, GPRHC_IND, 
+        GPRHC_ISR, GPRHC_ITA, GPRHC_JPN, GPRHC_KOR, GPRHC_MEX, 
+        GPRHC_MYS, GPRHC_NLD, GPRHC_NOR, GPRHC_PER, GPRHC_PHL, 
+        GPRHC_POL, GPRHC_PRT, GPRHC_RUS, GPRHC_SAU, GPRHC_SWE, 
+        GPRHC_THA, GPRHC_TUN, GPRHC_TUR, GPRHC_TWN, GPRHC_UKR, 
+        GPRHC_USA, GPRHC_VEN, GPRHC_VNM, GPRHC_ZAF,
+        -- Variable metadata
+        var_name, var_label
+    FROM 
+        gpr_data
+    """
+    
+    # Define weights (can be adjusted by user)
+    weights = {
+        'current_gpr': 0.3,       # Weight for current GPR
+        'historic_gpr': 0.15,     # Weight for historic GPR
+        'global_relative': 0.2,   # Weight for GPR relative to rest of world
+        'historic_relative': 0.15, # Weight for GPR relative to country's history
+        'forecast': 0.2           # Weight for forecasted GPR
+    }
+    
+    # Create composite GPR from SQL database
+    try:
+        result_df = create_composite_gpr(connection_string=connection_string, query=query, weights=weights)
+        
+        # Display results
+        print(f"Composite GPR Ratings (weights: {weights})")
+        print(f"Total countries analyzed: {len(result_df)}")
+        display(result_df)
+        
+        # Return the result dataframe (though it's not saved as per requirements)
+        return result_df
+    
+    except Exception as e:
+        print(f"Error creating composite GPR rating: {e}")
+        return None
+
+def create_composite_gpr_from_existing_df(df, weights=None):
+    """
+    Convenience wrapper to create composite GPR from an existing DataFrame
+    
+    Parameters:
+    df (pandas.DataFrame): DataFrame containing the GPR data
+    weights (dict): Dictionary containing weights for each component of the composite score
+    
+    Returns:
+    pandas.DataFrame: DataFrame containing the composite GPR scores
+    """
+    return create_composite_gpr(df=df, weights=weights)
+
+if __name__ == "__main__":
+    main()
