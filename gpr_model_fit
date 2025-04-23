@@ -7,50 +7,18 @@ from statsmodels.tsa.holtwinters import ExponentialSmoothing
 from statsmodels.tsa.stattools import adfuller
 from sklearn.metrics import r2_score, mean_squared_error, mean_absolute_error
 from itertools import product
-import sqlalchemy
-import re
 import warnings
 warnings.filterwarnings('ignore')
 
-def get_data_from_sql(connection_string, query):
-    """
-    Retrieve GPR data from a SQL database.
-    
-    Parameters:
-    -----------
-    connection_string : str
-        SQLAlchemy connection string to connect to the database
-    query : str
-        SQL query to retrieve the data
-        
-    Returns:
-    --------
-    pandas.DataFrame
-        DataFrame containing the retrieved data
-    """
-    try:
-        # Create SQLAlchemy engine
-        engine = sqlalchemy.create_engine(connection_string)
-        
-        # Read data into DataFrame
-        df = pd.read_sql(query, engine)
-        
-        print(f"Data loaded from SQL with {len(df)} rows")
-        return df
-    
-    except Exception as e:
-        print(f"Error connecting to database: {str(e)}")
-        raise
-
-def evaluate_forecast_models(df, country_codes=None, test_size=12):
+def evaluate_forecast_models(file_path, country_codes=None, test_size=12):
     """
     Evaluate multiple forecasting models for GPR data and find the best model
     based on highest R² values for each country.
     
     Parameters:
     -----------
-    df : pandas.DataFrame
-        DataFrame containing the GPR data from SQL
+    file_path : str
+        Path to the CSV file containing GPR data
     country_codes : list, optional
         List of country codes to evaluate (if None, evaluate all countries)
     test_size : int, optional
@@ -61,13 +29,12 @@ def evaluate_forecast_models(df, country_codes=None, test_size=12):
     pandas.DataFrame
         DataFrame containing the best model for each country
     """
-    # Convert month column to datetime if needed
-    if 'month' in df.columns and not pd.api.types.is_datetime64_any_dtype(df['month']):
-        df['date'] = pd.to_datetime(df['month'])
-    elif 'date' in df.columns and not pd.api.types.is_datetime64_any_dtype(df['date']):
-        df['date'] = pd.to_datetime(df['date'])
-    elif 'month' in df.columns:
-        df['date'] = df['month']
+    # Read the data
+    df = pd.read_csv(file_path)
+    print(f"Data loaded with {len(df)} rows")
+    
+    # Convert month column to datetime
+    df['date'] = pd.to_datetime(df['month'])
     
     # Get all country codes from columns if not provided
     if country_codes is None:
@@ -269,20 +236,26 @@ def find_best_overall_model(results_df):
     
     return model_avg_df
 
-def generate_forecast_visualizations(df, country_code, test_size=12):
+def generate_forecast_visualizations(file_path, country_code, test_size=12):
     """
     Generate visualizations of actual vs. forecasted GPR values
     using different models for a specific country.
     
     Parameters:
     -----------
-    df : pandas.DataFrame
-        DataFrame containing the GPR data from SQL
+    file_path : str
+        Path to the CSV file containing GPR data
     country_code : str
         Country code to analyze
     test_size : int, optional
         Number of months to use for testing
     """
+    # Read the data
+    df = pd.read_csv(file_path)
+    
+    # Convert month column to datetime
+    df['date'] = pd.to_datetime(df['month'])
+    
     # Sort data by date
     df = df.sort_values('date')
     
@@ -316,11 +289,9 @@ def generate_forecast_visualizations(df, country_code, test_size=12):
         try:
             if isinstance(model, (ARIMA, SARIMAX)):
                 fitted = model.fit()
-                # Generate forecast
                 forecast = fitted.forecast(steps=len(test))
             else:  # Holt-Winters
                 fitted = model.fit()
-                # Generate forecast
                 forecast = fitted.forecast(len(test))
             
             # Calculate R²
@@ -343,149 +314,38 @@ def generate_forecast_visualizations(df, country_code, test_size=12):
     plt.tight_layout()
     plt.show()
 
-def update_composite_gpr_with_best_model(df, results_df):
-    """
-    Update the GPR composite rating calculator to use the best forecasting model
-    for each country based on the evaluation results.
-    
-    Parameters:
-    -----------
-    df : pandas.DataFrame
-        DataFrame containing the GPR data from SQL
-    results_df : pandas.DataFrame
-        DataFrame with model evaluation results
-        
-    Returns:
-    --------
-    dict
-        Dictionary mapping each country code to its best forecasting model function
-    """
-    # Create a mapping of country codes to best model functions
-    country_best_models = {}
-    
-    for _, row in results_df.iterrows():
-        country_code = row['Country Code']
-        best_model_name = row['Best Model']
-        
-        # Define the model function based on the best model name
-        if best_model_name.startswith('ARIMA'):
-            # Extract p, d, q parameters from model name
-            params = best_model_name.split('(')[1].split(')')[0].split(',')
-            p, d, q = int(params[0]), int(params[1]), int(params[2])
-            model_func = lambda ts, p=p, d=d, q=q: ARIMA(ts, order=(p, d, q))
-            
-        elif best_model_name.startswith('SARIMA'):
-            # Extract parameters from model name
-            main_params = best_model_name.split('(')[1].split(')')[0].split(',')
-            seasonal_params = best_model_name.split('(')[2].split(')')[0].split(',')
-            
-            p, d, q = int(main_params[0]), int(main_params[1]), int(main_params[2])
-            P, D, Q, m = int(seasonal_params[0]), int(seasonal_params[1]), int(seasonal_params[2]), int(seasonal_params[3])
-            
-            model_func = lambda ts, p=p, d=d, q=q, P=P, D=D, Q=Q, m=m: SARIMAX(
-                ts, order=(p, d, q), seasonal_order=(P, D, Q, m)
-            )
-            
-        elif best_model_name == 'Holt-Winters':
-            model_func = lambda ts: ExponentialSmoothing(ts, trend='add', seasonal='add', seasonal_periods=12)
-            
-        elif best_model_name.startswith('Simple MA'):
-            window = int(best_model_name.split('(')[1].split(')')[0])
-            
-            def ma_forecast(ts, window=window, steps=1):
-                forecast = []
-                for _ in range(steps):
-                    if not forecast:
-                        # First forecast point
-                        forecast.append(ts.iloc[-window:].mean())
-                    else:
-                        # Use previous forecasts in the window
-                        window_data = pd.concat([ts.iloc[-(window-len(forecast)):], pd.Series(forecast)])
-                        forecast.append(window_data.mean())
-                return forecast
-            
-            model_func = ma_forecast
-        
-        country_best_models[country_code] = model_func
-    
-    return country_best_models
-
 def main():
-    # Define SQL connection parameters
-    connection_string = "mssql+pyodbc://username:password@server/database?driver=ODBC+Driver+17+for+SQL+Server"
+    # File path to the GPR data
+    file_path = ''
     
-    # Define SQL query to retrieve GPR data
-    # Adjust the query based on your database schema
-    query = """
-    SELECT 
-        month, 
-        GPR, GPRT, GPRA, GPRH, GPRHT, GPRHA, 
-        SHARE_GPR, N10, SHARE_GPRH, N3H, 
-        GPRH_NOEW, GPR_NOEW, GPRH_AND, GPR_AND, 
-        GPRH_BASIC, GPR_BASIC, 
-        SHAREH_CAT_1, SHAREH_CAT_2, SHAREH_CAT_3, 
-        SHAREH_CAT_4, SHAREH_CAT_5, SHAREH_CAT_6, 
-        SHAREH_CAT_7, SHAREH_CAT_8,
-        -- Add all country columns
-        GPRC_ARG, GPRC_AUS, GPRC_BEL, GPRC_BRA, GPRC_CAN, 
-        GPRC_CHE, GPRC_CHL, GPRC_CHN, GPRC_COL, GPRC_DEU, 
-        GPRC_DNK, GPRC_EGY, GPRC_ESP, GPRC_FIN, GPRC_FRA, 
-        GPRC_GBR, GPRC_HKG, GPRC_HUN, GPRC_IDN, GPRC_IND, 
-        GPRC_ISR, GPRC_ITA, GPRC_JPN, GPRC_KOR, GPRC_MEX, 
-        GPRC_MYS, GPRC_NLD, GPRC_NOR, GPRC_PER, GPRC_PHL, 
-        GPRC_POL, GPRC_PRT, GPRC_RUS, GPRC_SAU, GPRC_SWE, 
-        GPRC_THA, GPRC_TUN, GPRC_TUR, GPRC_TWN, GPRC_UKR, 
-        GPRC_USA, GPRC_VEN, GPRC_VNM, GPRC_ZAF,
-        GPRHC_ARG, GPRHC_AUS, GPRHC_BEL, GPRHC_BRA, GPRHC_CAN, 
-        GPRHC_CHE, GPRHC_CHL, GPRHC_CHN, GPRHC_COL, GPRHC_DEU, 
-        GPRHC_DNK, GPRHC_EGY, GPRHC_ESP, GPRHC_FIN, GPRHC_FRA, 
-        GPRHC_GBR, GPRHC_HKG, GPRHC_HUN, GPRHC_IDN, GPRHC_IND, 
-        GPRHC_ISR, GPRHC_ITA, GPRHC_JPN, GPRHC_KOR, GPRHC_MEX, 
-        GPRHC_MYS, GPRHC_NLD, GPRHC_NOR, GPRHC_PER, GPRHC_PHL, 
-        GPRHC_POL, GPRHC_PRT, GPRHC_RUS, GPRHC_SAU, GPRHC_SWE, 
-        GPRHC_THA, GPRHC_TUN, GPRHC_TUR, GPRHC_TWN, GPRHC_UKR, 
-        GPRHC_USA, GPRHC_VEN, GPRHC_VNM, GPRHC_ZAF,
-        var_name, var_label
-    FROM 
-        gpr_data
-    """
+    # Evaluate forecast models for all countries
+    results_df = evaluate_forecast_models(file_path, test_size=12)
     
-    try:
-        # Get data from SQL
-        df = get_data_from_sql(connection_string, query)
-        
-        # Evaluate forecast models for all countries
-        results_df = evaluate_forecast_models(df, test_size=12)
-        
-        # Display results of individual countries, sorted by highest R² (best fit)
-        print("\nBest Forecast Models by Country (Sorted by Highest R²):")
-        display(results_df[['Country Name', 'Best Model', 'R2', 'RMSE']])
-        
-        # Find the best overall model (highest average R²)
-        model_avg_df = find_best_overall_model(results_df)
-        
-        print("\nForecast Models Ranked by Average R² (Highest First):")
-        display(model_avg_df)
-        
-        # Determine the model with the highest average R²
-        best_model = model_avg_df.iloc[0]['Model']
-        best_avg_r2 = model_avg_df.iloc[0]['Average R2']
-        print(f"\nThe model with the highest average R² is: {best_model} (Average R² = {best_avg_r2:.4f})")
-        
-        # Find the country-model combination with the absolute highest R²
-        best_country_idx = results_df['R2'].idxmax()
-        best_country = results_df.loc[best_country_idx]
-        print(f"\nThe highest individual R² was achieved by: {best_country['Best Model']} for {best_country['Country Name']} (R² = {best_country['R2']:.4f})")
-        
-        # Create mapping of countries to best forecast models
-        country_best_models = update_composite_gpr_with_best_model(df, results_df)
-        
-        # Return results for further processing
-        return results_df, model_avg_df, country_best_models
+    # Display results of individual countries, sorted by highest R² (best fit)
+    print("\nBest Forecast Models by Country (Sorted by Highest R²):")
+    display(results_df[['Country Name', 'Best Model', 'R2', 'RMSE']])
     
-    except Exception as e:
-        print(f"Error in main function: {str(e)}")
-        return None, None, None
+    # Find the best overall model (highest average R²)
+    model_avg_df = find_best_overall_model(results_df)
+    
+    print("\nForecast Models Ranked by Average R² (Highest First):")
+    display(model_avg_df)
+    
+    # Determine the model with the highest average R²
+    best_model = model_avg_df.iloc[0]['Model']
+    best_avg_r2 = model_avg_df.iloc[0]['Average R2']
+    print(f"\nThe model with the highest average R² is: {best_model} (Average R² = {best_avg_r2:.4f})")
+    
+    # Find the country-model combination with the absolute highest R²
+    best_country_idx = results_df['R2'].idxmax()
+    best_country = results_df.loc[best_country_idx]
+    print(f"\nThe highest individual R² was achieved by: {best_country['Best Model']} for {best_country['Country Name']} (R² = {best_country['R2']:.4f})")
+    
+    # Optionally: Generate visualizations for a specific country
+    # generate_forecast_visualizations(file_path, 'USA')
+    
+    return results_df, model_avg_df
 
 if __name__ == "__main__":
+    import re  # Import re at the top level
     main()
