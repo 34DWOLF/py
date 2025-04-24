@@ -6,7 +6,7 @@ from bs4 import BeautifulSoup
 from typing import Dict, List, Tuple, Any
 
 # Define file path at the very start - used throughout the code
-DEFAULT_FILE_PATH = 
+DEFAULT_FILE_PATH = T1
 
 ###############################################################################
 # 1) HELPER FUNCTIONS
@@ -553,12 +553,12 @@ def calculate_mexico_risk_metrics(mexico_df, pop_data):
     if pop_total != 0 and "SecondaryThreatLevel" in merged_mexico.columns:
         pop_pct = merged_mexico.groupby("SecondaryThreatLevel")["Population"].sum() / pop_total
     else:
-        pop_pct = pd.Series()
+        pop_pct = pd.Series(dtype='float64')
     
     if area_total != 0 and "SecondaryThreatLevel" in merged_mexico.columns:
         area_pct = merged_mexico.groupby("SecondaryThreatLevel")["Area"].sum() / area_total
     else:
-        area_pct = pd.Series()
+        area_pct = pd.Series(dtype='float64')
     
     # Define risk levels and mapping
     risk_levels = ["Level 2: Exercise Increased Caution", 
@@ -743,8 +743,8 @@ def main(file_path=None):
     
     # If Mexico state-level data is available, calculate risk metrics
     if mexico_state_df is not None:
-        # If no state-level threat data found, apply country-level threat to all states
-        if not any(mexico_state_df["SecondaryThreatLevel"].notna()):
+        # Look for state level threat data in the summary
+        if "SecondaryThreatLevel" not in mexico_df.columns or not any(mexico_df["SecondaryThreatLevel"].notna()):
             print("No state-specific threat levels found. Using country-level threat for all states.")
             # Create default state entries with primary threat level
             default_threat = mexico_df["ThreatLevel"].iloc[0] if not mexico_df.empty else "Level 3: Reconsider Travel"
