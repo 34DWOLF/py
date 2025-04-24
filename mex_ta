@@ -806,5 +806,4 @@ def main(file_path=None):
         return None
 
 if __name__ == "__main__":
-    # Example usage - pass the path to your RSS XML file
-    main("/path/to/your/traveladvisory.xml")
+    main()
