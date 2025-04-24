@@ -45,6 +45,23 @@ MEXICO_POP_DATA = {
     "Zacatecas State": [1622138, 29064]
 }
 
+# Create a simplified lookup dictionary for state name standardization
+STATE_NAME_MAP = {}
+for state in MEXICO_POP_DATA.keys():
+    # Handle each name format possibility for better matching
+    base_name = state.replace(" State", "").lower()
+    STATE_NAME_MAP[base_name] = state
+    STATE_NAME_MAP[base_name + " state"] = state
+    STATE_NAME_MAP[state.lower()] = state
+
+# Special cases
+STATE_NAME_MAP["mexico city"] = "Mexico City"
+STATE_NAME_MAP["ciudad de mexico"] = "Mexico City"
+STATE_NAME_MAP["cdmx"] = "Mexico City"
+STATE_NAME_MAP["mexico"] = "Mexico State"
+STATE_NAME_MAP["estado de mexico"] = "Mexico State"
+STATE_NAME_MAP["state of mexico"] = "Mexico State"
+
 def read_xml_file(file_path):
     """Read XML content from a local file."""
     try:
@@ -101,16 +118,26 @@ def parse_mexico_states(summary_html):
         text = p.get_text(strip=True)
         m = re.match(pattern, text, re.I)
         if m:
-            place = m.group(1).strip()
+            place_raw = m.group(1).strip()
             advisory_text = m.group(2).strip().lower()
             
             # Skip if already added Mexico City or Mexico
-            if place.lower() in ["mexico city", "mexico"]:
+            if place_raw.lower() in ["mexico city", "mexico"]:
                 continue
                 
-            # Add "State" suffix if needed
-            if not place.lower().endswith("state") and not place.lower() == "mexico city":
-                place = f"{place} State"
+            # Standardize state name using mapping
+            place_key = place_raw.lower()
+            
+            # If the parsed name doesn't end with "state" or "city", add "state" to match our mapping
+            if not (place_key.endswith(" state") or place_key.endswith(" city")):
+                place_key += " state"
+                
+            # Try to find standardized name in our mapping
+            if place_key in STATE_NAME_MAP:
+                place = STATE_NAME_MAP[place_key]
+            else:
+                # As a fallback, preserve the original name with State suffix
+                place = place_raw + " State" if not place_raw.lower().endswith((" state", " city")) else place_raw
             
             level = None
             if "do not travel" in advisory_text:
@@ -169,6 +196,9 @@ def process_mexico_advisory(xml_content):
             mexico_df = pd.DataFrame(state_advisories)
             mexico_df["Country"] = "Mexico"
             mexico_df["CountryThreatLevel"] = threat_level
+            
+            # Add missing states with default threat level
+            add_missing_states(mexico_df, threat_level)
         else:
             # If no state data, create state entries with country-level threat
             mexico_df = create_default_state_advisories(threat_level)
@@ -180,6 +210,29 @@ def process_mexico_advisory(xml_content):
         import traceback
         traceback.print_exc()
         return None
+
+def add_missing_states(mexico_df, default_threat_level):
+    """Add missing states to the DataFrame with default threat level."""
+    # Get list of states already in the DataFrame
+    existing_states = set(mexico_df["Place"].tolist())
+    
+    # Find which states from our population data are missing
+    missing_states = []
+    for state_name in MEXICO_POP_DATA.keys():
+        if state_name not in existing_states:
+            missing_states.append({
+                "Country": "Mexico",
+                "Place": state_name,
+                "SecondaryThreatLevel": default_threat_level,
+                "CountryThreatLevel": default_threat_level
+            })
+    
+    # Add missing states to DataFrame if any
+    if missing_states:
+        missing_df = pd.DataFrame(missing_states)
+        mexico_df = pd.concat([mexico_df, missing_df], ignore_index=True)
+    
+    return mexico_df
 
 def create_default_state_advisories(threat_level):
     """Create default state advisories using country-level threat."""
@@ -202,8 +255,8 @@ def calculate_risk_metrics(mexico_df):
     # Add population and area data if not already present
     if "Population" not in mexico_df.columns or "Area" not in mexico_df.columns:
         # Map population and area data to states
-        mexico_df["Population"] = mexico_df["Place"].map(lambda x: MEXICO_POP_DATA.get(x, [0, 0])[0] if x else 0)
-        mexico_df["Area"] = mexico_df["Place"].map(lambda x: MEXICO_POP_DATA.get(x, [0, 0])[1] if x else 0)
+        mexico_df["Population"] = mexico_df["Place"].map(lambda x: MEXICO_POP_DATA.get(x, [0, 0])[0])
+        mexico_df["Area"] = mexico_df["Place"].map(lambda x: MEXICO_POP_DATA.get(x, [0, 0])[1])
     
     # Calculate population and area totals
     pop_total = mexico_df["Population"].sum()
@@ -284,6 +337,7 @@ def main():
         print("\n=== State-level Advisories (Sample) ===")
         print(mexico_df[["Place", "SecondaryThreatLevel", "Population", "Area"]].head(5))
         print(f"Total states: {len(mexico_df)}")
+        print(f"Unique places: {mexico_df['Place'].nunique()}")
         
         return mexico_df
     else:
