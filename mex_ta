@@ -6,7 +6,7 @@ from bs4 import BeautifulSoup
 from typing import Dict, List, Tuple, Any
 
 # Define file path at the very start - used throughout the code
-DEFAULT_FILE_PATH = os.path.join(os.path.expanduser("~/Downloads"), "traveladvisory.xml")
+DEFAULT_FILE_PATH = 
 
 ###############################################################################
 # 1) HELPER FUNCTIONS
