@@ -5,8 +5,10 @@ from statsmodels.tsa.arima.model import ARIMA
 from statsmodels.tsa.statespace.sarimax import SARIMAX
 from statsmodels.tsa.holtwinters import ExponentialSmoothing
 from statsmodels.tsa.stattools import adfuller
-from sklearn.metrics import r2_score, mean_squared_error, mean_absolute_error
+from sklearn.metrics import r2_score, mean_squared_error, mean_absolute_error, explained_variance_score
+from scipy import stats
 from itertools import product
+import re
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -122,6 +124,13 @@ def evaluate_forecast_models(file_path, country_codes=None, test_size=12):
                         
                         # Calculate the moving average
                         forecast.append(window_data.mean())
+                    
+                    # For MA models, we need to manually calculate the model fit info
+                    residuals = test - forecast
+                    model_summary = None
+                    f_statistic = None
+                    p_value = None
+                    
                 else:
                     # Fit the model
                     model = model_func(train)
@@ -129,10 +138,28 @@ def evaluate_forecast_models(file_path, country_codes=None, test_size=12):
                         fitted = model.fit()
                         # Generate forecast
                         forecast = fitted.forecast(steps=len(test))
+                        # Get model summary for F-Statistic
+                        model_summary = fitted.summary()
+                        
+                        # Calculate F-Statistic from the model
+                        # F = (ESS/df_model) / (RSS/df_resid)
+                        f_statistic = fitted.fittedvalues.var() / fitted.resid.var()
+                        # Calculate p-value from F-statistic
+                        df_model = len(fitted.params)
+                        df_resid = len(fitted.resid) - df_model
+                        p_value = 1 - stats.f.cdf(f_statistic, df_model, df_resid)
+                        
+                        residuals = test - forecast
+                        
                     else:  # Holt-Winters
                         fitted = model.fit()
                         # Generate forecast
                         forecast = fitted.forecast(len(test))
+                        # We don't have model summary for Holt-Winters
+                        model_summary = None
+                        f_statistic = None
+                        p_value = None
+                        residuals = test - forecast
                 
                 # Calculate metrics
                 r2 = r2_score(test, forecast)
@@ -140,14 +167,32 @@ def evaluate_forecast_models(file_path, country_codes=None, test_size=12):
                 mae = mean_absolute_error(test, forecast)
                 rmse = np.sqrt(mse)
                 
+                # Calculate Residual Sum of Squares (RSS)
+                rss = np.sum(np.square(residuals))
+                
+                # Calculate Total Sum of Squares (TSS)
+                tss = np.sum(np.square(test - test.mean()))
+                
+                # Calculate Explained Sum of Squares (ESS)
+                ess = tss - rss
+                
+                # Calculate Explained Variance
+                explained_var = explained_variance_score(test, forecast)
+                
                 model_metrics[model_name] = {
                     'R2': r2,
                     'MSE': mse,
                     'MAE': mae,
-                    'RMSE': rmse
+                    'RMSE': rmse,
+                    'RSS': rss,
+                    'ESS': ess,
+                    'TSS': tss,
+                    'F_Statistic': f_statistic,
+                    'P_Value': p_value,
+                    'Explained_Variance': explained_var
                 }
                 
-                print(f"  {model_name}: R² = {r2:.4f}, RMSE = {rmse:.4f}")
+                print(f"  {model_name}: R² = {r2:.4f}, RMSE = {rmse:.4f}, F = {f_statistic if f_statistic is not None else 'N/A'}")
             
             except Exception as e:
                 print(f"  Error with {model_name} for {country_code}: {str(e)}")
@@ -164,6 +209,12 @@ def evaluate_forecast_models(file_path, country_codes=None, test_size=12):
                 'MSE': best_model[1]['MSE'],
                 'MAE': best_model[1]['MAE'],
                 'RMSE': best_model[1]['RMSE'],
+                'RSS': best_model[1]['RSS'],
+                'ESS': best_model[1]['ESS'],
+                'TSS': best_model[1]['TSS'],
+                'F_Statistic': best_model[1]['F_Statistic'],
+                'P_Value': best_model[1]['P_Value'],
+                'Explained_Variance': best_model[1]['Explained_Variance'],
                 'All Models': model_metrics
             })
     
@@ -190,49 +241,66 @@ def find_best_overall_model(results_df):
     pandas.DataFrame
         DataFrame with average R² for each model type
     """
-    # Calculate average R² by model type
+    # Calculate average metrics by model type
     model_performance = {}
+    
+    metric_keys = ['R2', 'MSE', 'MAE', 'RMSE', 'RSS', 'ESS', 'TSS', 
+                   'F_Statistic', 'P_Value', 'Explained_Variance']
     
     for _, row in results_df.iterrows():
         all_models = row['All Models']
         for model_name, metrics in all_models.items():
             if model_name not in model_performance:
                 model_performance[model_name] = {
-                    'R2_sum': 0, 
-                    'R2_values': [], 
                     'count': 0
                 }
+                # Initialize sum and values for each metric
+                for key in metric_keys:
+                    model_performance[model_name][f'{key}_sum'] = 0
+                    model_performance[model_name][f'{key}_values'] = []
             
-            model_performance[model_name]['R2_sum'] += metrics['R2']
-            model_performance[model_name]['R2_values'].append(metrics['R2'])
+            # Update count
             model_performance[model_name]['count'] += 1
+            
+            # Update sums and values for each metric
+            for key in metric_keys:
+                if key in metrics and metrics[key] is not None:
+                    model_performance[model_name][f'{key}_sum'] += metrics[key]
+                    model_performance[model_name][f'{key}_values'].append(metrics[key])
     
-    # Calculate average R² and other stats for each model
+    # Calculate average, median, max, min, and std dev for each metric
     for model_name in model_performance:
-        r2_values = model_performance[model_name]['R2_values']
-        model_performance[model_name].update({
-            'Average_R2': model_performance[model_name]['R2_sum'] / model_performance[model_name]['count'],
-            'Median_R2': np.median(r2_values),
-            'Max_R2': np.max(r2_values),
-            'Min_R2': np.min(r2_values),
-            'Std_R2': np.std(r2_values)
-        })
+        for key in metric_keys:
+            values = model_performance[model_name][f'{key}_values']
+            if values:
+                model_performance[model_name][f'Average_{key}'] = model_performance[model_name][f'{key}_sum'] / len(values)
+                model_performance[model_name][f'Median_{key}'] = np.median(values)
+                model_performance[model_name][f'Max_{key}'] = np.max(values)
+                model_performance[model_name][f'Min_{key}'] = np.min(values)
+                model_performance[model_name][f'Std_{key}'] = np.std(values)
+            else:
+                model_performance[model_name][f'Average_{key}'] = None
+                model_performance[model_name][f'Median_{key}'] = None
+                model_performance[model_name][f'Max_{key}'] = None
+                model_performance[model_name][f'Min_{key}'] = None
+                model_performance[model_name][f'Std_{key}'] = None
     
-    # Convert to DataFrame and sort by average R² (highest first)
+    # Convert to DataFrame
+    metrics_to_include = ['Average_R2', 'Median_R2', 'Max_R2', 'Min_R2', 'Std_R2',
+                          'Average_RMSE', 'Average_MSE', 'Average_MAE', 
+                          'Average_F_Statistic', 'Average_RSS', 'Average_Explained_Variance']
+    
     model_avg_df = pd.DataFrame([
         {
-            'Model': model_name, 
-            'Average R2': stats['Average_R2'], 
-            'Median R2': stats['Median_R2'],
-            'Max R2': stats['Max_R2'],
-            'Min R2': stats['Min_R2'],
-            'Std Dev R2': stats['Std_R2'],
-            'Count': stats['count']
+            'Model': model_name,
+            'Count': stats['count'],
+            **{metric: stats.get(metric) for metric in metrics_to_include if metric in stats}
         }
         for model_name, stats in model_performance.items()
     ])
     
-    model_avg_df = model_avg_df.sort_values('Average R2', ascending=False)
+    # Sort by average R² (highest first)
+    model_avg_df = model_avg_df.sort_values('Average_R2', ascending=False)
     
     return model_avg_df
 
@@ -284,18 +352,51 @@ def generate_forecast_visualizations(file_path, country_code, test_size=12):
     # Plot actual values
     plt.plot(test_dates, test, 'k-', label='Actual')
     
+    # Initialize metrics table
+    metrics_table = []
+    
     # Plot forecasts for each model
     for model_name, model in models.items():
         try:
             if isinstance(model, (ARIMA, SARIMAX)):
                 fitted = model.fit()
+                # Generate forecast
                 forecast = fitted.forecast(steps=len(test))
             else:  # Holt-Winters
                 fitted = model.fit()
+                # Generate forecast
                 forecast = fitted.forecast(len(test))
             
-            # Calculate R²
+            # Calculate metrics
             r2 = r2_score(test, forecast)
+            mse = mean_squared_error(test, forecast)
+            mae = mean_absolute_error(test, forecast)
+            rmse = np.sqrt(mse)
+            
+            # Calculate Residual Sum of Squares (RSS)
+            residuals = test - forecast
+            rss = np.sum(np.square(residuals))
+            
+            # Calculate Total Sum of Squares (TSS)
+            tss = np.sum(np.square(test - test.mean()))
+            
+            # Calculate Explained Sum of Squares (ESS)
+            ess = tss - rss
+            
+            # Calculate Explained Variance
+            explained_var = explained_variance_score(test, forecast)
+            
+            # Store metrics
+            metrics_table.append({
+                'Model': model_name,
+                'R²': r2,
+                'RMSE': rmse,
+                'MSE': mse,
+                'MAE': mae,
+                'RSS': rss,
+                'ESS': ess,
+                'Explained Variance': explained_var
+            })
             
             # Plot forecast
             plt.plot(test_dates, forecast, '--', label=f'{model_name} (R² = {r2:.4f})')
@@ -313,6 +414,12 @@ def generate_forecast_visualizations(file_path, country_code, test_size=12):
     # Show the plot
     plt.tight_layout()
     plt.show()
+    
+    # Display metrics table
+    metrics_df = pd.DataFrame(metrics_table)
+    display(metrics_df)
+    
+    return metrics_df
 
 def main():
     # File path to the GPR data
@@ -323,7 +430,9 @@ def main():
     
     # Display results of individual countries, sorted by highest R² (best fit)
     print("\nBest Forecast Models by Country (Sorted by Highest R²):")
-    display(results_df[['Country Name', 'Best Model', 'R2', 'RMSE']])
+    display_cols = ['Country Name', 'Best Model', 'R2', 'RMSE', 'MSE', 'MAE', 
+                    'RSS', 'Explained_Variance', 'F_Statistic']
+    display(results_df[display_cols])
     
     # Find the best overall model (highest average R²)
     model_avg_df = find_best_overall_model(results_df)
@@ -333,16 +442,29 @@ def main():
     
     # Determine the model with the highest average R²
     best_model = model_avg_df.iloc[0]['Model']
-    best_avg_r2 = model_avg_df.iloc[0]['Average R2']
-    print(f"\nThe model with the highest average R² is: {best_model} (Average R² = {best_avg_r2:.4f})")
+    best_avg_r2 = model_avg_df.iloc[0]['Average_R2']
+    best_avg_rmse = model_avg_df.iloc[0]['Average_RMSE']
+    print(f"\nThe model with the highest average R² is: {best_model}")
+    print(f"Average R² = {best_avg_r2:.4f}")
+    print(f"Average RMSE = {best_avg_rmse:.4f}")
     
     # Find the country-model combination with the absolute highest R²
     best_country_idx = results_df['R2'].idxmax()
     best_country = results_df.loc[best_country_idx]
-    print(f"\nThe highest individual R² was achieved by: {best_country['Best Model']} for {best_country['Country Name']} (R² = {best_country['R2']:.4f})")
+    print(f"\nThe highest individual R² was achieved by: {best_country['Best Model']} for {best_country['Country Name']}")
+    print(f"R² = {best_country['R2']:.4f}")
+    print(f"RMSE = {best_country['RMSE']:.4f}")
+    print(f"MSE = {best_country['MSE']:.4f}")
+    print(f"MAE = {best_country['MAE']:.4f}")
+    print(f"RSS = {best_country['RSS']:.4f}")
+    print(f"Explained Variance = {best_country['Explained_Variance']:.4f}")
+    if best_country['F_Statistic'] is not None:
+        print(f"F-Statistic = {best_country['F_Statistic']:.4f} (p = {best_country['P_Value']:.4f})")
     
     # Optionally: Generate visualizations for a specific country
-    # generate_forecast_visualizations(file_path, 'USA')
+    # country_to_visualize = 'USA'
+    # print(f"\nGenerating visualizations for {country_to_visualize}...")
+    # generate_forecast_visualizations(file_path, country_to_visualize)
     
     return results_df, model_avg_df
 
