@@ -6,7 +6,7 @@ from bs4 import BeautifulSoup
 import os
 
 # Configuration settings
-RSS_FILE_PATH = t7  # Path to the XML file
+RSS_FILE_PATH = t8
 #RSS_URL = "https://travel.state.gov/_res/rss/TAsTWs.xml"  # Default URL if needed
 
 # Define Mexico population and area data once
