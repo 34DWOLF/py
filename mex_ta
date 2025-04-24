@@ -6,8 +6,8 @@ from bs4 import BeautifulSoup
 import os
 
 # Configuration settings
-RSS_FILE_PATH = "traveladvisory.xml"  # Path to the XML file
-RSS_URL = "https://travel.state.gov/_res/rss/TAsTWs.xml"  # Default URL if needed
+RSS_FILE_PATH = t6
+#RSS_URL = "https://travel.state.gov/_res/rss/TAsTWs.xml"  # Default URL if needed
 
 # Define Mexico population and area data once
 MEXICO_POP_DATA = {
