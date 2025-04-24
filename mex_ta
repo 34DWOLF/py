@@ -6,61 +6,96 @@ from bs4 import BeautifulSoup
 import os
 
 # Configuration settings
-RSS_FILE_PATH = t8
-#RSS_URL = "https://travel.state.gov/_res/rss/TAsTWs.xml"  # Default URL if needed
+RSS_FILE_PATH = "traveladvisory.xml"  # Path to the XML file
+RSS_URL = "https://travel.state.gov/_res/rss/TAsTWs.xml"  # Default URL if needed
 
-# Define Mexico population and area data once
-MEXICO_POP_DATA = {
-    "Aguascalientes State": [1425607, 2168],
-    "Baja California State": [3769020, 27587],
-    "Baja California Sur State": [798447, 28537],
-    "Campeche State": [928363, 22195],
-    "Chiapas State": [5543828, 28306],
-    "Chihuahua State": [3741869, 95527],
-    "Mexico City": [9209944, 577],
-    "Coahuila State": [3146771, 58531],
-    "Colima State": [731391, 2173],
-    "Durango State": [1832650, 47631],
-    "Guanajuato State": [6166934, 11817],
-    "Guerrero State": [3540685, 24555],
-    "Hidalgo State": [3082841, 8039],
-    "Jalisco State": [8348151, 30346],
-    "Mexico State": [16992418, 8630],
-    "Michoacan State": [4748846, 22625],
-    "Morelos State": [1971520, 1884],
-    "Nayarit State": [1235456, 10756],
-    "Nuevo Leon State": [5784442, 24771],
-    "Oaxaca State": [4132148, 36200],
-    "Puebla State": [6583278, 13247],
-    "Queretaro State": [2368467, 4514],
-    "Quintana Roo State": [1857985, 17261],
-    "San Luis Potosi State": [2822255, 23606],
-    "Sinaloa State": [3026943, 22149],
-    "Sonora State": [2944840, 69249],
-    "Tabasco State": [2402598, 9549],
-    "Tamaulipas State": [3527735, 30984],
-    "Tlaxcala State": [1342977, 1543],
-    "Veracruz State": [8062579, 27731],
-    "Yucatan State": [2320898, 15261],
-    "Zacatecas State": [1622138, 29064]
-}
+# SQL query placeholder for Mexico population data
+# This query would be executed to retrieve state population and area data
+MEXICO_POP_DATA_QUERY = """
+SELECT 
+    state_name AS State,
+    population AS Population,
+    area_km2 AS Area
+FROM mexico_states
+WHERE year = 2020
+ORDER BY state_name
+"""
 
-# Create a simplified lookup dictionary for state name standardization
-STATE_NAME_MAP = {}
-for state in MEXICO_POP_DATA.keys():
-    # Handle each name format possibility for better matching
-    base_name = state.replace(" State", "").lower()
-    STATE_NAME_MAP[base_name] = state
-    STATE_NAME_MAP[base_name + " state"] = state
-    STATE_NAME_MAP[state.lower()] = state
+def get_mexico_population_data():
+    """
+    Get Mexico population data from database.
+    In a real implementation, this would execute the SQL query.
+    For now, returns hardcoded data as a placeholder.
+    """
+    # This function would normally execute the SQL query
+    # But for demonstration, we're using hardcoded data
+    # In production, replace this with actual database connection code
+    
+    # Example: 
+    # conn = create_database_connection()
+    # df = pd.read_sql(MEXICO_POP_DATA_QUERY, conn)
+    # conn.close()
+    # return df
+    
+    # For now, return hardcoded data as a placeholder
+    data = [
+        ["Aguascalientes State", 1425607, 2168],
+        ["Baja California State", 3769020, 27587],
+        ["Baja California Sur State", 798447, 28537],
+        ["Campeche State", 928363, 22195],
+        ["Chiapas State", 5543828, 28306],
+        ["Chihuahua State", 3741869, 95527],
+        ["Mexico City", 9209944, 577],
+        ["Coahuila State", 3146771, 58531],
+        ["Colima State", 731391, 2173],
+        ["Durango State", 1832650, 47631],
+        ["Guanajuato State", 6166934, 11817],
+        ["Guerrero State", 3540685, 24555],
+        ["Hidalgo State", 3082841, 8039],
+        ["Jalisco State", 8348151, 30346],
+        ["Mexico State", 16992418, 8630],
+        ["Michoacan State", 4748846, 22625],
+        ["Morelos State", 1971520, 1884],
+        ["Nayarit State", 1235456, 10756],
+        ["Nuevo Leon State", 5784442, 24771],
+        ["Oaxaca State", 4132148, 36200],
+        ["Puebla State", 6583278, 13247],
+        ["Queretaro State", 2368467, 4514],
+        ["Quintana Roo State", 1857985, 17261],
+        ["San Luis Potosi State", 2822255, 23606],
+        ["Sinaloa State", 3026943, 22149],
+        ["Sonora State", 2944840, 69249],
+        ["Tabasco State", 2402598, 9549],
+        ["Tamaulipas State", 3527735, 30984],
+        ["Tlaxcala State", 1342977, 1543],
+        ["Veracruz State", 8062579, 27731],
+        ["Yucatan State", 2320898, 15261],
+        ["Zacatecas State", 1622138, 29064]
+    ]
+    
+    df = pd.DataFrame(data, columns=["State", "Population", "Area"])
+    return df
 
-# Special cases
-STATE_NAME_MAP["mexico city"] = "Mexico City"
-STATE_NAME_MAP["ciudad de mexico"] = "Mexico City"
-STATE_NAME_MAP["cdmx"] = "Mexico City"
-STATE_NAME_MAP["mexico"] = "Mexico State"
-STATE_NAME_MAP["estado de mexico"] = "Mexico State"
-STATE_NAME_MAP["state of mexico"] = "Mexico State"
+def create_state_name_mappings(pop_data_df):
+    """Create standardized state name mappings from population data DataFrame."""
+    state_name_map = {}
+    
+    for state in pop_data_df["State"].tolist():
+        # Handle each name format possibility for better matching
+        base_name = state.replace(" State", "").lower()
+        state_name_map[base_name] = state
+        state_name_map[base_name + " state"] = state
+        state_name_map[state.lower()] = state
+    
+    # Special cases
+    state_name_map["mexico city"] = "Mexico City"
+    state_name_map["ciudad de mexico"] = "Mexico City"
+    state_name_map["cdmx"] = "Mexico City"
+    state_name_map["mexico"] = "Mexico State"
+    state_name_map["estado de mexico"] = "Mexico State"
+    state_name_map["state of mexico"] = "Mexico State"
+    
+    return state_name_map
 
 def read_xml_file(file_path):
     """Read XML content from a local file."""
@@ -81,7 +116,7 @@ def fetch_travel_advisory_rss(rss_url):
         print(f"Error fetching RSS feed: {e}")
         return None
 
-def parse_mexico_states(summary_html):
+def parse_mexico_states(summary_html, state_name_map):
     """Parse HTML summary for Mexico state advisories and assign threat levels."""
     results = []
     soup = BeautifulSoup(summary_html, "html.parser")
@@ -133,8 +168,8 @@ def parse_mexico_states(summary_html):
                 place_key += " state"
                 
             # Try to find standardized name in our mapping
-            if place_key in STATE_NAME_MAP:
-                place = STATE_NAME_MAP[place_key]
+            if place_key in state_name_map:
+                place = state_name_map[place_key]
             else:
                 # As a fallback, preserve the original name with State suffix
                 place = place_raw + " State" if not place_raw.lower().endswith((" state", " city")) else place_raw
@@ -152,7 +187,7 @@ def parse_mexico_states(summary_html):
     
     return results
 
-def process_mexico_advisory(xml_content):
+def process_mexico_advisory(xml_content, state_name_map, pop_data_df):
     """Process Mexico travel advisory data from XML content."""
     if not xml_content:
         return None
@@ -189,7 +224,7 @@ def process_mexico_advisory(xml_content):
         summary = desc_elem.text if desc_elem is not None else ""
         
         # Extract state-level advisories
-        state_advisories = parse_mexico_states(summary)
+        state_advisories = parse_mexico_states(summary, state_name_map)
         
         # Create dataframe with state advisories
         if state_advisories:
@@ -198,10 +233,10 @@ def process_mexico_advisory(xml_content):
             mexico_df["OfficialThreatLevel"] = official_threat_level
             
             # Add missing states with default threat level
-            mexico_df = add_missing_states(mexico_df, official_threat_level)
+            mexico_df = add_missing_states(mexico_df, official_threat_level, pop_data_df)
         else:
             # If no state data, create state entries with country-level threat
-            mexico_df = create_default_state_advisories(official_threat_level)
+            mexico_df = create_default_state_advisories(official_threat_level, pop_data_df)
         
         return mexico_df
     
@@ -211,14 +246,14 @@ def process_mexico_advisory(xml_content):
         traceback.print_exc()
         return None
 
-def add_missing_states(mexico_df, default_threat_level):
+def add_missing_states(mexico_df, default_threat_level, pop_data_df):
     """Add missing states to the DataFrame with default threat level."""
     # Get list of states already in the DataFrame
     existing_states = set(mexico_df["Place"].tolist())
     
     # Find which states from our population data are missing
     missing_states = []
-    for state_name in MEXICO_POP_DATA.keys():
+    for state_name in pop_data_df["State"].tolist():
         if state_name not in existing_states:
             missing_states.append({
                 "Country": "Mexico",
@@ -234,29 +269,33 @@ def add_missing_states(mexico_df, default_threat_level):
     
     return mexico_df
 
-def create_default_state_advisories(threat_level):
+def create_default_state_advisories(threat_level, pop_data_df):
     """Create default state advisories using country-level threat."""
     # Create a dataframe with all states and default threat level
     state_rows = []
-    for state_name, data in MEXICO_POP_DATA.items():
+    for _, row in pop_data_df.iterrows():
+        state_name = row["State"]
         state_rows.append({
             "Country": "Mexico",
             "Place": state_name,
             "SecondaryThreatLevel": threat_level,
             "OfficialThreatLevel": threat_level,
-            "Population": data[0],
-            "Area": data[1]
+            "Population": row["Population"],
+            "Area": row["Area"]
         })
     
     return pd.DataFrame(state_rows)
 
-def calculate_risk_metrics(mexico_df):
+def calculate_risk_metrics(mexico_df, pop_data_df):
     """Calculate risk metrics based on population and area data."""
     # Add population and area data if not already present
     if "Population" not in mexico_df.columns or "Area" not in mexico_df.columns:
+        # Create a lookup dictionary from the population data DataFrame
+        pop_lookup = {row["State"]: (row["Population"], row["Area"]) for _, row in pop_data_df.iterrows()}
+        
         # Map population and area data to states
-        mexico_df["Population"] = mexico_df["Place"].map(lambda x: MEXICO_POP_DATA.get(x, [0, 0])[0])
-        mexico_df["Area"] = mexico_df["Place"].map(lambda x: MEXICO_POP_DATA.get(x, [0, 0])[1])
+        mexico_df["Population"] = mexico_df["Place"].map(lambda x: pop_lookup.get(x, (0, 0))[0])
+        mexico_df["Area"] = mexico_df["Place"].map(lambda x: pop_lookup.get(x, (0, 0))[1])
     
     # Calculate population and area totals
     pop_total = mexico_df["Population"].sum()
@@ -308,6 +347,12 @@ def calculate_risk_metrics(mexico_df):
 
 def main():
     """Main function to process Mexico travel advisory data."""
+    # Get population data that would normally come from SQL query
+    pop_data_df = get_mexico_population_data()
+    
+    # Create state name mapping from population data
+    state_name_map = create_state_name_mappings(pop_data_df)
+    
     # Try to read from local file first
     xml_content = read_xml_file(RSS_FILE_PATH)
     
@@ -320,10 +365,10 @@ def main():
         print("Failed to obtain XML content. Please check file path or URL.")
         return None
         
-    mexico_df = process_mexico_advisory(xml_content)
+    mexico_df = process_mexico_advisory(xml_content, state_name_map, pop_data_df)
     
     if mexico_df is not None:
-        mexico_df, risk_stats = calculate_risk_metrics(mexico_df)
+        mexico_df, risk_stats = calculate_risk_metrics(mexico_df, pop_data_df)
         
         # Display results
         print("\n=== Mexico Travel Advisory Risk Analysis ===")
