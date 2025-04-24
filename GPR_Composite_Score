@@ -309,7 +309,7 @@ def create_composite_gpr(file_path, weights=None, recency_weight=0.7, outlier_se
 
 def main():
     # File path to the GPR data
-    file_path = r"C:\Users\tbstr\Downloads\data_gpr_export.csv"
+    file_path = ''
     
     # Define weights (can be adjusted by user)
     weights = {
