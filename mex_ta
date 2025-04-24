@@ -6,7 +6,7 @@ from bs4 import BeautifulSoup
 import os
 
 # Configuration settings
-RSS_FILE_PATH = t6
+RSS_FILE_PATH = t7  # Path to the XML file
 #RSS_URL = "https://travel.state.gov/_res/rss/TAsTWs.xml"  # Default URL if needed
 
 # Define Mexico population and area data once
@@ -177,11 +177,11 @@ def process_mexico_advisory(xml_content):
             print("No Mexico advisory found in the RSS feed.")
             return None
         
-        # Extract country-level threat level
-        threat_level = "Level 3: Reconsider Travel"  # Default
+        # Extract country-level threat level from the file
+        official_threat_level = "Level 3: Reconsider Travel"  # Default
         for category in mexico_item.findall('category'):
             if category.text and "level" in category.text.lower():
-                threat_level = category.text.strip()
+                official_threat_level = category.text.strip()
                 break
         
         # Extract summary content
@@ -195,13 +195,13 @@ def process_mexico_advisory(xml_content):
         if state_advisories:
             mexico_df = pd.DataFrame(state_advisories)
             mexico_df["Country"] = "Mexico"
-            mexico_df["CountryThreatLevel"] = threat_level
+            mexico_df["OfficialThreatLevel"] = official_threat_level
             
             # Add missing states with default threat level
-            add_missing_states(mexico_df, threat_level)
+            mexico_df = add_missing_states(mexico_df, official_threat_level)
         else:
             # If no state data, create state entries with country-level threat
-            mexico_df = create_default_state_advisories(threat_level)
+            mexico_df = create_default_state_advisories(official_threat_level)
         
         return mexico_df
     
@@ -224,13 +224,13 @@ def add_missing_states(mexico_df, default_threat_level):
                 "Country": "Mexico",
                 "Place": state_name,
                 "SecondaryThreatLevel": default_threat_level,
-                "CountryThreatLevel": default_threat_level
+                "OfficialThreatLevel": default_threat_level
             })
     
     # Add missing states to DataFrame if any
     if missing_states:
         missing_df = pd.DataFrame(missing_states)
-        mexico_df = pd.concat([mexico_df, missing_df], ignore_index=True)
+        return pd.concat([mexico_df, missing_df], ignore_index=True)
     
     return mexico_df
 
@@ -243,7 +243,7 @@ def create_default_state_advisories(threat_level):
             "Country": "Mexico",
             "Place": state_name,
             "SecondaryThreatLevel": threat_level,
-            "CountryThreatLevel": threat_level,
+            "OfficialThreatLevel": threat_level,
             "Population": data[0],
             "Area": data[1]
         })
@@ -285,16 +285,23 @@ def calculate_risk_metrics(mexico_df):
     if composite:
         max_comp = max(composite.values())
         candidates = [r for r, comp in composite.items() if comp == max_comp]
-        total_risk = max(candidates, key=lambda r: risk_map[r]) if candidates else "Level 3: Reconsider Travel"
+        calculated_risk = max(candidates, key=lambda r: risk_map[r]) if candidates else "Level 3: Reconsider Travel"
     else:
-        total_risk = "Level 3: Reconsider Travel"
+        calculated_risk = "Level 3: Reconsider Travel"
+    
+    # Add the calculated risk level to the DataFrame
+    mexico_df["CalculatedThreatLevel"] = calculated_risk
+    
+    # Get the official threat level from the file (first value in the DataFrame)
+    official_risk = mexico_df["OfficialThreatLevel"].iloc[0]
     
     # Create risk statistics
     risk_stats = {
         "population_percentages": pop_pct.to_dict(),
         "area_percentages": area_pct.to_dict(),
         "composite_percentages": composite,
-        "total_risk_level": total_risk
+        "calculated_risk_level": calculated_risk,
+        "official_risk_level": official_risk
     }
     
     return mexico_df, risk_stats
@@ -332,10 +339,19 @@ def main():
         for level, pct in risk_stats["composite_percentages"].items():
             print(f"  {level}: {pct:.2%}")
         
-        print(f"\nTotal Country Risk Score: {risk_stats['total_risk_level']}")
+        print(f"\nRisk Level Comparison:")
+        print(f"  Official Risk Level (from RSS feed): {risk_stats['official_risk_level']}")
+        print(f"  Calculated Risk Level (population/area weighted): {risk_stats['calculated_risk_level']}")
+        
+        # Show difference if there is one
+        if risk_stats['official_risk_level'] != risk_stats['calculated_risk_level']:
+            print(f"\n  NOTE: The calculated risk level differs from the official advisory.")
+            print(f"        This suggests the state-level risks may be weighted differently")
+            print(f"        in the official assessment than our area/population method.")
         
         print("\n=== State-level Advisories (Sample) ===")
-        print(mexico_df[["Place", "SecondaryThreatLevel", "Population", "Area"]].head(5))
+        print(mexico_df[["Place", "SecondaryThreatLevel", "Population", "Area", 
+                         "OfficialThreatLevel", "CalculatedThreatLevel"]].head(5))
         print(f"Total states: {len(mexico_df)}")
         print(f"Unique places: {mexico_df['Place'].nunique()}")
         
