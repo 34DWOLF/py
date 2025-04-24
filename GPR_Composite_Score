@@ -5,7 +5,72 @@ import re
 import warnings
 warnings.filterwarnings('ignore')
 
-def create_composite_gpr(file_path, weights=None, recency_weight=0.7, outlier_sensitivity=1.5):
+#######################################################################
+# CENTRALIZED PARAMETER SECTION - All parameters defined only once
+#######################################################################
+
+# Component weights for the composite GPR score
+DEFAULT_WEIGHTS = {
+    'current_gpr': 0.3,       # Weight for current GPR
+    'historic_gpr': 0.15,     # Weight for historic GPR
+    'global_relative': 0.2,   # Weight for GPR relative to rest of world
+    'historic_relative': 0.15, # Weight for GPR relative to country's history
+    'forecast': 0.2           # Weight for forecasted GPR
+}
+
+# Sensitivity parameters
+DEFAULT_RECENCY_WEIGHT = 0.7       # Weight given to recent data vs historical (0-1)
+DEFAULT_OUTLIER_SENSITIVITY = 1.5   # Multiplier for sensitivity to recent outliers (>1)
+
+# Coverage bias correction parameters
+DEFAULT_COVERAGE_BIAS_THRESHOLD = 1.25  # Threshold above average for identifying bias (lower = stricter)
+DEFAULT_COVERAGE_ADJUSTMENT_POWER = 2.0  # Power factor for adjustment (higher = stronger)
+
+# Countries to exclude from coverage adjustment (even if they have high coverage)
+# This can be useful for countries where high news coverage is justified by actual geopolitical importance
+# rather than media bias or for countries where you want to preserve the raw GPR values
+DEFAULT_COVERAGE_ADJUSTMENT_EXCLUSIONS = [
+    'CHN',  # China
+    'HKG',  # Hong Kong
+    'MEX'   # Mexico
+]
+
+# Forecasting parameters
+DEFAULT_FORECAST_WINDOW = 24  # Months of data used for forecasting
+DEFAULT_ARIMA_ORDER = (1, 1, 1)  # Order parameters for ARIMA model
+DEFAULT_RECENT_TREND_WINDOW = 6  # Months of data used for recent trend calculation
+
+#######################################################################
+# COUNTRY CODE TO NAME MAPPING - For consistent country naming
+#######################################################################
+
+DEFAULT_COUNTRY_CODE_MAP = {
+    'USA': 'United States', 'GBR': 'United Kingdom', 'CHN': 'China', 'RUS': 'Russia',
+    'DEU': 'Germany', 'FRA': 'France', 'JPN': 'Japan', 'IND': 'India', 'BRA': 'Brazil',
+    'ITA': 'Italy', 'CAN': 'Canada', 'AUS': 'Australia', 'ESP': 'Spain', 'MEX': 'Mexico',
+    'KOR': 'South Korea', 'IDN': 'Indonesia', 'TUR': 'Turkey', 'SAU': 'Saudi Arabia',
+    'ZAF': 'South Africa', 'ARG': 'Argentina', 'EGY': 'Egypt', 'NLD': 'Netherlands',
+    'THA': 'Thailand', 'PHL': 'Philippines', 'PAK': 'Pakistan', 'UKR': 'Ukraine',
+    'POL': 'Poland', 'IRN': 'Iran', 'COL': 'Colombia', 'CHE': 'Switzerland',
+    'SWE': 'Sweden', 'BEL': 'Belgium', 'NOR': 'Norway', 'VNM': 'Vietnam',
+    'TWN': 'Taiwan', 'ISR': 'Israel', 'MYS': 'Malaysia', 'PER': 'Peru',
+    'HKG': 'Hong Kong', 'CHL': 'Chile', 'FIN': 'Finland', 'TUN': 'Tunisia',
+    'DNK': 'Denmark', 'PRT': 'Portugal', 'HUN': 'Hungary', 'VEN': 'Venezuela'
+}
+
+def create_composite_gpr(
+        file_path, 
+        weights=DEFAULT_WEIGHTS,
+        recency_weight=DEFAULT_RECENCY_WEIGHT, 
+        outlier_sensitivity=DEFAULT_OUTLIER_SENSITIVITY,
+        coverage_bias_threshold=DEFAULT_COVERAGE_BIAS_THRESHOLD, 
+        coverage_adjustment_power=DEFAULT_COVERAGE_ADJUSTMENT_POWER,
+        coverage_adjustment_exclusions=DEFAULT_COVERAGE_ADJUSTMENT_EXCLUSIONS,
+        forecast_window=DEFAULT_FORECAST_WINDOW,
+        arima_order=DEFAULT_ARIMA_ORDER,
+        recent_trend_window=DEFAULT_RECENT_TREND_WINDOW,
+        country_code_map=DEFAULT_COUNTRY_CODE_MAP
+    ):
     """
     Create a composite GPR rating using the Dario Caldara and Matteo Iacoviello Geopolitical Risk data.
     Only the Composite GPR is scaled to a 1-10 range; all other metrics retain their original values.
@@ -16,23 +81,22 @@ def create_composite_gpr(file_path, weights=None, recency_weight=0.7, outlier_se
     weights (dict): Dictionary containing weights for each component of the composite score
     recency_weight (float): Weight given to recent data vs historical (0-1, higher = more recent focus)
     outlier_sensitivity (float): Multiplier for sensitivity to recent outliers (>1 = more sensitive)
+    coverage_bias_threshold (float): Threshold above average for identifying coverage bias (lower = stricter)
+    coverage_adjustment_power (float): Power factor for coverage adjustment (higher = stronger adjustment)
+    coverage_adjustment_exclusions (list): List of country codes to exclude from coverage adjustment
+    forecast_window (int): Number of months of data to use for forecasting
+    arima_order (tuple): Order parameters (p,d,q) for ARIMA forecasting model
+    recent_trend_window (int): Number of months to use for recent trend calculation
+    country_code_map (dict): Mapping of country codes to full country names
     
     Returns:
     pandas.DataFrame: DataFrame containing the composite GPR scores
     """
-    # Default weights if not provided
-    if weights is None:
-        weights = {
-            'current_gpr': 0.3,
-            'historic_gpr': 0.15,
-            'global_relative': 0.2,
-            'historic_relative': 0.15,
-            'forecast': 0.2
-        }
-    
     # Ensure weights sum to 1
     weight_sum = sum(weights.values())
     if weight_sum != 1.0:
+        # Create a copy to avoid modifying the global DEFAULT_WEIGHTS
+        weights = weights.copy()
         for key in weights:
             weights[key] = weights[key] / weight_sum
     
@@ -53,21 +117,6 @@ def create_composite_gpr(file_path, weights=None, recency_weight=0.7, outlier_se
     
     # Create mapping of country codes to full country names using var_name and var_label
     country_names = {}
-    
-    # Manually set country names for common country codes in case var_label extraction fails
-    country_code_map = {
-        'USA': 'United States', 'GBR': 'United Kingdom', 'CHN': 'China', 'RUS': 'Russia',
-        'DEU': 'Germany', 'FRA': 'France', 'JPN': 'Japan', 'IND': 'India', 'BRA': 'Brazil',
-        'ITA': 'Italy', 'CAN': 'Canada', 'AUS': 'Australia', 'ESP': 'Spain', 'MEX': 'Mexico',
-        'KOR': 'South Korea', 'IDN': 'Indonesia', 'TUR': 'Turkey', 'SAU': 'Saudi Arabia',
-        'ZAF': 'South Africa', 'ARG': 'Argentina', 'EGY': 'Egypt', 'NLD': 'Netherlands',
-        'THA': 'Thailand', 'PHL': 'Philippines', 'PAK': 'Pakistan', 'UKR': 'Ukraine',
-        'POL': 'Poland', 'IRN': 'Iran', 'COL': 'Colombia', 'CHE': 'Switzerland',
-        'SWE': 'Sweden', 'BEL': 'Belgium', 'NOR': 'Norway', 'VNM': 'Vietnam',
-        'TWN': 'Taiwan', 'ISR': 'Israel', 'MYS': 'Malaysia', 'PER': 'Peru',
-        'HKG': 'Hong Kong', 'CHL': 'Chile', 'FIN': 'Finland', 'TUN': 'Tunisia',
-        'DNK': 'Denmark', 'PRT': 'Portugal', 'HUN': 'Hungary', 'VEN': 'Venezuela'
-    }
     
     # Update with the default mapping
     country_names.update(country_code_map)
@@ -94,12 +143,12 @@ def create_composite_gpr(file_path, weights=None, recency_weight=0.7, outlier_se
         for code in country_codes:
             country_names[code] = code
     
-    # Get the most recent 24 months for forecasting and recent trend analysis
-    recent_dates = sorted(df['date'].unique())[-24:]
+    # Get the data for forecasting and recent trend analysis
+    recent_dates = sorted(df['date'].unique())[-forecast_window:]
     recent_df = df[df['date'].isin(recent_dates)]
     
-    # Get the very recent months (last 6 months) for detecting recent outliers
-    very_recent_dates = sorted(df['date'].unique())[-6:]
+    # Get the very recent months for detecting recent outliers
+    very_recent_dates = sorted(df['date'].unique())[-recent_trend_window:]
     very_recent_df = df[df['date'].isin(very_recent_dates)]
     
     # Get the latest date with data
@@ -113,14 +162,39 @@ def create_composite_gpr(file_path, weights=None, recency_weight=0.7, outlier_se
         if current_gpr_col in df.columns:
             global_avg_coverage[country_code] = df[current_gpr_col].mean()
     
-    # Find countries with potential coverage bias (significantly above average coverage)
+    # Find countries with potential coverage bias - using more aggressive threshold
+    # Exclude countries in the exclusion list
     overall_avg = np.mean(list(global_avg_coverage.values()))
-    coverage_bias_countries = {code: val/overall_avg for code, val in global_avg_coverage.items() if val > overall_avg * 1.5}
+    coverage_bias_countries = {
+        code: val/overall_avg for code, val in global_avg_coverage.items() 
+        if val > overall_avg * coverage_bias_threshold and code not in coverage_adjustment_exclusions
+    }
+    
+    # Print identified countries with coverage bias
+    bias_countries = sorted([(country_names.get(code, code), bias) 
+                            for code, bias in coverage_bias_countries.items()], 
+                           key=lambda x: x[1], reverse=True)
+    
+    print("Countries with coverage bias (bias factor):")
+    for country, bias in bias_countries:
+        print(f"  {country}: {bias:.2f}x average coverage")
+    
+    # Print excluded countries that would have been adjusted
+    excluded_with_bias = [
+        (country_names.get(code, code), global_avg_coverage[code]/overall_avg)
+        for code in coverage_adjustment_exclusions
+        if code in global_avg_coverage and global_avg_coverage[code] > overall_avg * coverage_bias_threshold
+    ]
+    if excluded_with_bias:
+        print("\nExcluded from adjustment despite high coverage:")
+        for country, bias in excluded_with_bias:
+            print(f"  {country}: {bias:.2f}x average coverage (excluded)")
     
     # Initialize result dataframe
     result_columns = ['Date', 'Country', 'Composite GPR', 'Current GPR', 'Historic GPR', 
                       'Average GPR over time', 'Average GPR of the rest of the countries', 
-                      'Forecasted GPR', 'Recent Trend', 'Coverage Adjustment']
+                      'Forecasted GPR', 'Recent Trend', 'Coverage Adjustment', 'Raw Bias Factor', 
+                      'Adjustment Applied']
     result_df = pd.DataFrame(columns=result_columns)
     
     # Process each country
@@ -164,7 +238,7 @@ def create_composite_gpr(file_path, weights=None, recency_weight=0.7, outlier_se
         other_countries_cols = [col for col in current_gpr_cols if col != current_gpr_col]
         avg_gpr_rest = latest_row[other_countries_cols].mean()
         
-        # Calculate recent trend (percentage change in last 6 months)
+        # Calculate recent trend (percentage change in last few months)
         if len(very_recent_df) >= 2:
             earliest_recent = very_recent_df.iloc[0][current_gpr_col]
             latest_recent = very_recent_df.iloc[-1][current_gpr_col]
@@ -180,23 +254,32 @@ def create_composite_gpr(file_path, weights=None, recency_weight=0.7, outlier_se
             recent_trend = recent_trend * outlier_sensitivity
         
         # Calculate coverage adjustment factor for countries with heavy news coverage
+        # Store raw bias factor for reporting
+        raw_bias_factor = 1.0
         coverage_adjustment = 1.0
+        adjustment_applied = "No"
+        
         if country_code in coverage_bias_countries:
             bias_factor = coverage_bias_countries[country_code]
-            # Gradually reduce impact as bias factor increases
-            # This prevents over-correction for countries with legitimately high GPR
-            if bias_factor > 2:
-                coverage_adjustment = 1.0 / np.log2(bias_factor)
-            else:
-                coverage_adjustment = 1.0 / bias_factor
+            raw_bias_factor = bias_factor
+            
+            # Apply more aggressive adjustment using power factor
+            coverage_adjustment = 1.0 / (bias_factor ** coverage_adjustment_power)
+            adjustment_applied = "Yes"
+        elif country_code in coverage_adjustment_exclusions and country_code in global_avg_coverage:
+            # This is an excluded country - show bias factor but don't apply adjustment
+            bias = global_avg_coverage[country_code]/overall_avg
+            if bias > coverage_bias_threshold:
+                raw_bias_factor = bias
+                adjustment_applied = "No (Excluded)"
         
         # Forecast the GPR for next month using ARIMA
         try:
-            # Get GPR time series for the last 24 months
+            # Get GPR time series for forecasting
             country_gpr_series = recent_df[current_gpr_col].dropna()
             
-            if len(country_gpr_series) >= 12:  # Need enough data for forecasting
-                model = ARIMA(country_gpr_series, order=(1, 1, 1))
+            if len(country_gpr_series) >= forecast_window/2:  # Need enough data for forecasting
+                model = ARIMA(country_gpr_series, order=arima_order)
                 model_fit = model.fit()
                 forecast = model_fit.forecast(steps=1)[0]
             else:
@@ -215,18 +298,35 @@ def create_composite_gpr(file_path, weights=None, recency_weight=0.7, outlier_se
         global_min = min(all_gpr_values)
         global_max = max(all_gpr_values)
         
-        # For relative position within current global landscape
-        current_gpr_values = [latest_row[col] for col in current_gpr_cols]
+        # For relative position within current global landscape - APPLY COVERAGE ADJUSTMENT HERE TOO
+        current_gpr_values = []
+        for col in current_gpr_cols:
+            val = latest_row[col]
+            # Apply coverage adjustment to other countries' values when calculating relative position
+            # Skip excluded countries
+            col_country_code = col.split('_')[1]
+            if col_country_code in coverage_bias_countries:
+                col_bias = coverage_bias_countries[col_country_code]
+                col_adj = 1.0 / (col_bias ** coverage_adjustment_power)
+                val = val * col_adj
+            current_gpr_values.append(val)
+            
         current_min = min(current_gpr_values)
         current_max = max(current_gpr_values)
-        global_relative_position = (current_gpr - current_min) / (current_max - current_min) if current_max > current_min else 0.5
+        
+        # Use adjusted current GPR for relative position calculation
+        adjusted_current_gpr = current_gpr * coverage_adjustment
+        global_relative_position = (adjusted_current_gpr - current_min) / (current_max - current_min) if current_max > current_min else 0.5
         
         # For relative position compared to country's own history with heightened sensitivity to recent changes
-        country_min = df[current_gpr_col].min()
-        country_max = df[current_gpr_col].max()
+        # Apply coverage adjustment to historical data as well
+        country_values = df[current_gpr_col].values
+        adjusted_country_values = country_values * coverage_adjustment
+        country_min = min(adjusted_country_values)
+        country_max = max(adjusted_country_values)
         
         # Enhance historical relative position by factoring in recent trend
-        base_historic_relative = (current_gpr - country_min) / (country_max - country_min) if country_max > country_min else 0.5
+        base_historic_relative = (adjusted_current_gpr - country_min) / (country_max - country_min) if country_max > country_min else 0.5
         
         # Adjust historical position based on recent trend
         if recent_trend > 0:
@@ -267,10 +367,12 @@ def create_composite_gpr(file_path, weights=None, recency_weight=0.7, outlier_se
                         c_gpr = latest_row[c_gpr_col]
                         h_gpr = latest_row[h_gpr_col]
                         
-                        # Apply coverage adjustment if applicable
+                        # Apply coverage adjustment if applicable (skip excluded countries)
                         if code in coverage_bias_countries:
-                            c_gpr = c_gpr * (1.0 / coverage_bias_countries[code])
-                            h_gpr = h_gpr * (1.0 / coverage_bias_countries[code])
+                            c_bias = coverage_bias_countries[code]
+                            c_adj = 1.0 / (c_bias ** coverage_adjustment_power)
+                            c_gpr = c_gpr * c_adj
+                            h_gpr = h_gpr * c_adj
                         
                         # Simple estimation of other countries' composite scores (for scaling purposes only)
                         all_raw_composites.append(weights['current_gpr'] * c_gpr + weights['historic_gpr'] * h_gpr)
@@ -298,7 +400,9 @@ def create_composite_gpr(file_path, weights=None, recency_weight=0.7, outlier_se
             'Average GPR of the rest of the countries': round(avg_gpr_rest, 4),  # Original value
             'Forecasted GPR': round(forecast, 4),  # Original value
             'Recent Trend': round(recent_trend * 100, 2),  # Percentage change
-            'Coverage Adjustment': round(coverage_adjustment, 4)  # Adjustment for coverage bias
+            'Coverage Adjustment': round(coverage_adjustment, 4),  # Adjustment for coverage bias
+            'Raw Bias Factor': round(raw_bias_factor, 2),  # Raw bias factor for reference
+            'Adjustment Applied': adjustment_applied  # Whether adjustment was applied
         }
         result_df = pd.concat([result_df, pd.DataFrame([new_row])], ignore_index=True)
     
@@ -308,25 +412,26 @@ def create_composite_gpr(file_path, weights=None, recency_weight=0.7, outlier_se
     return result_df
 
 def main():
+    """
+    Main function to run the GPR composite rating calculator.
+    Uses centralized default parameters defined at the top of the file.
+    """
     # File path to the GPR data
     file_path = ''
     
-    # Define weights (can be adjusted by user)
-    weights = {
-        'current_gpr': 0.3,       # Weight for current GPR
-        'historic_gpr': 0.15,     # Weight for historic GPR
-        'global_relative': 0.2,   # Weight for GPR relative to rest of world
-        'historic_relative': 0.15, # Weight for GPR relative to country's history
-        'forecast': 0.2           # Weight for forecasted GPR
-    }
-    
-    # Create composite GPR with enhanced sensitivity to recent trends
-    # recency_weight=0.7: Gives 70% weight to recent data vs. historical
-    # outlier_sensitivity=1.5: Increases sensitivity to recent outliers by 50%
-    result_df = create_composite_gpr(file_path, weights, recency_weight=0.7, outlier_sensitivity=1.5)
+    # Create composite GPR using the centralized parameters
+    # All parameters have defaults defined at the top of the file
+    # Any parameter can be overridden here if needed
+    result_df = create_composite_gpr(
+        file_path=file_path,
+        # All other parameters use defaults unless explicitly specified here
+        
+        # Example of overriding default parameters:
+        # coverage_adjustment_exclusions=['USA', 'CHN', 'HKG']  # Add USA to exclusion list
+    )
     
     # Display results
-    print(f"Composite GPR Ratings (weights: {weights})")
+    print(f"Composite GPR Ratings (weights: {DEFAULT_WEIGHTS})")
     print(f"Total countries analyzed: {len(result_df)}")
     display(result_df)
     
