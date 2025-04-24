@@ -6,7 +6,7 @@ from bs4 import BeautifulSoup
 from typing import Dict, List, Tuple, Any
 
 # Define file path at the very start - used throughout the code
-DEFAULT_FILE_PATH = t2
+DEFAULT_FILE_PATH = t3
 
 ###############################################################################
 # 1) HELPER FUNCTIONS
@@ -552,11 +552,13 @@ def calculate_mexico_risk_metrics(mexico_df, pop_data):
     # Calculate percentages by risk level
     if pop_total != 0 and "SecondaryThreatLevel" in merged_mexico.columns:
         pop_pct = merged_mexico.groupby("SecondaryThreatLevel")["Population"].sum() / pop_total
+        pop_pct = pop_pct.fillna(value=0)  # Fill any NaN values with 0
     else:
         pop_pct = pd.Series(dtype='float64')
     
     if area_total != 0 and "SecondaryThreatLevel" in merged_mexico.columns:
         area_pct = merged_mexico.groupby("SecondaryThreatLevel")["Area"].sum() / area_total
+        area_pct = area_pct.fillna(value=0)  # Fill any NaN values with 0
     else:
         area_pct = pd.Series(dtype='float64')
     
@@ -810,4 +812,4 @@ def main(file_path=None):
         return None
 
 if __name__ == "__main__":
-    result = main()
+    main()
