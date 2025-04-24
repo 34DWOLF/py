@@ -5,6 +5,9 @@ import pandas as pd
 from bs4 import BeautifulSoup
 from typing import Dict, List, Tuple, Any
 
+# Define file path at the very start - used throughout the code
+DEFAULT_FILE_PATH = os.path.join(os.path.expanduser("~/Downloads"), "traveladvisory.xml")
+
 ###############################################################################
 # 1) HELPER FUNCTIONS
 ###############################################################################
@@ -596,8 +599,8 @@ def calculate_mexico_risk_metrics(mexico_df, pop_data):
 def main(file_path=None):
     """Main function to process travel advisory data."""
     if file_path is None:
-        # Define default file path if none provided
-        file_path = ""
+        # Use the globally defined file path if none provided
+        file_path = DEFAULT_FILE_PATH
     
     # Mexico population data with "State" added to names
     pop_data = [
