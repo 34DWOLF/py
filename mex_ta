@@ -2,12 +2,8 @@ import os
 import re
 import xml.etree.ElementTree as ET
 import pandas as pd
-import numpy as np
 from bs4 import BeautifulSoup
 from typing import Dict, List, Tuple, Any
-
-# Define file path at the very start - used throughout the code
-DEFAULT_FILE_PATH = t4
 
 ###############################################################################
 # 1) HELPER FUNCTIONS
@@ -132,57 +128,55 @@ def parse_mexico_states(summary_html):
     
     return results
 
-def process_rss_travel_advisory(file_path):
+def process_travel_advisory_data(file_path):
     """
-    Process the travel advisory RSS XML file with focus on Mexico.
+    Main function to process travel advisory data with focus on Mexico.
     """
-    print(f"Processing travel advisory RSS data from: {file_path}")
+    print(f"Processing travel advisory data from: {file_path}")
     
     try:
-        # Parse the XML file and handle RSS namespace
-        with open(file_path, 'r', encoding='utf-8') as f:
-            xml_content = f.read()
+        # Parse the XML file
+        tree = ET.parse(file_path)
+        root = tree.getroot()
+        ns = {'atom': 'http://www.w3.org/2005/Atom'}
         
-        # Define namespaces used in the RSS feed - common ones for travel advisories
-        namespaces = {
-            'rss': 'http://purl.org/rss/1.0/',
-            'atom': 'http://www.w3.org/2005/Atom',
-            'content': 'http://purl.org/rss/1.0/modules/content/',
-            'dc': 'http://purl.org/dc/elements/1.1/'
-        }
-        
-        # Register namespaces with ElementTree
-        for prefix, uri in namespaces.items():
-            ET.register_namespace(prefix, uri)
-        
-        # Parse the RSS content
-        root = ET.fromstring(xml_content)
-        
-        # Determine the RSS format - could be RSS 2.0, Atom, or other
-        if root.tag.endswith('rss'):
-            # Standard RSS format
-            print("Detected RSS format")
-            items = root.findall('.//item')
-            all_rows = parse_rss_items(items)
-        elif root.tag.endswith('feed'):
-            # Atom format
-            print("Detected Atom format")
-            entries = root.findall('.//atom:entry', namespaces)
-            all_rows = parse_atom_entries(entries, namespaces)
-        else:
-            # Try to handle as a generic XML format
-            print("Unknown XML format, attempting generic parsing")
-            # Look for common entry patterns
-            items = root.findall('.//item') or root.findall('.//entry')
-            all_rows = parse_generic_xml_entries(items)
+        # Create a DataFrame with all country data
+        all_rows = []
+        for entry in root.findall('atom:entry', ns):
+            title_elem = entry.find('atom:title', ns)
+            title = title_elem.text.strip() if (title_elem is not None and title_elem.text) else None
+            country = title.split(" - ")[0].strip() if title else None
+            
+            country_tag_elem = entry.find("atom:category[@label='Country-Tag']", ns)
+            country_tag = country_tag_elem.get('term') if country_tag_elem is not None else None
+            threat_elem = entry.find("atom:category[@label='Threat-Level']", ns)
+            primary_threat = threat_elem.get('term') if threat_elem is not None else None
+            
+            summary_elem = entry.find('atom:summary', ns)
+            if summary_elem is not None:
+                raw_summary = get_full_text(summary_elem)
+                summary_clean = re.sub(r'[\r\n]+', ' ', raw_summary)
+                summary_clean = re.sub(r'\s+', ' ', summary_clean).strip()
+            else:
+                summary_clean = None
+            
+            # Identify Mexico entries
+            if (country and "mexico" in country.lower()) or (country_tag and country_tag.upper() == "MX"):
+                country = "Mexico"
+                
+                row = {
+                    "Title": title,
+                    "Country": country,
+                    "ThreatLevel": primary_threat,
+                    "Summary": summary_clean,
+                    "CountryTag": country_tag
+                }
+                all_rows.append(row)
         
         # Create main dataframe
         df = pd.DataFrame(all_rows)
         
-        # Filter for Mexico entries
-        mexico_df = df[df['Country'].str.contains('Mexico', case=False, na=False)]
-        
-        if mexico_df.empty:
+        if df.empty:
             print("No Mexico data found in the file.")
             return None, None
             
@@ -190,224 +184,31 @@ def process_rss_travel_advisory(file_path):
         
         # Extract Mexico state-level data
         mexico_df_rows = []
-        for _, row in mexico_df.iterrows():
-            adv_list = parse_mexico_states(row.get("Summary", "") or "")
+        for _, row in df.iterrows():
+            adv_list = parse_mexico_states(row["Summary"] or "")
             if adv_list:
                 for adv in adv_list:
                     new_row = row.copy()
                     new_row["Place"] = adv["Place"]
                     new_row["SecondaryThreatLevel"] = adv["SecondaryThreatLevel"]
-                    new_row["Reason"] = adv.get("Reason", "")
                     mexico_df_rows.append(new_row)
             else:
                 new_row = row.copy()
                 new_row["Place"] = None
-                new_row["SecondaryThreatLevel"] = None
                 mexico_df_rows.append(new_row)
         
-        mexico_state_df = pd.DataFrame(mexico_df_rows)
+        mexico_df = pd.DataFrame(mexico_df_rows)
         
-        return mexico_df, mexico_state_df
+        return df, mexico_df
         
     except ET.ParseError as e:
         print(f"Error parsing XML: {e}")
-        # Try alternate parsing approach for malformed XML
-        try:
-            print("Attempting alternate parsing approach...")
-            # Use more lenient BeautifulSoup parsing
-            soup = BeautifulSoup(xml_content, 'xml')
-            
-            # Try to extract data using BeautifulSoup
-            all_rows = parse_with_beautifulsoup(soup)
-            
-            if all_rows:
-                df = pd.DataFrame(all_rows)
-                mexico_df = df[df['Country'].str.contains('Mexico', case=False, na=False)]
-                
-                if not mexico_df.empty:
-                    # Extract Mexico state-level data
-                    mexico_df_rows = []
-                    for _, row in mexico_df.iterrows():
-                        adv_list = parse_mexico_states(row.get("Summary", "") or "")
-                        if adv_list:
-                            for adv in adv_list:
-                                new_row = row.copy()
-                                new_row["Place"] = adv["Place"]
-                                new_row["SecondaryThreatLevel"] = adv["SecondaryThreatLevel"]
-                                new_row["Reason"] = adv.get("Reason", "")
-                                mexico_df_rows.append(new_row)
-                        else:
-                            new_row = row.copy()
-                            new_row["Place"] = None
-                            new_row["SecondaryThreatLevel"] = None
-                            mexico_df_rows.append(new_row)
-                    
-                    mexico_state_df = pd.DataFrame(mexico_df_rows)
-                    return mexico_df, mexico_state_df
-                else:
-                    print("No Mexico data found in the file.")
-                    return None, None
-            else:
-                print("Failed to extract data using alternate parsing approach.")
-                return None, None
-        except Exception as bs_error:
-            print(f"Error during alternate parsing: {bs_error}")
-            return None, None
+        return None, None
     except Exception as e:
         print(f"Error processing file: {str(e)}")
         import traceback
         traceback.print_exc()
         return None, None
-
-def parse_rss_items(items):
-    """Parse items from a standard RSS feed"""
-    all_rows = []
-    
-    for item in items:
-        # Extract common RSS fields
-        title = get_element_text(item, 'title')
-        description = get_element_text(item, 'description')
-        
-        # Parse country from title (common format: "Country - Advisory")
-        country = title.split(" - ")[0].strip() if title else None
-        
-        # Look for threat level in categories or custom fields
-        threat_level = None
-        categories = item.findall('category')
-        for cat in categories:
-            cat_text = cat.text.strip() if cat.text else ""
-            if "Level" in cat_text and any(word in cat_text.lower() for word in ["travel", "threat"]):
-                threat_level = cat_text
-                break
-        
-        row = {
-            "Title": title,
-            "Country": country,
-            "ThreatLevel": threat_level,
-            "Summary": description
-        }
-        all_rows.append(row)
-    
-    return all_rows
-
-def parse_atom_entries(entries, namespaces):
-    """Parse entries from an Atom feed"""
-    all_rows = []
-    
-    for entry in entries:
-        # Extract common Atom fields
-        title_elem = entry.find('atom:title', namespaces)
-        title = title_elem.text.strip() if (title_elem is not None and title_elem.text) else None
-        
-        # Parse country from title
-        country = title.split(" - ")[0].strip() if title else None
-        
-        # Look for threat level in categories
-        threat_level = None
-        categories = entry.findall("atom:category", namespaces)
-        for cat in categories:
-            if cat.get('label') == "Threat-Level":
-                threat_level = cat.get('term')
-                break
-        
-        # Get summary content
-        summary_elem = entry.find('atom:summary', namespaces)
-        summary = get_full_text(summary_elem) if summary_elem is not None else None
-        
-        row = {
-            "Title": title,
-            "Country": country,
-            "ThreatLevel": threat_level,
-            "Summary": clean_html_content(summary)
-        }
-        all_rows.append(row)
-    
-    return all_rows
-
-def parse_generic_xml_entries(entries):
-    """Parse entries from a generic XML format"""
-    all_rows = []
-    
-    for entry in entries:
-        # Try to find common fields with various possible tag names
-        title = get_element_text(entry, 'title') or get_element_text(entry, 'name')
-        summary = (get_element_text(entry, 'summary') or 
-                   get_element_text(entry, 'description') or 
-                   get_element_text(entry, 'content'))
-        
-        # Parse country from title
-        country = title.split(" - ")[0].strip() if title else None
-        
-        # Look for threat level in any element
-        threat_level = None
-        for elem in entry:
-            elem_text = elem.text.strip() if elem.text else ""
-            if "Level" in elem_text and any(word in elem_text.lower() for word in ["travel", "threat"]):
-                threat_level = elem_text
-                break
-        
-        row = {
-            "Title": title,
-            "Country": country,
-            "ThreatLevel": threat_level,
-            "Summary": clean_html_content(summary)
-        }
-        all_rows.append(row)
-    
-    return all_rows
-
-def parse_with_beautifulsoup(soup):
-    """Parse RSS or Atom feed using BeautifulSoup"""
-    all_rows = []
-    
-    # Try to find items or entries (RSS vs Atom)
-    items = soup.find_all('item') or soup.find_all('entry')
-    
-    for item in items:
-        # Extract fields based on tag names
-        title_tag = item.find('title')
-        title = title_tag.get_text(strip=True) if title_tag else None
-        
-        # Parse country from title
-        country = title.split(" - ")[0].strip() if title else None
-        
-        # Look for summary/description/content
-        summary_tag = (item.find('summary') or item.find('description') or 
-                      item.find('content') or item.find('content:encoded'))
-        summary = summary_tag.get_text(strip=True) if summary_tag else None
-        
-        # Look for threat level
-        threat_level = None
-        category_tags = item.find_all('category')
-        for cat in category_tags:
-            if cat.has_attr('label') and cat['label'] == "Threat-Level" and cat.has_attr('term'):
-                threat_level = cat['term']
-                break
-        
-        row = {
-            "Title": title,
-            "Country": country,
-            "ThreatLevel": threat_level,
-            "Summary": clean_html_content(summary)
-        }
-        all_rows.append(row)
-    
-    return all_rows
-
-def get_element_text(element, tag_name):
-    """Safely get text from an XML element"""
-    elem = element.find(tag_name)
-    return elem.text.strip() if (elem is not None and elem.text) else None
-
-def clean_html_content(html_content):
-    """Clean HTML content and normalize whitespace"""
-    if not html_content:
-        return ""
-    
-    # Remove newlines and excessive whitespace
-    text = re.sub(r'[\r\n]+', ' ', html_content)
-    text = re.sub(r'\s+', ' ', text).strip()
-    return text
 
 def calculate_mexico_risk_metrics(mexico_df, pop_data):
     """
@@ -419,8 +220,7 @@ def calculate_mexico_risk_metrics(mexico_df, pop_data):
     
     # Create cleaned keys for merging
     if "Place" in mexico_df.columns:
-        # Fill NaN values with empty string before applying string methods
-        mexico_df["StateName_clean"] = mexico_df["Place"].replace(np.nan, "").str.strip().str.lower()
+        mexico_df["StateName_clean"] = mexico_df["Place"].fillna("").str.strip().str.lower()
     else:
         # If Place column doesn't exist, create an empty StateName_clean column
         mexico_df["StateName_clean"] = ""
@@ -436,6 +236,7 @@ def calculate_mexico_risk_metrics(mexico_df, pop_data):
     print(mex_pop_df["State_clean"].head(10).tolist())
     
     # More aggressive state name mapping
+    # First, create a mapping of common advisory names to our population data names
     advisory_to_pop_map = {}
     for pop_state in mex_pop_df["State_clean"]:
         # For states with "State" in the name
@@ -489,6 +290,7 @@ def calculate_mexico_risk_metrics(mexico_df, pop_data):
         print(f"Population states that didn't match: {list(unmatched_pop)}")
     
     # For unmatched population states, create placeholder rows with default threat level
+    # This ensures all states are included in the analysis
     if not mexico_df.empty and "ThreatLevel" in mexico_df.columns:
         default_threat = mexico_df["ThreatLevel"].iloc[0]
     else:
@@ -539,7 +341,7 @@ def calculate_mexico_risk_metrics(mexico_df, pop_data):
     
     # Ensure SecondaryThreatLevel is populated for all rows
     if "SecondaryThreatLevel" in merged_mexico.columns:
-        merged_mexico["SecondaryThreatLevel"] = merged_mexico["SecondaryThreatLevel"].replace(np.nan, default_threat)
+        merged_mexico["SecondaryThreatLevel"] = merged_mexico["SecondaryThreatLevel"].fillna(default_threat)
     else:
         merged_mexico["SecondaryThreatLevel"] = default_threat
     
@@ -553,15 +355,13 @@ def calculate_mexico_risk_metrics(mexico_df, pop_data):
     # Calculate percentages by risk level
     if pop_total != 0 and "SecondaryThreatLevel" in merged_mexico.columns:
         pop_pct = merged_mexico.groupby("SecondaryThreatLevel")["Population"].sum() / pop_total
-        pop_pct = pop_pct.replace(np.nan, 0)  # Fill any NaN values with 0
     else:
-        pop_pct = pd.Series(dtype='float64')
+        pop_pct = pd.Series()
     
     if area_total != 0 and "SecondaryThreatLevel" in merged_mexico.columns:
         area_pct = merged_mexico.groupby("SecondaryThreatLevel")["Area"].sum() / area_total
-        area_pct = area_pct.replace(np.nan, 0)  # Fill any NaN values with 0
     else:
-        area_pct = pd.Series(dtype='float64')
+        area_pct = pd.Series()
     
     # Define risk levels and mapping
     risk_levels = ["Level 2: Exercise Increased Caution", 
@@ -599,11 +399,11 @@ def calculate_mexico_risk_metrics(mexico_df, pop_data):
     
     return merged_mexico, risk_stats
 
-def main(file_path=None):
+def main():
     """Main function to process travel advisory data."""
-    if file_path is None:
-        # Use the globally defined file path if none provided
-        file_path = DEFAULT_FILE_PATH
+    # Define file path
+    download_folder = r"C:\Users\tbstr\Downloads"
+    file_path = t5
     
     # Mexico population data with "State" added to names
     pop_data = [
@@ -641,8 +441,8 @@ def main(file_path=None):
         [2020, "Zacatecas State", 1622138, 29064]
     ]
     
-    # Process travel advisory data using the improved RSS processor
-    mexico_df, mexico_state_df = process_rss_travel_advisory(file_path)
+    # Process travel advisory data
+    mexico_df, mexico_state_df = process_travel_advisory_data(file_path)
     
     if mexico_df is None:
         # Manual fallback for Mexico data if parsing fails
@@ -651,67 +451,35 @@ def main(file_path=None):
             with open(file_path, 'r', encoding='utf-8') as f:
                 content = f.read()
             
-            # Try different patterns for Mexico entry based on common RSS/Atom formats
-            # RSS format attempt
-            mexico_pattern_rss = r'<item>.*?<title>Mexico.*?</title>.*?</item>'
-            mexico_match_rss = re.search(mexico_pattern_rss, content, re.DOTALL | re.IGNORECASE)
+            # Search for Mexico entry
+            mexico_pattern = r'<entry>.*?Mexico.*?</entry>'
+            mexico_match = re.search(mexico_pattern, content, re.DOTALL)
             
-            # Atom format attempt
-            mexico_pattern_atom = r'<entry>.*?<title>Mexico.*?</title>.*?</entry>'
-            mexico_match_atom = re.search(mexico_pattern_atom, content, re.DOTALL | re.IGNORECASE)
-            
-            mexico_entry = None
-            if mexico_match_rss:
-                mexico_entry = mexico_match_rss.group(0)
-                format_type = "RSS"
-            elif mexico_match_atom:
-                mexico_entry = mexico_match_atom.group(0)
-                format_type = "Atom"
-            
-            if mexico_entry:
-                print(f"Found Mexico entry in {format_type} format")
+            if mexico_match:
+                mexico_entry = mexico_match.group(0)
                 
-                # Extract threat level based on format type
-                threat_level = None
-                if format_type == "RSS":
-                    threat_level_pattern = r'<category[^>]*>Level \d+[^<]*</category>'
-                else:  # Atom
-                    threat_level_pattern = r'<category label="Threat-Level" term="(Level \d+.*?)"'
-                
+                # Extract threat level
+                threat_level_pattern = r'<category label="Threat-Level" term="(Level \d+.*?)"'
                 threat_match = re.search(threat_level_pattern, mexico_entry)
                 
                 # Extract summary content
-                summary = None
-                if format_type == "RSS":
-                    summary_pattern = r'<description>(.*?)</description>'
-                else:  # Atom
-                    summary_pattern = r'<summary.*?>(.*?)</summary>'
-                
+                summary_pattern = r'<summary type="html">(.*?)</summary>'
                 summary_match = re.search(summary_pattern, mexico_entry, re.DOTALL)
                 
-                if threat_match:
-                    if format_type == "RSS":
-                        threat_level = re.sub(r'<.*?>', '', threat_match.group(0)).strip()
-                    else:  # Atom
-                        threat_level = threat_match.group(1)
-                    
-                    print(f"Extracted Mexico threat level: {threat_level}")
-                
-                if summary_match:
+                if threat_match and summary_match:
+                    threat_level = threat_match.group(1)
                     summary = summary_match.group(1)
-                    # Clean HTML tags if present
-                    summary = re.sub(r'<.*?>', ' ', summary)
-                    summary = re.sub(r'\s+', ' ', summary).strip()
-                
-                # Create Mexico dataframe with default threat level
-                mexico_df = pd.DataFrame([{
-                    "Country": "Mexico",
-                    "ThreatLevel": threat_level,
-                    "Summary": summary
-                }])
-                
-                # Try to extract state-level data
-                if summary:
+                    
+                    print(f"Manually extracted Mexico threat level: {threat_level}")
+                    
+                    # Create Mexico dataframe with default threat level
+                    mexico_df = pd.DataFrame([{
+                        "Country": "Mexico",
+                        "ThreatLevel": threat_level,
+                        "Summary": summary
+                    }])
+                    
+                    # Try to extract state-level data
                     adv_list = parse_mexico_states(summary)
                     
                     if adv_list:
@@ -735,19 +503,19 @@ def main(file_path=None):
                             "Summary": summary
                         }])
                 else:
-                    print("Could not extract summary from Mexico entry.")
-                    return None
+                    print("Could not extract threat level or summary from Mexico entry.")
+                    return
             else:
                 print("Mexico entry not found in the content.")
-                return None
+                return
         except Exception as e:
             print(f"Error during manual extraction: {e}")
-            return None
+            return
     
     # If Mexico state-level data is available, calculate risk metrics
     if mexico_state_df is not None:
-        # Look for state level threat data in the summary
-        if "SecondaryThreatLevel" not in mexico_df.columns or not any(mexico_df["SecondaryThreatLevel"].notna()):
+        # If no state-level threat data found, apply country-level threat to all states
+        if not any(mexico_state_df["SecondaryThreatLevel"].notna()):
             print("No state-specific threat levels found. Using country-level threat for all states.")
             # Create default state entries with primary threat level
             default_threat = mexico_df["ThreatLevel"].iloc[0] if not mexico_df.empty else "Level 3: Reconsider Travel"
@@ -797,14 +565,10 @@ def main(file_path=None):
         # Return the integrated Mexico DataFrame as a standalone DataFrame for other code blocks to use
         final_mexico_df = merged_mexico[["State", "SecondaryThreatLevel", "Population", "Area", "ThreatLevel"]]
         
-        # Using display() to show the full dataframe (if running in Jupyter notebook)
-        try:
-            from IPython.display import display
-            print("\n=== Full Integrated Mexico DataFrame (For Use in Other Code Blocks) ===")
-            display(final_mexico_df)
-        except ImportError:
-            print("\n=== Full Integrated Mexico DataFrame (For Use in Other Code Blocks) ===")
-            print(final_mexico_df)
+        # Using display() to show the full dataframe
+        from IPython.display import display
+        print("\n=== Full Integrated Mexico DataFrame (For Use in Other Code Blocks) ===")
+        display(final_mexico_df)
         
         # Return the dataframe to be used by other code
         return final_mexico_df
@@ -813,5 +577,4 @@ def main(file_path=None):
         return None
 
 if __name__ == "__main__":
-    # Simple main execution - just call the main function
     main()
