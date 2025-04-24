@@ -5,10 +5,7 @@ import re
 import warnings
 warnings.filterwarnings('ignore')
 
-#######################################################################
-# CENTRALIZED PARAMETER SECTION - All parameters defined only once
-#######################################################################
-
+# Centralized Paramaeters
 # Component weights for the composite GPR score
 DEFAULT_WEIGHTS = {
     'current_gpr': 0.3,       # Weight for current GPR
@@ -40,10 +37,7 @@ DEFAULT_FORECAST_WINDOW = 24  # Months of data used for forecasting
 DEFAULT_ARIMA_ORDER = (1, 1, 1)  # Order parameters for ARIMA model
 DEFAULT_RECENT_TREND_WINDOW = 6  # Months of data used for recent trend calculation
 
-#######################################################################
-# COUNTRY CODE TO NAME MAPPING - For consistent country naming
-#######################################################################
-
+# Country code name mapping
 DEFAULT_COUNTRY_CODE_MAP = {
     'USA': 'United States', 'GBR': 'United Kingdom', 'CHN': 'China', 'RUS': 'Russia',
     'DEU': 'Germany', 'FRA': 'France', 'JPN': 'Japan', 'IND': 'India', 'BRA': 'Brazil',
