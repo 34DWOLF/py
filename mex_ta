@@ -3,406 +3,306 @@ import re
 import xml.etree.ElementTree as ET
 import pandas as pd
 from bs4 import BeautifulSoup
+import feedparser
 from typing import Dict, List, Tuple, Any
 
-###############################################################################
-# 1) HELPER FUNCTIONS
-###############################################################################
-def get_full_text(elem):
+def extract_reason(text, state_name=""):
     """
-    Recursively extracts text from an element and its subelements,
-    concatenating all text content.
+    Extract the reason for a travel advisory from the text.
+    
+    Args:
+        text (str): The advisory text to extract from
+        state_name (str): The name of the place (state/city) to look for
+        
+    Returns:
+        str: The extracted reason
     """
-    texts = []
-    if elem.text:
-        texts.append(elem.text)
-    for sub in elem:
-        texts.append(get_full_text(sub))
-        if sub.tail:
-            texts.append(sub.tail)
-    return "".join(texts)
+    # Look for explicit reason patterns
+    reason_patterns = [
+        r"due to\s+([^\.]+)",
+        r"because of\s+([^\.]+)",
+        r"as a result of\s+([^\.]+)"
+    ]
+    
+    for pattern in reason_patterns:
+        match = re.search(pattern, text, re.I)
+        if match:
+            reason_text = match.group(1).strip()
+            return reason_text
+    
+    # Common reason keywords as fallback
+    common_reasons = ["crime", "kidnapping", "cartel", "violence"]
+    found_reasons = []
+    for reason in common_reasons:
+        if reason in text.lower():
+            found_reasons.append(reason)
+    
+    if found_reasons:
+        return " and ".join(found_reasons)
+    
+    return ""  # Return empty string if no reason found
 
 def parse_mexico_states(summary_html):
     """
-    Parse the HTML summary for a Mexico advisory to identify paragraphs that
-    look like: "[State Name][ optional:  state/city] – [Advisory Text]".
-    Depending on keywords in the advisory text, assign:
-      - "do not travel"       → "Level 4: Do Not Travel"
-      - "reconsider travel"    → "Level 3: Reconsider Travel"
-      - "exercise increased caution" → "Level 2: Exercise Increased Caution"
-    
-    Returns a list of dictionaries with keys "Place", "SecondaryThreatLevel", and "Reason".
+    Parse HTML content for Mexico state advisories.
+    Returns list of dictionaries with Place, SecondaryThreatLevel, and Reason.
     """
+    if not summary_html:
+        return []
+        
     results = []
-    soup = BeautifulSoup(summary_html, "html.parser")
-    paragraphs = soup.find_all("p")
-    
-    # Function to extract reason from advisory text
-    def extract_reason(text):
-        # Look for reason after "due to" or similar phrases
-        reason_patterns = [
-            r"due to\s+([^\.]+)",
-            r"because of\s+([^\.]+)",
-            r"as a result of\s+([^\.]+)"
-        ]
+    try:
+        soup = BeautifulSoup(summary_html, "html.parser")
+        paragraphs = soup.find_all("p")
         
-        for pattern in reason_patterns:
-            reason_match = re.search(pattern, text, re.I)
-            if reason_match:
-                return reason_match.group(1).strip()
-        return "unspecified reasons"  # Default if no specific reason found
-    
-    # Special case: look for Mexico City and Mexico State mentions
-    for p in paragraphs:
-        text = p.get_text(strip=True)
-        # Look for Mexico City
-        if "mexico city" in text.lower():
-            advisory_text = text.lower()
-            level = None
-            if "do not travel" in advisory_text:
-                level = "Level 4: Do Not Travel"
-            elif "reconsider travel" in advisory_text:
-                level = "Level 3: Reconsider Travel"
-            elif "exercise increased caution" in advisory_text:
-                level = "Level 2: Exercise Increased Caution"
+        for p in paragraphs:
+            text = p.get_text(strip=True)
             
-            if level:
-                reason = extract_reason(text)
-                results.append({
-                    "Place": "Mexico City", 
-                    "SecondaryThreatLevel": level, 
-                    "Reason": reason
-                })
-        
-        # Look for Mexico State (Estado de México)
-        if any(term in text.lower() for term in ["mexico state", "state of mexico", "estado de méxico"]):
-            advisory_text = text.lower()
-            level = None
-            if "do not travel" in advisory_text:
-                level = "Level 4: Do Not Travel"
-            elif "reconsider travel" in advisory_text:
-                level = "Level 3: Reconsider Travel"
-            elif "exercise increased caution" in advisory_text:
-                level = "Level 2: Exercise Increased Caution"
+            # Pattern for state name followed by advisory text
+            state_pattern = r"^([A-Za-z\s]+)(?:\s+(?:state|city))?\s*[–-]\s*(.+)$"
+            match = re.match(state_pattern, text, re.I)
             
-            if level:
-                reason = extract_reason(text)
-                results.append({
-                    "Place": "Mexico State", 
-                    "SecondaryThreatLevel": level, 
-                    "Reason": reason
-                })
-    
-    # Regular pattern for other states
-    pattern = r"^([A-Za-z\s]+)(?:\s+(?:state|city))?\s*[–-]\s*(.+)$"
-    for p in paragraphs:
-        text = p.get_text(strip=True)
-        m = re.match(pattern, text, re.I)
-        if m:
-            place = m.group(1).strip()
-            advisory_text = m.group(2).strip()
-            
-            # Skip if we already added Mexico City or Mexico State from special case
-            if place.lower() in ["mexico city", "mexico"]:
-                continue
+            if match:
+                place = match.group(1).strip()
+                advisory_text = match.group(2).strip()
                 
-            # Add "State" suffix if not already present and not Mexico City
-            if not place.lower().endswith("state") and not place.lower() == "mexico city":
-                place = f"{place} State"
+                # Handle special cases
+                if place.lower() == "mexico city":
+                    place = "Mexico City"
+                elif place.lower() == "mexico" and "state" in place.lower():
+                    place = "Mexico State"
+                elif not place.lower().endswith("state") and place.lower() != "mexico city":
+                    place = f"{place} State"
+                
+                # Determine threat level
+                level = None
+                if "do not travel" in advisory_text.lower():
+                    level = "Level 4: Do Not Travel"
+                elif "reconsider travel" in advisory_text.lower():
+                    level = "Level 3: Reconsider Travel"
+                elif "exercise increased caution" in advisory_text.lower():
+                    level = "Level 2: Exercise Increased Caution"
+                elif "exercise normal precautions" in advisory_text.lower():
+                    level = "Level 1: Exercise Normal Precautions"
+                
+                if level:
+                    # Extract reason directly from the advisory text
+                    reason = extract_reason(advisory_text)
+                    
+                    results.append({
+                        "Place": place,
+                        "SecondaryThreatLevel": level,
+                        "Reason": reason
+                    })
             
-            level = None
-            if "do not travel" in advisory_text.lower():
-                level = "Level 4: Do Not Travel"
-            elif "reconsider travel" in advisory_text.lower():
-                level = "Level 3: Reconsider Travel"
-            elif "exercise increased caution" in advisory_text.lower():
-                level = "Level 2: Exercise Increased Caution"
+            # Special case for paragraphs that mention Mexico City or Mexico State
+            # but don't follow the standard pattern
+            elif "mexico city" in text.lower() and any(term in text.lower() for term in 
+                  ["do not travel", "reconsider travel", "exercise increased caution"]):
+                level = None
+                if "do not travel" in text.lower():
+                    level = "Level 4: Do Not Travel"
+                elif "reconsider travel" in text.lower():
+                    level = "Level 3: Reconsider Travel"
+                elif "exercise increased caution" in text.lower():
+                    level = "Level 2: Exercise Increased Caution"
+                
+                if level:
+                    reason = extract_reason(text)
+                    results.append({
+                        "Place": "Mexico City",
+                        "SecondaryThreatLevel": level,
+                        "Reason": reason
+                    })
             
-            if level:
-                reason = extract_reason(advisory_text)
-                results.append({
-                    "Place": place, 
-                    "SecondaryThreatLevel": level, 
-                    "Reason": reason
-                })
-    
-    return results
+            elif ("mexico state" in text.lower() or "state of mexico" in text.lower()) and any(term in text.lower() for term in 
+                  ["do not travel", "reconsider travel", "exercise increased caution"]):
+                level = None
+                if "do not travel" in text.lower():
+                    level = "Level 4: Do Not Travel"
+                elif "reconsider travel" in text.lower():
+                    level = "Level 3: Reconsider Travel"
+                elif "exercise increased caution" in text.lower():
+                    level = "Level 2: Exercise Increased Caution"
+                
+                if level:
+                    reason = extract_reason(text)
+                    results.append({
+                        "Place": "Mexico State",
+                        "SecondaryThreatLevel": level,
+                        "Reason": reason
+                    })
+        
+        # Print first few results for debugging
+        print("\nExtracted state advisories:")
+        for item in results[:5]:  # Show first 5 for debugging
+            print(f"{item['Place']}: {item['SecondaryThreatLevel']} - {item['Reason']}")
+            
+        return results
+    except Exception as e:
+        print(f"Error parsing state data: {e}")
+        return []
 
-def process_travel_advisory_data(file_path):
+def process_travel_advisory_rss(file_path):
     """
-    Main function to process travel advisory data with focus on Mexico.
+    Process travel advisory data from RSS file, focusing on Mexico.
+    
+    Args:
+        file_path: Path to the RSS feed file
+        
+    Returns:
+        Tuple: (country_df, state_df) - DataFrames for country and state level data
     """
     print(f"Processing travel advisory data from: {file_path}")
     
     try:
+        # Parse the RSS feed
+        with open(file_path, 'r', encoding='utf-8') as f:
+            feed_content = f.read()
+        
+        feed = feedparser.parse(feed_content)
+        
+        # Look for Mexico entry
+        mexico_data = None
+        mexico_summary = None
+        
+        for entry in feed.entries:
+            if "Mexico" in entry.title and "Travel Advisory" in entry.title:
+                # Extract threat level from title
+                threat_match = re.search(r'Level (\d+):', entry.title)
+                threat_level = f"Level {threat_match.group(1)}" if threat_match else ""
+                
+                if hasattr(entry, 'description') or hasattr(entry, 'summary'):
+                    summary = entry.description if hasattr(entry, 'description') else entry.summary
+                    
+                    # Store Mexico data
+                    mexico_data = {
+                        "Country": "Mexico",
+                        "ThreatLevel": threat_level,
+                        "Summary": summary
+                    }
+                    mexico_summary = summary
+                    print(f"Found Mexico data with threat level: {threat_level}")
+                    break
+        
+        if mexico_data:
+            # Create country-level dataframe
+            mexico_df = pd.DataFrame([mexico_data])
+            
+            # Extract state-level data from summary
+            state_data = parse_mexico_states(mexico_summary)
+            
+            if state_data:
+                # Create state-level dataframe
+                state_rows = []
+                for item in state_data:
+                    state_rows.append({
+                        "Country": "Mexico",
+                        "Place": item["Place"],
+                        "SecondaryThreatLevel": item["SecondaryThreatLevel"],
+                        "Reason": item["Reason"],
+                        "ThreatLevel": mexico_data["ThreatLevel"]
+                    })
+                mexico_state_df = pd.DataFrame(state_rows)
+                return mexico_df, mexico_state_df
+            else:
+                print("No state-level data found in the Mexico advisory.")
+                return mexico_df, None
+        else:
+            # Fallback to regular XML parsing if feedparser doesn't work
+            return process_xml_fallback(file_path)
+            
+    except Exception as e:
+        print(f"Error processing RSS: {str(e)}")
+        print("Falling back to XML parsing...")
+        return process_xml_fallback(file_path)
+
+def process_xml_fallback(file_path):
+    """Fallback method using direct XML parsing if RSS parsing fails"""
+    try:
         # Parse the XML file
         tree = ET.parse(file_path)
         root = tree.getroot()
-        ns = {'atom': 'http://www.w3.org/2005/Atom'}
         
-        # Create a DataFrame with all country data
-        all_rows = []
-        for entry in root.findall('atom:entry', ns):
-            title_elem = entry.find('atom:title', ns)
-            title = title_elem.text.strip() if (title_elem is not None and title_elem.text) else None
-            country = title.split(" - ")[0].strip() if title else None
+        # Try to find Mexico entry in different XML formats
+        mexico_entry = None
+        mexico_threat = None
+        mexico_summary = None
+        
+        # Check for <item> tags (RSS format)
+        for item in root.findall('.//item'):
+            title_elem = item.find('./title')
+            if title_elem is not None and "Mexico" in title_elem.text:
+                description_elem = item.find('./description')
+                if description_elem is not None:
+                    mexico_entry = item
+                    mexico_summary = description_elem.text
+                    
+                    # Try to extract threat level from title
+                    threat_match = re.search(r'Level (\d+):', title_elem.text)
+                    if threat_match:
+                        mexico_threat = f"Level {threat_match.group(1)}"
+                    break
+        
+        # If not found, check for <entry> tags (Atom format)
+        if mexico_entry is None:
+            for entry in root.findall('.//{http://www.w3.org/2005/Atom}entry'):
+                title_elem = entry.find('.//{http://www.w3.org/2005/Atom}title')
+                if title_elem is not None and "Mexico" in title_elem.text:
+                    summary_elem = entry.find('.//{http://www.w3.org/2005/Atom}summary')
+                    if summary_elem is not None:
+                        mexico_entry = entry
+                        mexico_summary = summary_elem.text
+                        
+                        # Try to find threat level in category
+                        for cat in entry.findall('.//{http://www.w3.org/2005/Atom}category'):
+                            if cat.get('label') == 'Threat-Level':
+                                mexico_threat = cat.get('term')
+                                if mexico_threat and "Level" in mexico_threat:
+                                    level_match = re.search(r'Level (\d+)', mexico_threat)
+                                    if level_match:
+                                        mexico_threat = f"Level {level_match.group(1)}"
+                        break
+        
+        if mexico_entry is not None and mexico_summary is not None:
+            # Create country dataframe
+            mexico_df = pd.DataFrame([{
+                "Country": "Mexico",
+                "ThreatLevel": mexico_threat or "",
+                "Summary": mexico_summary
+            }])
             
-            country_tag_elem = entry.find("atom:category[@label='Country-Tag']", ns)
-            country_tag = country_tag_elem.get('term') if country_tag_elem is not None else None
-            threat_elem = entry.find("atom:category[@label='Threat-Level']", ns)
-            primary_threat = threat_elem.get('term') if threat_elem is not None else None
-            
-            summary_elem = entry.find('atom:summary', ns)
-            if summary_elem is not None:
-                raw_summary = get_full_text(summary_elem)
-                summary_clean = re.sub(r'[\r\n]+', ' ', raw_summary)
-                summary_clean = re.sub(r'\s+', ' ', summary_clean).strip()
+            # Extract state data
+            state_data = parse_mexico_states(mexico_summary)
+            if state_data:
+                # Create state dataframe
+                state_rows = []
+                for item in state_data:
+                    state_rows.append({
+                        "Country": "Mexico",
+                        "Place": item["Place"],
+                        "SecondaryThreatLevel": item["SecondaryThreatLevel"],
+                        "Reason": item["Reason"],
+                        "ThreatLevel": mexico_threat or ""
+                    })
+                mexico_state_df = pd.DataFrame(state_rows)
+                return mexico_df, mexico_state_df
             else:
-                summary_clean = None
-            
-            # Identify Mexico entries
-            if (country and "mexico" in country.lower()) or (country_tag and country_tag.upper() == "MX"):
-                country = "Mexico"
-                
-                row = {
-                    "Title": title,
-                    "Country": country,
-                    "ThreatLevel": primary_threat,
-                    "Summary": summary_clean,
-                    "CountryTag": country_tag
-                }
-                all_rows.append(row)
-        
-        # Create main dataframe
-        df = pd.DataFrame(all_rows)
-        
-        if df.empty:
-            print("No Mexico data found in the file.")
+                return mexico_df, None
+        else:
+            print("Mexico entry not found in XML.")
             return None, None
             
-        print(f"Successfully parsed Mexico travel advisory data.")
-        
-        # Extract Mexico state-level data
-        mexico_df_rows = []
-        for _, row in df.iterrows():
-            adv_list = parse_mexico_states(row["Summary"] or "")
-            if adv_list:
-                for adv in adv_list:
-                    new_row = row.copy()
-                    new_row["Place"] = adv["Place"]
-                    new_row["SecondaryThreatLevel"] = adv["SecondaryThreatLevel"]
-                    mexico_df_rows.append(new_row)
-            else:
-                new_row = row.copy()
-                new_row["Place"] = None
-                mexico_df_rows.append(new_row)
-        
-        mexico_df = pd.DataFrame(mexico_df_rows)
-        
-        return df, mexico_df
-        
-    except ET.ParseError as e:
-        print(f"Error parsing XML: {e}")
-        return None, None
     except Exception as e:
-        print(f"Error processing file: {str(e)}")
+        print(f"Error in XML fallback: {str(e)}")
         import traceback
         traceback.print_exc()
         return None, None
 
-def calculate_mexico_risk_metrics(mexico_df, pop_data):
-    """
-    Calculate risk metrics for Mexico based on population and area data.
-    Returns the merged dataframe and risk statistics.
-    """
-    # Create population dataframe
-    mex_pop_df = pd.DataFrame(pop_data, columns=["Year", "State", "Population", "Area"])
-    
-    # Create cleaned keys for merging
-    if "Place" in mexico_df.columns:
-        mexico_df["StateName_clean"] = mexico_df["Place"].fillna("").str.strip().str.lower()
-    else:
-        # If Place column doesn't exist, create an empty StateName_clean column
-        mexico_df["StateName_clean"] = ""
-    
-    mex_pop_df["State_clean"] = mex_pop_df["State"].str.strip().str.lower()
-    
-    # Debug: Print state names before merging
-    print("\nState names in advisory data (first 10):")
-    if not mexico_df.empty and "StateName_clean" in mexico_df.columns:
-        print(mexico_df["StateName_clean"].head(10).tolist())
-    
-    print("\nState names in population data (first 10):")
-    print(mex_pop_df["State_clean"].head(10).tolist())
-    
-    # More aggressive state name mapping
-    # First, create a mapping of common advisory names to our population data names
-    advisory_to_pop_map = {}
-    for pop_state in mex_pop_df["State_clean"]:
-        # For states with "State" in the name
-        if "state" in pop_state:
-            # Create mappings with and without "state"
-            base_name = pop_state.replace(" state", "")
-            advisory_to_pop_map[base_name] = pop_state
-            advisory_to_pop_map[pop_state] = pop_state
-            
-            # Add common variations
-            if base_name == "mexico":
-                advisory_to_pop_map["estado de mexico"] = pop_state
-                advisory_to_pop_map["state of mexico"] = pop_state
-            
-            # Add variations for state names
-            advisory_to_pop_map[f"{base_name} state"] = pop_state
-        else:  # For Mexico City
-            advisory_to_pop_map[pop_state] = pop_state
-            advisory_to_pop_map["ciudad de mexico"] = pop_state
-            advisory_to_pop_map["federal district"] = pop_state
-            advisory_to_pop_map["cdmx"] = pop_state
-            advisory_to_pop_map["df"] = pop_state
-    
-    # Apply the mapping to normalize names in the advisory data
-    mexico_df["MappedStateName"] = mexico_df["StateName_clean"].map(
-        lambda x: advisory_to_pop_map.get(x, x)
-    )
-    
-    print("\nAfter mapping, first 10 state names in advisory data:")
-    if not mexico_df.empty and "MappedStateName" in mexico_df.columns:
-        print(mexico_df["MappedStateName"].head(10).tolist())
-    
-    # Merge the dataframes
-    merged_mexico = pd.merge(
-        mexico_df,
-        mex_pop_df,
-        left_on="MappedStateName",
-        right_on="State_clean",
-        how="outer"  # Changed to outer join to show which states might be missing
-    )
-    
-    # Print debugging info about the merge
-    matched_states = merged_mexico.dropna(subset=["State"])
-    unmatched_advisory = merged_mexico[merged_mexico["State"].isna()]["MappedStateName"].unique() if "MappedStateName" in merged_mexico.columns else []
-    unmatched_pop = merged_mexico[merged_mexico["MappedStateName"].isna()]["State_clean"].unique() if "MappedStateName" in merged_mexico.columns else []
-    
-    print(f"\nSuccessfully matched {len(matched_states)} states")
-    if len(unmatched_advisory) > 0:
-        print(f"Advisory states that didn't match: {list(unmatched_advisory)}")
-    if len(unmatched_pop) > 0:
-        print(f"Population states that didn't match: {list(unmatched_pop)}")
-    
-    # For unmatched population states, create placeholder rows with default threat level
-    # This ensures all states are included in the analysis
-    if not mexico_df.empty and "ThreatLevel" in mexico_df.columns:
-        default_threat = mexico_df["ThreatLevel"].iloc[0]
-    else:
-        default_threat = "Level 3: Reconsider Travel"  # Default fallback
-    
-    # Create a DataFrame with just the unmatched population states
-    unmatched_states_df = pd.DataFrame()
-    for state_clean in unmatched_pop:
-        state_row = mex_pop_df[mex_pop_df["State_clean"] == state_clean]
-        if not state_row.empty:
-            temp_df = state_row.copy()
-            temp_df["SecondaryThreatLevel"] = default_threat
-            unmatched_states_df = pd.concat([unmatched_states_df, temp_df], ignore_index=True)
-    
-    # Combine with the merged dataframe
-    if not unmatched_states_df.empty:
-        # Ensure merged_mexico has all the necessary columns before concatenation
-        for col in unmatched_states_df.columns:
-            if col not in merged_mexico.columns:
-                merged_mexico[col] = None
-                
-        # Add the unmatched states
-        merged_mexico = pd.concat([merged_mexico, unmatched_states_df], ignore_index=True)
-    
-    # Clean up merged dataframe - fill in missing values and handle duplicates
-    # First, drop rows without valid State from population data
-    merged_mexico = merged_mexico.dropna(subset=["State"])
-    
-    # Handle duplicates - keep the row with the highest threat level
-    if "SecondaryThreatLevel" in merged_mexico.columns:
-        threat_order = {
-            "Level 4: Do Not Travel": 4,
-            "Level 3: Reconsider Travel": 3,
-            "Level 2: Exercise Increased Caution": 2,
-            "Level 1: Exercise Normal Precautions": 1,
-            None: 0
-        }
-        
-        # Add a numeric threat value for sorting
-        merged_mexico["ThreatValue"] = merged_mexico["SecondaryThreatLevel"].map(lambda x: threat_order.get(x, 0))
-        
-        # Sort by State and ThreatValue (descending) then drop duplicates
-        merged_mexico = merged_mexico.sort_values(["State", "ThreatValue"], ascending=[True, False])
-        merged_mexico = merged_mexico.drop_duplicates(subset=["State"], keep="first")
-        
-        # Remove the temporary ThreatValue column
-        merged_mexico = merged_mexico.drop(columns=["ThreatValue"], errors="ignore")
-    
-    # Ensure SecondaryThreatLevel is populated for all rows
-    if "SecondaryThreatLevel" in merged_mexico.columns:
-        merged_mexico["SecondaryThreatLevel"] = merged_mexico["SecondaryThreatLevel"].fillna(default_threat)
-    else:
-        merged_mexico["SecondaryThreatLevel"] = default_threat
-    
-    # Calculate risk metrics
-    merged_mexico["Population"] = pd.to_numeric(merged_mexico["Population"], errors="coerce")
-    merged_mexico["Area"] = pd.to_numeric(merged_mexico["Area"], errors="coerce")
-    
-    pop_total = merged_mexico["Population"].sum()
-    area_total = merged_mexico["Area"].sum()
-    
-    # Calculate percentages by risk level
-    if pop_total != 0 and "SecondaryThreatLevel" in merged_mexico.columns:
-        pop_pct = merged_mexico.groupby("SecondaryThreatLevel")["Population"].sum() / pop_total
-    else:
-        pop_pct = pd.Series()
-    
-    if area_total != 0 and "SecondaryThreatLevel" in merged_mexico.columns:
-        area_pct = merged_mexico.groupby("SecondaryThreatLevel")["Area"].sum() / area_total
-    else:
-        area_pct = pd.Series()
-    
-    # Define risk levels and mapping
-    risk_levels = ["Level 2: Exercise Increased Caution", 
-                   "Level 3: Reconsider Travel", 
-                   "Level 4: Do Not Travel"]
-    risk_map = {"Level 2: Exercise Increased Caution": 2,
-                "Level 3: Reconsider Travel": 3,
-                "Level 4: Do Not Travel": 4}
-    
-    # Calculate composite risk
-    composite = {}
-    for r in risk_levels:
-        pop_val = pop_pct.get(r, 0)
-        area_val = area_pct.get(r, 0)
-        composite[r] = 0.5 * pop_val + 0.5 * area_val
-    
-    # Determine total risk level
-    if composite:
-        max_comp = max(composite.values())
-        candidates = [r for r, comp in composite.items() if comp == max_comp]
-        total_risk = max(candidates, key=lambda r: risk_map[r]) if candidates else None
-    else:
-        total_risk = None
-    
-    # Update threat level in merged dataframe
-    merged_mexico["ThreatLevel"] = total_risk
-    
-    # Create risk statistics
-    risk_stats = {
-        "population_percentages": pop_pct.to_dict(),
-        "area_percentages": area_pct.to_dict(),
-        "composite_percentages": composite,
-        "total_risk_level": total_risk
-    }
-    
-    return merged_mexico, risk_stats
-
 def main():
-    """Main function to process travel advisory data."""
+    """Main function to process travel advisory data and return integrated DataFrame."""
     # Define file path
-    file_path = ''
+    file_path = file_path
     
     # Mexico population data with "State" added to names
     pop_data = [
@@ -420,7 +320,7 @@ def main():
         [2020, "Guerrero State", 3540685, 24555],
         [2020, "Hidalgo State", 3082841, 8039],
         [2020, "Jalisco State", 8348151, 30346],
-        [2020, "Mexico State", 16992418, 8630],  # Changed from "Mexico" to "Mexico State"
+        [2020, "Mexico State", 16992418, 8630],
         [2020, "Michoacan State", 4748846, 22625],
         [2020, "Morelos State", 1971520, 1884],
         [2020, "Nayarit State", 1235456, 10756],
@@ -440,140 +340,94 @@ def main():
         [2020, "Zacatecas State", 1622138, 29064]
     ]
     
-    # Process travel advisory data
-    mexico_df, mexico_state_df = process_travel_advisory_data(file_path)
+    # Process travel advisory data using RSS parser first
+    mexico_df, mexico_state_df = process_travel_advisory_rss(file_path)
     
+    # Manual extraction as last resort if all parsing fails
     if mexico_df is None:
-        # Manual fallback for Mexico data if parsing fails
-        print("Attempting manual extraction of Mexico data...")
+        print("Attempting manual regex extraction...")
         try:
             with open(file_path, 'r', encoding='utf-8') as f:
                 content = f.read()
             
-            # Search for Mexico entry
-            mexico_pattern = r'<entry>.*?Mexico.*?</entry>'
-            mexico_match = re.search(mexico_pattern, content, re.DOTALL)
-            
+            # Look for Mexico entry with regex
+            mexico_match = re.search(r'<item>.*?Mexico.*?</item>|<entry>.*?Mexico.*?</entry>', content, re.DOTALL)
             if mexico_match:
-                mexico_entry = mexico_match.group(0)
+                entry_text = mexico_match.group(0)
                 
-                # Extract threat level
-                threat_level_pattern = r'<category label="Threat-Level" term="(Level \d+.*?)"'
-                threat_match = re.search(threat_level_pattern, mexico_entry)
-                
-                # Extract summary content
-                summary_pattern = r'<summary type="html">(.*?)</summary>'
-                summary_match = re.search(summary_pattern, mexico_entry, re.DOTALL)
+                # Extract threat level and description
+                threat_match = re.search(r'Level (\d+)', entry_text)
+                summary_match = re.search(r'<description>(.*?)</description>|<summary.*?>(.*?)</summary>', entry_text, re.DOTALL)
                 
                 if threat_match and summary_match:
-                    threat_level = threat_match.group(1)
-                    summary = summary_match.group(1)
+                    threat_level = f"Level {threat_match.group(1)}"
+                    summary = summary_match.group(1) or summary_match.group(2)
                     
-                    print(f"Manually extracted Mexico threat level: {threat_level}")
-                    
-                    # Create Mexico dataframe with default threat level
+                    # Create dataframes
                     mexico_df = pd.DataFrame([{
                         "Country": "Mexico",
                         "ThreatLevel": threat_level,
                         "Summary": summary
                     }])
                     
-                    # Try to extract state-level data
-                    adv_list = parse_mexico_states(summary)
-                    
-                    if adv_list:
-                        mexico_state_rows = []
-                        for adv in adv_list:
-                            mexico_state_rows.append({
+                    # Extract state-level data
+                    state_data = parse_mexico_states(summary)
+                    if state_data:
+                        state_rows = []
+                        for item in state_data:
+                            state_rows.append({
                                 "Country": "Mexico",
-                                "ThreatLevel": threat_level,
-                                "Place": adv["Place"],
-                                "SecondaryThreatLevel": adv["SecondaryThreatLevel"],
-                                "Summary": summary
+                                "Place": item["Place"],
+                                "SecondaryThreatLevel": item["SecondaryThreatLevel"],
+                                "Reason": item["Reason"],
+                                "ThreatLevel": threat_level
                             })
-                        mexico_state_df = pd.DataFrame(mexico_state_rows)
-                    else:
-                        # If no state-level data, create default with country-level threat
-                        mexico_state_df = pd.DataFrame([{
-                            "Country": "Mexico",
-                            "ThreatLevel": threat_level,
-                            "Place": None,
-                            "SecondaryThreatLevel": None,
-                            "Summary": summary
-                        }])
-                else:
-                    print("Could not extract threat level or summary from Mexico entry.")
-                    return
-            else:
-                print("Mexico entry not found in the content.")
-                return
+                        mexico_state_df = pd.DataFrame(state_rows)
         except Exception as e:
             print(f"Error during manual extraction: {e}")
-            return
     
-    # If Mexico state-level data is available, calculate risk metrics
-    if mexico_state_df is not None:
-        # If no state-level threat data found, apply country-level threat to all states
-        if not any(mexico_state_df["SecondaryThreatLevel"].notna()):
-            print("No state-specific threat levels found. Using country-level threat for all states.")
-            # Create default state entries with primary threat level
-            default_threat = mexico_df["ThreatLevel"].iloc[0] if not mexico_df.empty else "Level 3: Reconsider Travel"
+    # Create base dataframe with population data
+    state_rows = []
+    for row in pop_data:
+        threat_level = ""
+        if mexico_df is not None and not mexico_df.empty and "ThreatLevel" in mexico_df.columns:
+            threat_level = mexico_df["ThreatLevel"].iloc[0]
             
-            # Create a new dataframe with all states and the default threat level
-            state_rows = []
-            for state_data in pop_data:
-                state_name = state_data[1]
-                state_rows.append({
-                    "Country": "Mexico",
-                    "Place": state_name,
-                    "SecondaryThreatLevel": default_threat,
-                    "ThreatLevel": default_threat,
-                    "Summary": mexico_df["Summary"].iloc[0] if not mexico_df.empty else ""
-                })
-            mexico_state_df = pd.DataFrame(state_rows)
-        
-        # Calculate risk metrics
-        merged_mexico, risk_stats = calculate_mexico_risk_metrics(mexico_state_df, pop_data)
-        
-        # Display results
-        print("\n=== Mexico Composite Percentage Breakdown ===")
-        print("Population Percentage by Risk Level:")
-        pop_pct = risk_stats["population_percentages"]
-        for level, pct in pop_pct.items():
-            print(f"  {level}: {pct:.2%}")
-        
-        print("\nArea Percentage by Risk Level:")
-        area_pct = risk_stats["area_percentages"]
-        for level, pct in area_pct.items():
-            print(f"  {level}: {pct:.2%}")
-        
-        print("\nComposite Percentage (50% weight each):")
-        composite = risk_stats["composite_percentages"]
-        for level, pct in composite.items():
-            print(f"  {level}: {pct:.2%}")
-        
-        print(f"\nTotal Country Risk Score for Mexico: {risk_stats['total_risk_level']}")
-        
-        print("\n=== Mexico Country-Level Advisory ===")
-        print(mexico_df[["Country", "ThreatLevel"]].iloc[0] if not mexico_df.empty else "No country-level data")
-        
-        print("\n=== Integrated Mexico DataFrame (State-level with Population, Area & Risk Scores) ===")
-        print(merged_mexico[["State", "SecondaryThreatLevel", "Population", "Area"]].head(10))
-        print(f"Total states: {len(merged_mexico)}")
-        
-        # Return the integrated Mexico DataFrame as a standalone DataFrame for other code blocks to use
-        final_mexico_df = merged_mexico[["State", "SecondaryThreatLevel", "Population", "Area", "ThreatLevel"]]
-        
-        # Using display() to show the full dataframe
-        from IPython.display import display
-        print("\n=== Full Integrated Mexico DataFrame (For Use in Other Code Blocks) ===")
-        display(final_mexico_df)
-        
-        # Return the dataframe to be used by other code
-        return final_mexico_df
-    else:
-        print("No Mexico state-level data available for analysis.")
-        return None
+        state_rows.append({
+            "State": row[1],
+            "Population": row[2],
+            "Area": row[3],
+            "SecondaryThreatLevel": "See State Summaries",
+            "Reason": "",
+            "ThreatLevel": threat_level
+        })
+    
+    base_df = pd.DataFrame(state_rows)
+    
+    # Update with state-specific data if available
+    if mexico_state_df is not None and not mexico_state_df.empty:
+        for idx, row in mexico_state_df.iterrows():
+            place = row["Place"]
+            mask = base_df["State"] == place
+            if mask.any():
+                base_df.loc[mask, "SecondaryThreatLevel"] = row["SecondaryThreatLevel"]
+                base_df.loc[mask, "Reason"] = row["Reason"]
+    
+    # Display results
+    print("\n=== Mexico Country-Level Advisory ===")
+    if mexico_df is not None and not mexico_df.empty:
+        print(mexico_df[["Country", "ThreatLevel"]].iloc[0])
+    
+    print("\n=== Mexico State-Level Data ===")
+    print(f"Total states: {len(base_df)}")
+    print(base_df[["State", "SecondaryThreatLevel", "Reason"]].head(10))
+    
+    # Create the final DataFrame for other code blocks
+    from IPython.display import display
+    print("\n=== Full Integrated Mexico DataFrame ===")
+    display(base_df)
+    
+    return base_df
 
 if __name__ == "__main__":
     main()
