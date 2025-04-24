@@ -6,7 +6,7 @@ from bs4 import BeautifulSoup
 from typing import Dict, List, Tuple, Any
 
 # Define file path at the very start - used throughout the code
-DEFAULT_FILE_PATH = T1
+DEFAULT_FILE_PATH = t2
 
 ###############################################################################
 # 1) HELPER FUNCTIONS
@@ -810,4 +810,4 @@ def main(file_path=None):
         return None
 
 if __name__ == "__main__":
-    main()
+    result = main()
