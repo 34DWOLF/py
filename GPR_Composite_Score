@@ -5,13 +5,17 @@ import re
 import warnings
 warnings.filterwarnings('ignore')
 
-def create_composite_gpr(file_path, weights=None):
+def create_composite_gpr(file_path, weights=None, recency_weight=0.7, outlier_sensitivity=1.5):
     """
     Create a composite GPR rating using the Dario Caldara and Matteo Iacoviello Geopolitical Risk data.
+    Only the Composite GPR is scaled to a 1-10 range; all other metrics retain their original values.
+    Enhanced to be more sensitive to recent outliers and account for coverage bias.
     
     Parameters:
     file_path (str): Path to the CSV file containing GPR data
     weights (dict): Dictionary containing weights for each component of the composite score
+    recency_weight (float): Weight given to recent data vs historical (0-1, higher = more recent focus)
+    outlier_sensitivity (float): Multiplier for sensitivity to recent outliers (>1 = more sensitive)
     
     Returns:
     pandas.DataFrame: DataFrame containing the composite GPR scores
@@ -47,13 +51,31 @@ def create_composite_gpr(file_path, weights=None):
     country_codes = [col.split('_')[1] for col in current_gpr_cols]
     print(f"Found {len(country_codes)} countries")
     
-    # Create mapping of country codes to country names using var_name and var_label
+    # Create mapping of country codes to full country names using var_name and var_label
     country_names = {}
+    
+    # Manually set country names for common country codes in case var_label extraction fails
+    country_code_map = {
+        'USA': 'United States', 'GBR': 'United Kingdom', 'CHN': 'China', 'RUS': 'Russia',
+        'DEU': 'Germany', 'FRA': 'France', 'JPN': 'Japan', 'IND': 'India', 'BRA': 'Brazil',
+        'ITA': 'Italy', 'CAN': 'Canada', 'AUS': 'Australia', 'ESP': 'Spain', 'MEX': 'Mexico',
+        'KOR': 'South Korea', 'IDN': 'Indonesia', 'TUR': 'Turkey', 'SAU': 'Saudi Arabia',
+        'ZAF': 'South Africa', 'ARG': 'Argentina', 'EGY': 'Egypt', 'NLD': 'Netherlands',
+        'THA': 'Thailand', 'PHL': 'Philippines', 'PAK': 'Pakistan', 'UKR': 'Ukraine',
+        'POL': 'Poland', 'IRN': 'Iran', 'COL': 'Colombia', 'CHE': 'Switzerland',
+        'SWE': 'Sweden', 'BEL': 'Belgium', 'NOR': 'Norway', 'VNM': 'Vietnam',
+        'TWN': 'Taiwan', 'ISR': 'Israel', 'MYS': 'Malaysia', 'PER': 'Peru',
+        'HKG': 'Hong Kong', 'CHL': 'Chile', 'FIN': 'Finland', 'TUN': 'Tunisia',
+        'DNK': 'Denmark', 'PRT': 'Portugal', 'HUN': 'Hungary', 'VEN': 'Venezuela'
+    }
+    
+    # Update with the default mapping
+    country_names.update(country_code_map)
     
     # Create a mapping of var_name to var_label
     var_name_to_label = {}
     
-    # Only do this if var_name and var_label columns exist
+    # Only do this if var_name and var_label columns exist - this will override defaults if found
     if 'var_name' in df.columns and 'var_label' in df.columns:
         for _, row in df.drop_duplicates('var_name').iterrows():
             if isinstance(row['var_name'], str) and isinstance(row['var_label'], str):
@@ -72,17 +94,33 @@ def create_composite_gpr(file_path, weights=None):
         for code in country_codes:
             country_names[code] = code
     
-    # Get the most recent 24 months for forecasting purposes
+    # Get the most recent 24 months for forecasting and recent trend analysis
     recent_dates = sorted(df['date'].unique())[-24:]
     recent_df = df[df['date'].isin(recent_dates)]
+    
+    # Get the very recent months (last 6 months) for detecting recent outliers
+    very_recent_dates = sorted(df['date'].unique())[-6:]
+    very_recent_df = df[df['date'].isin(very_recent_dates)]
     
     # Get the latest date with data
     latest_date = recent_df['date'].max()
     latest_df = df[df['date'] == latest_date]
     
+    # Calculate global average coverage for normalization
+    global_avg_coverage = {}
+    for country_code in country_codes:
+        current_gpr_col = f'GPRC_{country_code}'
+        if current_gpr_col in df.columns:
+            global_avg_coverage[country_code] = df[current_gpr_col].mean()
+    
+    # Find countries with potential coverage bias (significantly above average coverage)
+    overall_avg = np.mean(list(global_avg_coverage.values()))
+    coverage_bias_countries = {code: val/overall_avg for code, val in global_avg_coverage.items() if val > overall_avg * 1.5}
+    
     # Initialize result dataframe
     result_columns = ['Date', 'Country', 'Composite GPR', 'Current GPR', 'Historic GPR', 
-                      'Average GPR over time', 'Average GPR of the rest of the countries', 'Forecasted GPR']
+                      'Average GPR over time', 'Average GPR of the rest of the countries', 
+                      'Forecasted GPR', 'Recent Trend', 'Coverage Adjustment']
     result_df = pd.DataFrame(columns=result_columns)
     
     # Process each country
@@ -101,12 +139,56 @@ def create_composite_gpr(file_path, weights=None):
             print(f"No data for the latest date for {country_code}, skipping")
             continue
         
-        # Calculate average GPR over time for this country
-        avg_gpr_over_time = df[current_gpr_col].mean()
+        # Calculate average GPR over time with stronger weighting for recent data
+        if len(recent_df) > 0:
+            # Calculate weighted average with exponential decay
+            recent_series = recent_df[current_gpr_col].dropna()
+            if len(recent_series) > 0:
+                weights_exp = np.exp(np.linspace(0, 2, len(recent_series))) * recency_weight
+                # Normalize weights to sum to 1
+                weights_exp = weights_exp / np.sum(weights_exp)
+                # Calculate weighted average
+                weighted_avg = np.sum(recent_series.values * weights_exp)
+                
+                # Calculate standard average for comparison
+                std_avg = df[current_gpr_col].mean()
+                
+                # Use a blend of standard and recency-weighted average
+                avg_gpr_over_time = weighted_avg * recency_weight + std_avg * (1 - recency_weight)
+            else:
+                avg_gpr_over_time = df[current_gpr_col].mean()
+        else:
+            avg_gpr_over_time = df[current_gpr_col].mean()
         
         # Calculate average GPR of the rest of the countries for the latest date
         other_countries_cols = [col for col in current_gpr_cols if col != current_gpr_col]
         avg_gpr_rest = latest_row[other_countries_cols].mean()
+        
+        # Calculate recent trend (percentage change in last 6 months)
+        if len(very_recent_df) >= 2:
+            earliest_recent = very_recent_df.iloc[0][current_gpr_col]
+            latest_recent = very_recent_df.iloc[-1][current_gpr_col]
+            if earliest_recent > 0:
+                recent_trend = (latest_recent - earliest_recent) / earliest_recent
+            else:
+                recent_trend = 0
+        else:
+            recent_trend = 0
+        
+        # Apply outlier sensitivity to recent trend
+        if abs(recent_trend) > 0.1:  # If there's a significant trend
+            recent_trend = recent_trend * outlier_sensitivity
+        
+        # Calculate coverage adjustment factor for countries with heavy news coverage
+        coverage_adjustment = 1.0
+        if country_code in coverage_bias_countries:
+            bias_factor = coverage_bias_countries[country_code]
+            # Gradually reduce impact as bias factor increases
+            # This prevents over-correction for countries with legitimately high GPR
+            if bias_factor > 2:
+                coverage_adjustment = 1.0 / np.log2(bias_factor)
+            else:
+                coverage_adjustment = 1.0 / bias_factor
         
         # Forecast the GPR for next month using ARIMA
         try:
@@ -125,7 +207,7 @@ def create_composite_gpr(file_path, weights=None):
             # Fallback to last value if forecasting fails
             forecast = current_gpr
         
-        # Find min and max across all countries for normalization
+        # Find the global min and max for scaling the composite score
         all_gpr_values = []
         for col in current_gpr_cols + historic_gpr_cols:
             all_gpr_values.extend(df[col].dropna().tolist())
@@ -133,49 +215,90 @@ def create_composite_gpr(file_path, weights=None):
         global_min = min(all_gpr_values)
         global_max = max(all_gpr_values)
         
-        # Normalize function (min-max scaling to 1-10)
-        def normalize(value, min_val, max_val):
-            if pd.isna(value) or pd.isna(min_val) or pd.isna(max_val) or max_val == min_val:
-                return 5.0  # Default to middle value if unable to normalize
-            return 1 + 9 * (value - min_val) / (max_val - min_val)
-        
-        # Normalize all components
-        norm_current_gpr = normalize(current_gpr, global_min, global_max)
-        norm_historic_gpr = normalize(historic_gpr, global_min, global_max)
-        
-        # For global relative, higher values mean higher risk compared to others
+        # For relative position within current global landscape
         current_gpr_values = [latest_row[col] for col in current_gpr_cols]
-        global_min_current = min(current_gpr_values)
-        global_max_current = max(current_gpr_values)
-        global_relative = normalize(current_gpr, global_min_current, global_max_current)
-                                   
-        # For historic relative, higher values mean higher risk compared to country's history
+        current_min = min(current_gpr_values)
+        current_max = max(current_gpr_values)
+        global_relative_position = (current_gpr - current_min) / (current_max - current_min) if current_max > current_min else 0.5
+        
+        # For relative position compared to country's own history with heightened sensitivity to recent changes
         country_min = df[current_gpr_col].min()
         country_max = df[current_gpr_col].max()
-        historic_relative = normalize(current_gpr, country_min, country_max)
-                                     
-        # Normalize forecast
-        norm_forecast = normalize(forecast, global_min, global_max)
         
-        # Calculate composite score using weights
-        composite_score = (
-            weights['current_gpr'] * norm_current_gpr +
-            weights['historic_gpr'] * norm_historic_gpr +
-            weights['global_relative'] * global_relative +
-            weights['historic_relative'] * historic_relative +
-            weights['forecast'] * norm_forecast
-        )
+        # Enhance historical relative position by factoring in recent trend
+        base_historic_relative = (current_gpr - country_min) / (country_max - country_min) if country_max > country_min else 0.5
+        
+        # Adjust historical position based on recent trend
+        if recent_trend > 0:
+            # Increasing trend should increase the relative position
+            historic_relative_position = base_historic_relative * (1 + recent_trend * recency_weight)
+            # Cap at 1.0
+            historic_relative_position = min(historic_relative_position, 1.0)
+        else:
+            # Decreasing trend should decrease the relative position
+            historic_relative_position = base_historic_relative * (1 + recent_trend * recency_weight)
+            # Floor at 0.0
+            historic_relative_position = max(historic_relative_position, 0.0)
+        
+        # Apply coverage adjustment to current_gpr and historic_gpr
+        adjusted_current_gpr = current_gpr * coverage_adjustment
+        adjusted_historic_gpr = historic_gpr * coverage_adjustment
+        
+        # Calculate weighted components (using adjusted values)
+        weighted_current = weights['current_gpr'] * adjusted_current_gpr
+        weighted_historic = weights['historic_gpr'] * adjusted_historic_gpr
+        weighted_global_relative = weights['global_relative'] * (adjusted_current_gpr * global_relative_position)
+        weighted_historic_relative = weights['historic_relative'] * (adjusted_current_gpr * historic_relative_position)
+        weighted_forecast = weights['forecast'] * (forecast * coverage_adjustment)
+        
+        # Sum the weighted components
+        raw_composite_score = weighted_current + weighted_historic + weighted_global_relative + weighted_historic_relative + weighted_forecast
+        
+        # Scale only the composite score to 1-10 range
+        # Find min and max across all potential composite scores for scaling
+        all_raw_composites = []
+        for j, code in enumerate(country_codes):
+            if j != i:  # Skip current country to avoid redundant calculation
+                try:
+                    c_gpr_col = f'GPRC_{code}'
+                    h_gpr_col = f'GPRHC_{code}'
+                    
+                    if c_gpr_col in latest_row and h_gpr_col in latest_row:
+                        c_gpr = latest_row[c_gpr_col]
+                        h_gpr = latest_row[h_gpr_col]
+                        
+                        # Apply coverage adjustment if applicable
+                        if code in coverage_bias_countries:
+                            c_gpr = c_gpr * (1.0 / coverage_bias_countries[code])
+                            h_gpr = h_gpr * (1.0 / coverage_bias_countries[code])
+                        
+                        # Simple estimation of other countries' composite scores (for scaling purposes only)
+                        all_raw_composites.append(weights['current_gpr'] * c_gpr + weights['historic_gpr'] * h_gpr)
+                except:
+                    pass
+        
+        all_raw_composites.append(raw_composite_score)
+        composite_min = min(all_raw_composites)
+        composite_max = max(all_raw_composites)
+        
+        # Scale to 1-10 range
+        scaled_composite = 1 + 9 * (raw_composite_score - composite_min) / (composite_max - composite_min) if composite_max > composite_min else 5.0
+        
+        # Get full country name from mapping, or use country code if not found
+        country_name = country_names.get(country_code, country_code)
         
         # Add to result dataframe
         new_row = {
             'Date': latest_date,
-            'Country': country_names.get(country_code, country_code),
-            'Composite GPR': round(composite_score, 2),
-            'Current GPR': round(norm_current_gpr, 2),
-            'Historic GPR': round(norm_historic_gpr, 2),
-            'Average GPR over time': round(normalize(avg_gpr_over_time, global_min, global_max), 2),
-            'Average GPR of the rest of the countries': round(normalize(avg_gpr_rest, global_min, global_max), 2),
-            'Forecasted GPR': round(norm_forecast, 2)
+            'Country': country_name,  # Full country name instead of code
+            'Composite GPR': round(scaled_composite, 2),  # Only this is scaled to 1-10
+            'Current GPR': round(current_gpr, 4),  # Original value
+            'Historic GPR': round(historic_gpr, 4),  # Original value
+            'Average GPR over time': round(avg_gpr_over_time, 4),  # Original value
+            'Average GPR of the rest of the countries': round(avg_gpr_rest, 4),  # Original value
+            'Forecasted GPR': round(forecast, 4),  # Original value
+            'Recent Trend': round(recent_trend * 100, 2),  # Percentage change
+            'Coverage Adjustment': round(coverage_adjustment, 4)  # Adjustment for coverage bias
         }
         result_df = pd.concat([result_df, pd.DataFrame([new_row])], ignore_index=True)
     
@@ -186,7 +309,7 @@ def create_composite_gpr(file_path, weights=None):
 
 def main():
     # File path to the GPR data
-    file_path = ''
+    file_path = r"C:\Users\tbstr\Downloads\data_gpr_export.csv"
     
     # Define weights (can be adjusted by user)
     weights = {
@@ -197,8 +320,10 @@ def main():
         'forecast': 0.2           # Weight for forecasted GPR
     }
     
-    # Create composite GPR
-    result_df = create_composite_gpr(file_path, weights)
+    # Create composite GPR with enhanced sensitivity to recent trends
+    # recency_weight=0.7: Gives 70% weight to recent data vs. historical
+    # outlier_sensitivity=1.5: Increases sensitivity to recent outliers by 50%
+    result_df = create_composite_gpr(file_path, weights, recency_weight=0.7, outlier_sensitivity=1.5)
     
     # Display results
     print(f"Composite GPR Ratings (weights: {weights})")
