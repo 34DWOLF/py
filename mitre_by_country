@@ -1,0 +1,77 @@
+import requests
+import pandas as pd
+import re
+import pycountry
+from IPython.display import display
+
+# 1) Fetch the MITRE ATT&CK Enterprise STIX bundle
+attack_url = 'https://raw.githubusercontent.com/mitre/cti/master/enterprise-attack/enterprise-attack.json'
+resp = requests.get(attack_url)
+resp.raise_for_status()
+attack_data = resp.json()
+
+# 2) Filter for 'intrusion-set' objects (groups)
+groups = [obj for obj in attack_data.get('objects', []) if obj.get('type') == 'intrusion-set']
+
+# 3) Extract fields including Group_Code
+records = []
+for grp in groups:
+    stix_id = grp.get('id', '')
+    ext_refs = grp.get('external_references', [])
+    group_code = next(
+        (ref.get('external_id') for ref in ext_refs if ref.get('source_name') == 'mitre-attack'),
+        ''
+    )
+    records.append({
+        'ID': stix_id,
+        'Group_Code': group_code,
+        'Name': grp.get('name', ''),
+        'Associated Groups': ', '.join(grp.get('aliases', [])),
+        'Description': grp.get('description', '')
+    })
+
+df_groups = pd.DataFrame(records)
+
+# 4) Build a comprehensive country list using pycountry
+country_names = set()
+for country in pycountry.countries:
+    country_names.add(country.name)
+    if hasattr(country, 'official_name'):
+        country_names.add(country.official_name)
+    if hasattr(country, 'common_name'):
+        country_names.add(country.common_name)
+country_list = sorted(country_names, key=lambda x: len(x), reverse=True)
+
+# 5) Function to find all country names in a text
+def find_countries(text):
+    found = set()
+    for country in country_list:
+        if re.search(r'\b' + re.escape(country) + r'\b', text or '', flags=re.IGNORECASE):
+            found.add(country)
+    return ', '.join(sorted(found)) if found else 'None'
+
+# 6) Add the 'Country' column
+df_groups['Country'] = df_groups['Description'].apply(find_countries)
+
+# 7) Create the country counts DataFrame
+df_exploded = df_groups.assign(Country=df_groups['Country'].str.split(', ')).explode('Country')
+country_counts_df = (
+    df_exploded
+    .groupby('Country', as_index=False)['ID']
+    .count()
+    .rename(columns={'ID': 'Count'})
+)
+
+# 8) Display the DataFrames
+print("=== All MITRE ATT&CK Groups with Country Column ===")
+display(df_groups)
+
+print("\n=== Country Entry Counts ===")
+display(country_counts_df)
+
+# Debugging dfs
+# print("\n=== filter_df (Group_Code == 'G0018') ===")
+# display(filter_df)
+
+# print("\n=== filter_desc_df (Description contains 'China') ===")
+# display(filter_desc_df)
