@@ -1,558 +1,248 @@
-# Import required libraries
-import numpy as np
-import pandas as pd
-import matplotlib.pyplot as plt
-from statsmodels.tsa.stattools import adfuller, acf, pacf
-from statsmodels.tsa.arima.model import ARIMA
-from statsmodels.graphics.tsaplots import plot_acf, plot_pacf
-from sklearn.linear_model import LinearRegression
-from datetime import datetime, timedelta
-import warnings
-from dateutil.relativedelta import relativedelta
+# MLflow Model Registration and Tracking
+import mlflow
+import mlflow.sklearn
+import mlflow.statsmodels
+import pickle
+import json
+import os
+from datetime import datetime
 
-# Suppress warnings for cleaner output
-warnings.filterwarnings("ignore")
+# This code block assumes model_metadata is available from the previous code block
+# If model_metadata is not available, you can load it from a saved file or rerun the model training
 
-# Set plot style for better visualizations
-plt.style.use('seaborn-whitegrid')
+# ====================================================
+# MLflow PARAMETER SECTION - Modify these values as needed
+# ====================================================
+# MLflow tracking parameters
+experiment_name = "Owner_Value_Forecasting"  # Change to your experiment name
+run_name_prefix = "Monthly_Forecast_"        # Will be appended with date and owner
+model_prefix = "owner_forecast_"             # Will be appended with owner name
+model_stage = "Production"                   # Options: "None", "Staging", "Production", "Archived"
 
-# Load data (replace with your actual file path in Databricks)
-file_path = "/dbfs/FileStore/your_data_file.csv"  # Update this path
-df = pd.read_csv(file_path)
+# Set this to the Model Registry URI (if using remote registry)
+model_registry_uri = None  # Example: "databricks" or "http://your-mlflow-server:5000"
 
-# Ensure Date is in datetime format
-df['Date'] = pd.to_datetime(df['Date'])
+# Additional run tags
+run_tags = {
+    "model_type": "time_series",
+    "data_frequency": "monthly",
+    "forecast_horizon": f"{FORECAST_MONTHS}_months",
+    "reconciliation_method": RECONCILIATION_METHOD if is_total_present else "none"
+}
 
-# Since data is monthly, ensure it's set to the first day of each month for consistency
-df['Date'] = df['Date'].apply(lambda x: x.replace(day=1))
+# Model details (for documentation)
+model_details = {
+    "description": "Monthly value forecasting by owner", 
+    "min_months_for_arima": MIN_MONTHS_FOR_ARIMA,
+    "forecast_months": FORECAST_MONTHS,
+    "confidence_level": CONFIDENCE_LEVEL,
+    "created_by": "Forecast_Pipeline_v1.0"
+}
+# ====================================================
 
-# Display the first few rows
-print("Data sample:")
-display(df.head())
+# Set MLflow tracking URI if provided
+if model_registry_uri:
+    mlflow.set_tracking_uri(model_registry_uri)
+    print(f"MLflow tracking URI set to: {model_registry_uri}")
 
-# Get basic statistics
-print("\nData summary:")
-display(df.describe())
+# Create or get the experiment
+try:
+    experiment_id = mlflow.create_experiment(experiment_name)
+    print(f"Created new experiment: {experiment_name} with ID: {experiment_id}")
+except Exception:
+    experiment_id = mlflow.get_experiment_by_name(experiment_name).experiment_id
+    print(f"Using existing experiment: {experiment_name} with ID: {experiment_id}")
 
-# Check for missing values
-print("\nMissing values:")
-display(df.isnull().sum())
+mlflow.set_experiment(experiment_name)
 
-# Get unique owners
-owners = df['Owner'].unique()
-print(f"\nNumber of unique owners: {len(owners)}")
-print("Owners:", owners)
-
-# Count data points per owner
-owner_counts = df.groupby('Owner').size().reset_index(name='Count')
-print("\nData points per owner:")
-display(owner_counts)
-
-# Check date ranges per owner
-date_ranges = []
-for owner in owners:
-    owner_data = df[df['Owner'] == owner].sort_values('Date')
-    date_ranges.append({
-        'Owner': owner,
-        'First Month': owner_data['Date'].min().strftime('%Y-%m'),
-        'Last Month': owner_data['Date'].max().strftime('%Y-%m'),
-        'Months Count': len(owner_data),
-        'Is Continuous': len(owner_data) == ((owner_data['Date'].max() - owner_data['Date'].min()).days // 30) + 1
-    })
-
-date_range_df = pd.DataFrame(date_ranges)
-print("\nDate ranges per owner:")
-display(date_range_df)
-
-# Define stationarity check function
-def check_stationarity(timeseries, owner_name=None):
-    """
-    Test stationarity using Augmented Dickey-Fuller test
-    """
-    # Perform ADF test
-    result = adfuller(timeseries)
-    
-    # Extract results
-    dftest = pd.Series(
-        result[0:4],
-        index=['Test Statistic', 'p-value', '#Lags Used', 'Number of Observations Used']
-    )
-    
-    for key, value in result[4].items():
-        dftest[f'Critical Value ({key})'] = value
-    
-    # Determine if stationary
-    is_stationary = result[1] <= 0.05
-    
-    # Display results
-    if owner_name:
-        print(f"Results of Augmented Dickey-Fuller Test for Owner: {owner_name}")
-    else:
-        print("Results of Augmented Dickey-Fuller Test:")
-    
-    print(dftest)
-    print(f"Is the series stationary? {'Yes' if is_stationary else 'No'}")
-    print("-" * 50)
-    
-    return is_stationary, result[1]
-
-# Plot time series for each owner
-plt.figure(figsize=(14, len(owners) * 4))
-
-for i, owner in enumerate(owners):
-    owner_data = df[df['Owner'] == owner].sort_values('Date')
-    
-    plt.subplot(len(owners), 1, i+1)
-    plt.plot(owner_data['Date'], owner_data['Value'], marker='o', linestyle='-', label=f"Data Points: {len(owner_data)}")
-    plt.title(f'Monthly Time Series for Owner: {owner}')
-    plt.ylabel('Value')
-    plt.grid(True)
-    plt.legend()
-    
-    # Format x-axis to show month-year
-    plt.gca().xaxis.set_major_formatter(plt.matplotlib.dates.DateFormatter('%b %Y'))
-    plt.gcf().autofmt_xdate()
-
-plt.tight_layout()
-display(plt.gcf())
-plt.close()
-
-# Test stationarity for each owner
-stationarity_results = {}
-
-for owner in owners:
-    owner_data = df[df['Owner'] == owner].sort_values('Date')
-    values = owner_data['Value'].values
-    
-    # Only test if we have enough data points
-    if len(values) >= 8:  # Minimum required for adfuller test
-        is_stationary, p_value = check_stationarity(values, owner)
-        stationarity_results[owner] = {
-            'is_stationary': is_stationary,
-            'p_value': p_value,
-            'data_points': len(values)
-        }
-    else:
-        print(f"Owner {owner} has only {len(values)} months of data, not enough for stationarity test.")
-        stationarity_results[owner] = {
-            'is_stationary': None,
-            'p_value': None,
-            'data_points': len(values)
-        }
-
-# Function to analyze and plot ACF and PACF
-def analyze_acf_pacf(timeseries, owner_name, max_lags=10):
-    # Compute ACF and PACF
-    acf_values = acf(timeseries, nlags=max_lags, fft=True)
-    pacf_values = pacf(timeseries, nlags=max_lags, method='ols')
-    
-    # Plot
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8))
-    
-    # ACF plot
-    plot_acf(timeseries, ax=ax1, lags=max_lags)
-    ax1.set_title(f'Autocorrelation Function for Owner: {owner_name}')
-    
-    # PACF plot
-    plot_pacf(timeseries, ax=ax2, lags=max_lags)
-    ax2.set_title(f'Partial Autocorrelation Function for Owner: {owner_name}')
-    
-    plt.tight_layout()
-    display(plt.gcf())
-    plt.close()
-    
-    # Find significant lags (95% confidence)
-    significance_level = 1.96/np.sqrt(len(timeseries))
-    
-    # Significant lags in ACF (for MA/q order)
-    significant_acf = [i for i in range(1, max_lags + 1) if abs(acf_values[i]) > significance_level]
-    
-    # Significant lags in PACF (for AR/p order)
-    significant_pacf = [i for i in range(1, max_lags + 1) if abs(pacf_values[i]) > significance_level]
-    
-    print(f"Owner: {owner_name}")
-    print(f"Significant lags in ACF (suggests MA/q order): {significant_acf}")
-    print(f"Significant lags in PACF (suggests AR/p order): {significant_pacf}")
-    
-    # Check for seasonality (12 months)
-    if max_lags >= 12 and len(timeseries) >= 24:
-        seasonal_lag = 12
-        if seasonal_lag in significant_acf or seasonal_lag in significant_pacf:
-            print(f"Potential yearly seasonality detected at lag {seasonal_lag}")
-    
-    print("-" * 50)
-    
-    # Suggested order
-    p = max(significant_pacf) if significant_pacf else 1
-    q = max(significant_acf) if significant_acf else 1
-    
-    return p, q, acf_values, pacf_values
-
-# Analyze ACF and PACF for each owner with sufficient data
-acf_pacf_results = {}
-
-for owner in owners:
-    owner_data = df[df['Owner'] == owner].sort_values('Date')
-    values = owner_data['Value'].values
-    
-    # Only analyze if we have enough data points
-    if len(values) >= 24:  # Minimum recommended for monthly data (2 years)
-        print(f"Analyzing ACF/PACF for Owner: {owner} (Months of data: {len(values)})")
+# Function to register a model in MLflow
+def register_model(owner, metadata, artifact_path):
+    try:
+        # Register the model
+        model_name = f"{model_prefix}{owner.replace(' ', '_').lower()}"
+        registered_model = mlflow.register_model(
+            f"runs:/{run_id}/{artifact_path}",
+            model_name
+        )
         
-        # Check if differencing is needed
-        is_stationary, _ = stationarity_results[owner]['is_stationary'], stationarity_results[owner]['p_value']
+        # Transition the model to the specified stage
+        client = mlflow.tracking.MlflowClient()
+        client.transition_model_version_stage(
+            name=model_name,
+            version=registered_model.version,
+            stage=model_stage
+        )
         
-        # If not stationary, difference the series
-        if not is_stationary:
-            print(f"Series for {owner} is not stationary, applying differencing")
-            values_diff = np.diff(values)
-            p, q, acf_vals, pacf_vals = analyze_acf_pacf(values_diff, f"{owner} (differenced)")
-            d = 1
-        else:
-            p, q, acf_vals, pacf_vals = analyze_acf_pacf(values, owner)
-            d = 0
-            
-        # For monthly data, we might need higher max_lags to catch seasonality
-        if len(values) >= 36:  # If we have at least 3 years of data
-            p_seasonal, q_seasonal, _, _ = analyze_acf_pacf(values if is_stationary else values_diff, 
-                                                         f"{owner} (seasonal check)", 
-                                                         max_lags=24)
-            # Use the higher of the two if seasonal analysis found something
-            p = max(p, p_seasonal) if p_seasonal > p else p
-            q = max(q, q_seasonal) if q_seasonal > q else q
-            
-        acf_pacf_results[owner] = {
-            'p': p,
-            'd': d,
-            'q': q,
-            'acf_values': acf_vals,
-            'pacf_values': pacf_vals
-        }
+        # Add model description and details
+        client.update_model_version(
+            name=model_name,
+            version=registered_model.version,
+            description=json.dumps(model_details)
+        )
         
-        print(f"Suggested ARIMA order for {owner}: ({p}, {d}, {q})")
-    else:
-        print(f"Owner {owner} has only {len(values)} months of data, not enough for robust ACF/PACF analysis.")
-        acf_pacf_results[owner] = None
+        print(f"Model for owner '{owner}' registered as '{model_name}' " +
+              f"version {registered_model.version} in stage '{model_stage}'")
+        
+        return registered_model
+    except Exception as e:
+        print(f"Error registering model for {owner}: {str(e)}")
+        return None
 
-# Train ARIMA models for owners with sufficient data
-arima_results = {}
+# Log each model in a separate MLflow run
+registered_models = {}
 
-for owner in owners:
-    owner_data = df[df['Owner'] == owner].sort_values('Date')
-    values = owner_data['Value'].values
-    dates = owner_data['Date'].values
+for owner, metadata in model_metadata.items():
+    model_fit = metadata['model_fit']
+    model_type = metadata['model_type']
+    framework = metadata['framework']
+    params = metadata['params']
     
-    # Only attempt ARIMA if we have enough data points (at least 24 months / 2 years)
-    if len(values) >= 24 and acf_pacf_results[owner] is not None:
-        print(f"Training ARIMA model for Owner: {owner}")
-        
-        # Get suggested order
-        p, d, q = acf_pacf_results[owner]['p'], acf_pacf_results[owner]['d'], acf_pacf_results[owner]['q']
-        
-        try:
-            # Train ARIMA model
-            model = ARIMA(values, order=(p, d, q))
-            model_fit = model.fit()
-            
-            # Print model summary
-            print(f"ARIMA model summary for Owner: {owner}")
-            print(model_fit.summary())
-            
-            arima_results[owner] = {
-                'model': model_fit,
-                'order': (p, d, q),
-                'values': values,
-                'dates': dates,
-                'model_type': f"ARIMA({p},{d},{q})"
-            }
-            
-        except Exception as e:
-            print(f"Error training ARIMA for {owner}: {str(e)}")
-            print("Trying simpler ARIMA(1,1,1) model...")
-            
-            try:
-                # Try with simpler model
-                model = ARIMA(values, order=(1, 1, 1))
-                model_fit = model.fit()
-                
-                arima_results[owner] = {
-                    'model': model_fit,
-                    'order': (1, 1, 1),
-                    'values': values,
-                    'dates': dates,
-                    'model_type': "ARIMA(1,1,1)"
-                }
-                
-            except Exception as e2:
-                print(f"Error training simpler ARIMA for {owner}: {str(e2)}")
-                arima_results[owner] = None
-    else:
-        print(f"Owner {owner} has insufficient data for ARIMA modeling.")
-        arima_results[owner] = None
-
-# Train linear regression models for all owners
-linear_results = {}
-
-for owner in owners:
-    owner_data = df[df['Owner'] == owner].sort_values('Date')
-    values = owner_data['Value'].values
-    dates = owner_data['Date'].values
+    # Add reconciliation info to tags for non-Total owners
+    owner_tags = run_tags.copy()
+    if is_total_present and owner != "Total":
+        owner_tags["reconciled"] = "true"
+    elif owner == "Total":
+        owner_tags["is_total"] = "true"
     
-    print(f"Training Linear Regression model for Owner: {owner}")
-    
-    # For monthly data, convert dates to numeric feature (months since first date)
-    first_date = min(dates)
-    X = np.array([((d.year - first_date.year) * 12 + d.month - first_date.month) for d in dates]).reshape(-1, 1)
-    
-    # Fit model
-    model = LinearRegression()
-    model.fit(X, values)
-    
-    # Calculate R-squared
-    y_pred = model.predict(X)
-    ss_total = np.sum((values - np.mean(values))**2)
-    ss_residual = np.sum((values - y_pred)**2)
-    r_squared = 1 - (ss_residual / ss_total)
-    
-    print(f"Linear Regression coefficients for {owner}:")
-    print(f"Intercept: {model.intercept_:.4f}")
-    print(f"Slope (per month): {model.coef_[0]:.4f}")
-    print(f"R-squared: {r_squared:.4f}")
-    
-    linear_results[owner] = {
-        'model': model,
-        'first_date': first_date,
-        'values': values,
-        'dates': dates,
-        'r_squared': r_squared,
-        'model_type': "Linear Regression"
-    }
-
-# Generate forecasts for each owner
-forecast_months = 12  # Number of months to forecast
-forecast_results = {}
-
-for owner in owners:
-    print(f"Generating forecast for Owner: {owner}")
-    
-    # Check if we have a valid ARIMA model
-    if arima_results[owner] is not None:
-        print(f"Using {arima_results[owner]['model_type']} model for {owner}")
+    # Start a new MLflow run for this owner
+    run_name = f"{run_name_prefix}{owner.replace(' ', '_')}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    with mlflow.start_run(run_name=run_name) as run:
+        run_id = run.info.run_id
+        print(f"Started MLflow run: {run_name} with ID: {run_id}")
         
-        # Get the model and data
-        model = arima_results[owner]['model']
-        values = arima_results[owner]['values']
-        dates = arima_results[owner]['dates']
-        
-        # Generate forecast
-        forecast = model.forecast(steps=forecast_months)
-        forecast_conf = model.get_forecast(steps=forecast_months)
-        conf_int = forecast_conf.conf_int()
-        
-        # Generate future dates (monthly)
-        last_date = dates[-1]
-        future_dates = [last_date + relativedelta(months=i+1) for i in range(forecast_months)]
-        
-        forecast_results[owner] = {
-            'forecast': forecast,
-            'conf_int': conf_int,
-            'future_dates': future_dates,
-            'model_type': arima_results[owner]['model_type']
-        }
-    else:
-        print(f"Using Linear Regression model for {owner}")
-        
-        # Get the model and data
-        model = linear_results[owner]['model']
-        first_date = linear_results[owner]['first_date']
-        values = linear_results[owner]['values']
-        dates = linear_results[owner]['dates']
-        
-        # Get the last date
-        last_date = dates[-1]
-        
-        # Generate future months (as X values)
-        months_since_first = [
-            ((last_date.year - first_date.year) * 12 + last_date.month - first_date.month) + i + 1 
-            for i in range(forecast_months)
-        ]
-        future_X = np.array(months_since_first).reshape(-1, 1)
-        
-        # Generate forecast
-        forecast = model.predict(future_X)
-        
-        # Generate simple confidence intervals
-        # (This is a simplification - not statistically rigorous)
-        prediction_std = np.std(values - model.predict(
-            np.array([((d.year - first_date.year) * 12 + d.month - first_date.month) for d in dates]).reshape(-1, 1)
-        ))
-        conf_lower = forecast - 1.96 * prediction_std
-        conf_upper = forecast + 1.96 * prediction_std
-        
-        # Create a DataFrame similar to ARIMA's conf_int
-        conf_int = pd.DataFrame({
-            'lower': conf_lower,
-            'upper': conf_upper
+        # Log parameters
+        mlflow.log_params({
+            "owner": owner,
+            "model_type": model_type,
+            "framework": framework,
+            "min_months_for_arima": MIN_MONTHS_FOR_ARIMA,
+            "forecast_months": FORECAST_MONTHS,
+            **params  # Unpack the model parameters
         })
         
-        # Generate future dates (monthly)
-        future_dates = [last_date + relativedelta(months=i+1) for i in range(forecast_months)]
+        # Log tags
+        mlflow.set_tags({**owner_tags, "owner": owner})
         
-        forecast_results[owner] = {
-            'forecast': forecast,
-            'conf_int': conf_int,
-            'future_dates': future_dates,
-            'model_type': "Linear Regression"
-        }
-
-# Plot forecasts for each owner
-for owner in owners:
-    # Get owner data
-    owner_data = df[df['Owner'] == owner].sort_values('Date')
-    dates = owner_data['Date']
-    values = owner_data['Value']
-    
-    # Get forecast data
-    forecast = forecast_results[owner]['forecast']
-    conf_int = forecast_results[owner]['conf_int']
-    future_dates = forecast_results[owner]['future_dates']
-    model_type = forecast_results[owner]['model_type']
-    
-    # Create plot
-    plt.figure(figsize=(14, 7))
-    
-    # Plot historical data
-    plt.plot(dates, values, label='Historical Data', marker='o', color='blue')
-    
-    # Plot forecast
-    plt.plot(future_dates, forecast, label=f'Forecast ({model_type})', 
-             color='red', marker='x', linestyle='--')
-    
-    # Plot confidence interval
-    if isinstance(conf_int, pd.DataFrame):
-        plt.fill_between(future_dates, 
-                         conf_int['lower'], 
-                         conf_int['upper'], 
-                         color='red', alpha=0.2)
-    
-    # Add labels and title
-    plt.title(f'Monthly Forecast for Owner: {owner} using {model_type}')
-    plt.xlabel('Date')
-    plt.ylabel('Value')
-    plt.grid(True)
-    plt.legend()
-    
-    # Add vertical line at the forecast start
-    plt.axvline(x=dates.iloc[-1], color='green', linestyle='--', 
-                label='Forecast Start')
-    
-    # Format date axis to show month-year
-    plt.gca().xaxis.set_major_formatter(plt.matplotlib.dates.DateFormatter('%b %Y'))
-    plt.gcf().autofmt_xdate()
-    
-    # Display plot
-    display(plt.gcf())
-    plt.close()
-
-# Create summary report
-summary_data = []
-
-for owner in owners:
-    # Get original data
-    owner_data = df[df['Owner'] == owner]
-    
-    # Get forecast data
-    forecast = forecast_results[owner]['forecast']
-    model_type = forecast_results[owner]['model_type']
-    future_dates = forecast_results[owner]['future_dates']
-    
-    # Calculate growth metrics
-    last_value = owner_data['Value'].iloc[-1]
-    forecast_first = forecast[0]  # First month forecast
-    forecast_third = forecast[2] if len(forecast) > 2 else np.nan  # 3-month forecast
-    forecast_sixth = forecast[5] if len(forecast) > 5 else np.nan  # 6-month forecast
-    forecast_last = forecast[-1]  # 12-month forecast
-    
-    # Calculate percentage changes
-    pct_change_1m = ((forecast_first - last_value) / last_value) * 100 if last_value != 0 else np.inf
-    pct_change_3m = ((forecast_third - last_value) / last_value) * 100 if last_value != 0 else np.inf
-    pct_change_6m = ((forecast_sixth - last_value) / last_value) * 100 if last_value != 0 else np.inf
-    pct_change_12m = ((forecast_last - last_value) / last_value) * 100 if last_value != 0 else np.inf
-    
-    # Add to summary
-    summary_data.append({
-        'Owner': owner,
-        'Model_Type': model_type,
-        'Months_of_Data': len(owner_data),
-        'Last_Actual_Value': round(last_value, 2),
-        'Forecast_1M': round(forecast_first, 2),
-        'Forecast_3M': round(forecast_third, 2) if not np.isnan(forecast_third) else np.nan,
-        'Forecast_6M': round(forecast_sixth, 2) if not np.isnan(forecast_sixth) else np.nan,
-        'Forecast_12M': round(forecast_last, 2),
-        '%_Change_1M': round(pct_change_1m, 2),
-        '%_Change_3M': round(pct_change_3m, 2) if not np.isnan(forecast_third) else np.nan,
-        '%_Change_6M': round(pct_change_6m, 2) if not np.isnan(forecast_sixth) else np.nan,
-        '%_Change_12M': round(pct_change_12m, 2)
-    })
-
-# Create DataFrame and display summary
-summary_df = pd.DataFrame(summary_data)
-print("Forecast Summary Report:")
-display(summary_df)
-
-# Create detailed forecast tables for each owner
-for owner in owners:
-    # Get forecast data
-    forecast = forecast_results[owner]['forecast']
-    future_dates = forecast_results[owner]['future_dates']
-    model_type = forecast_results[owner]['model_type']
-    
-    # Create DataFrame with forecasts
-    forecast_df = pd.DataFrame({
-        'Month': [d.strftime('%Y-%m') for d in future_dates],
-        'Forecasted_Value': forecast,
-        'Model_Type': model_type
-    })
-    
-    # Display
-    print(f"Detailed monthly forecast for {owner} using {model_type}:")
-    display(forecast_df)
-
-# Optional: Seasonal analysis for owners with sufficient data
-for owner in owners:
-    owner_data = df[df['Owner'] == owner].sort_values('Date')
-    
-    # Only analyze if we have enough data (at least 2 years)
-    if len(owner_data) >= 24:
-        print(f"Seasonal analysis for Owner: {owner}")
+        # Log model and metrics based on model type
+        if "ARIMA" in model_type:
+            # For ARIMA models
+            artifact_path = "arima_model"
+            mlflow.statsmodels.log_model(model_fit, artifact_path)
+            
+            # Log metrics
+            aic = model_fit.aic if hasattr(model_fit, 'aic') else None
+            bic = model_fit.bic if hasattr(model_fit, 'bic') else None
+            if aic is not None:
+                mlflow.log_metric("AIC", aic)
+            if bic is not None:
+                mlflow.log_metric("BIC", bic)
+            
+            # Register the model
+            registered_model = register_model(owner, metadata, artifact_path)
+            registered_models[owner] = registered_model
+            
+        else:
+            # For Linear Regression models
+            artifact_path = "linear_model"
+            mlflow.sklearn.log_model(model_fit, artifact_path)
+            
+            # Log metrics (R-squared for Linear Regression)
+            r_squared = linear_results[owner]['r_squared'] if owner in linear_results else None
+            if r_squared is not None:
+                mlflow.log_metric("R-squared", r_squared)
+                mlflow.log_metric("RMSE", np.sqrt(np.mean((linear_results[owner]['values'] - 
+                                 model_fit.predict(np.array([((d.year - linear_results[owner]['first_date'].year) * 12 + 
+                                 d.month - linear_results[owner]['first_date'].month) 
+                                 for d in linear_results[owner]['dates']]).reshape(-1, 1)))**2)))
+            
+            # Register the model
+            registered_model = register_model(owner, metadata, artifact_path)
+            registered_models[owner] = registered_model
         
-        # Create a month column
-        owner_data['Month'] = owner_data['Date'].dt.month
+        # Log the forecast data as a CSV artifact
+        forecast_data = pd.DataFrame({
+            'Month': [d.strftime('%Y-%m') for d in forecast_results[owner]['future_dates']],
+            'Forecasted_Value': forecast_results[owner]['forecast']
+        })
         
-        # Group by month and calculate average
-        monthly_avg = owner_data.groupby('Month')['Value'].mean().reset_index()
-        monthly_avg['Month_Name'] = monthly_avg['Month'].apply(lambda x: datetime(2000, x, 1).strftime('%b'))
+        # Add initial forecast if reconciled
+        if is_total_present and owner != "Total" and 'initial_forecast' in forecast_results[owner]:
+            forecast_data['Initial_Forecast'] = forecast_results[owner]['initial_forecast']
+            forecast_data['Adjustment'] = forecast_results[owner]['forecast'] - forecast_results[owner]['initial_forecast']
+            
+        forecast_path = f"{owner.replace(' ', '_')}_forecast.csv"
+        forecast_data.to_csv(forecast_path, index=False)
+        mlflow.log_artifact(forecast_path)
+        os.remove(forecast_path)  # Clean up the temporary file
         
-        # Plot monthly averages
-        plt.figure(figsize=(12, 6))
-        plt.bar(monthly_avg['Month_Name'], monthly_avg['Value'], color='skyblue')
-        plt.title(f'Monthly Seasonal Pattern for Owner: {owner}')
-        plt.xlabel('Month')
-        plt.ylabel('Average Value')
-        plt.grid(axis='y', linestyle='--', alpha=0.7)
+        # Create and log a forecast plot
+        plt.figure(figsize=FIGSIZE_TIMESERIES)
+        owner_data = df[df['Owner'] == owner].sort_values('Date')
+        plt.plot(owner_data['Date'], owner_data['Value'], label='Historical Data', marker='o')
+        plt.plot(forecast_results[owner]['future_dates'], forecast_results[owner]['forecast'], 
+                 label=f'Forecast ({model_type})', color='red', linestyle='--', marker='x')
+                 
+        # Add initial forecast if reconciled
+        if is_total_present and owner != "Total" and 'initial_forecast' in forecast_results[owner]:
+            plt.plot(forecast_results[owner]['future_dates'], forecast_results[owner]['initial_forecast'], 
+                     label='Initial Forecast', color='green', linestyle=':', marker='+')
         
-        # Display plot
-        display(plt.gcf())
+        plt.title(f'Value Forecast for Owner: {owner}')
+        plt.xlabel('Date')
+        plt.ylabel('Value')
+        plt.grid(True)
+        plt.legend()
+        plt.tight_layout()
+        plot_path = f"{owner.replace(' ', '_')}_forecast_plot.png"
+        plt.savefig(plot_path, dpi=300)
+        mlflow.log_artifact(plot_path)
         plt.close()
+        os.remove(plot_path)  # Clean up the temporary file
         
-        # Identify peak and trough months
-        peak_month = monthly_avg.loc[monthly_avg['Value'].idxmax()]
-        trough_month = monthly_avg.loc[monthly_avg['Value'].idxmin()]
+        # Log reconciliation info if applicable
+        if is_total_present:
+            if owner == "Total":
+                # Log total's sum check
+                reconciliation_sum = np.zeros(FORECAST_MONTHS)
+                for other_owner in other_owners:
+                    reconciliation_sum += forecast_results[other_owner]['forecast']
+                
+                reconciliation_error = forecast_results["Total"]['forecast'] - reconciliation_sum
+                mlflow.log_metric("max_reconciliation_error", float(np.max(np.abs(reconciliation_error))))
+                mlflow.log_metric("mean_reconciliation_error", float(np.mean(np.abs(reconciliation_error))))
+            elif 'initial_forecast' in forecast_results[owner]:
+                # Log adjustment metrics for individual owners
+                initial = forecast_results[owner]['initial_forecast']
+                reconciled = forecast_results[owner]['forecast']
+                adjustment = reconciled - initial
+                mlflow.log_metric("mean_adjustment", float(np.mean(adjustment)))
+                mlflow.log_metric("max_adjustment", float(np.max(np.abs(adjustment))))
+                mlflow.log_metric("pct_adjustment", float(np.mean(np.abs(adjustment) / np.abs(initial)) * 100))
         
-        print(f"Peak month: {peak_month['Month_Name']} (Average: {peak_month['Value']:.2f})")
-        print(f"Trough month: {trough_month['Month_Name']} (Average: {trough_month['Value']:.2f})")
-        print("-" * 50)
-        
-        # Display monthly average data
-        print("Monthly average values:")
-        display(monthly_avg[['Month_Name', 'Value']].sort_values('Month'))
+        print(f"Completed MLflow run for owner: {owner}")
+
+# Display registered models summary
+print("\nRegistered Models Summary:")
+registered_models_df = pd.DataFrame([
+    {
+        "Owner": owner,
+        "Model Name": f"{model_prefix}{owner.replace(' ', '_').lower()}",
+        "Model Type": model_metadata[owner]['model_type'],
+        "Version": registered_model.version if registered_model else "Registration Failed",
+        "Stage": model_stage
+    }
+    for owner, registered_model in registered_models.items()
+])
+display(registered_models_df)
+
+# Instructions for loading models from MLflow
+print("\nTo load a specific model from MLflow, use the following code:")
+print("```python")
+print("# For ARIMA models")
+print("import mlflow.statsmodels")
+print("loaded_model = mlflow.statsmodels.load_model('runs:/<run_id>/arima_model')")
+print("")
+print("# For Linear Regression models")
+print("import mlflow.sklearn")
+print("loaded_model = mlflow.sklearn.load_model('runs:/<run_id>/linear_model')")
+print("```")
