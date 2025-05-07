@@ -11,7 +11,6 @@ from datetime import datetime, timedelta
 import warnings
 from dateutil.relativedelta import relativedelta
 import logging
-from scipy.optimize import nnls
 
 # ====================================================
 # PARAMETER SECTION - Modify these values as needed
@@ -33,23 +32,8 @@ MAX_LAGS_SEASONAL = 6  # Cannot detect yearly seasonality
 CONFIDENCE_LEVEL = 90  # 90% confidence as requested
 Z_VALUE = 1.645  # Corresponds to 90% confidence
 
-# ARIMA modeling parameters
-MAX_P = 1  # Very simple models only
-MAX_Q = 1  # Very simple models only
-MAX_D = 1  # At most one differencing
-
-# Simplified ARIMA approach 
-USE_SIMPLE_ARIMA = True  # Use predetermined simple models
-DEFAULT_ARIMA_ORDER = (1, 0, 0)  # Default to AR(1) model
-
-# Prefer linear regression flag
-PREFER_LINEAR_REGRESSION = True  # Linear regression may be more stable
-
-# Non-negativity constraints
+# Non-negativity constraint
 ENFORCE_NON_NEGATIVE = True  # Flag to ensure forecasts don't go below zero
-LOG_TRANSFORM = True  # Use log transformation for non-negative forecasts
-MIN_VALUE = 0.01  # Minimum value to use when log transforming (to avoid log(0))
-CONSTRAINED_LINEAR = True  # Use constrained linear regression (non-negative)
 
 # Reconciliation method
 RECONCILIATION_METHOD = "proportional"  
@@ -126,98 +110,54 @@ for owner in all_owners:
         logger.info(f"Training ARIMA model for Owner: {owner}")
         print(f"Training ARIMA model for Owner: {owner}")
         
-        # Get order parameters
-        if USE_SIMPLE_ARIMA:
-            # Skip complex analysis and use simple models
-            logger.info(f"Using simple predetermined ARIMA order for {owner} due to limited data")
-            p, d, q = DEFAULT_ARIMA_ORDER
-        else:
-            # Get suggested order from previous analysis
+        # Get suggested order from previous analysis
+        if owner in acf_pacf_results and acf_pacf_results[owner] is not None:
             p, d, q = acf_pacf_results[owner]['p'], acf_pacf_results[owner]['d'], acf_pacf_results[owner]['q']
-            # Limit to maximum values
-            p = min(p, MAX_P)
-            d = min(d, MAX_D)
-            q = min(q, MAX_Q)
+        else:
+            # Simple default if not available
+            p, d, q = 1, 0, 0
         
         try:
-            # Apply transformation if needed for non-negative forecasts
-            if LOG_TRANSFORM and ENFORCE_NON_NEGATIVE:
-                # Check for non-positive values
-                min_value = np.min(values)
-                if min_value <= 0:
-                    # Add offset to ensure all values are positive
-                    transformed_values = np.log(values + MIN_VALUE)
-                    logger.info(f"Applied log transformation with offset {MIN_VALUE} for {owner}")
-                else:
-                    transformed_values = np.log(values)
-                    logger.info(f"Applied log transformation for {owner}")
-                
-                # Train ARIMA on transformed data
-                model = ARIMA(transformed_values, order=(p, d, q))
-                model_fit = model.fit()
-                
-                # For in-sample predictions, we need to back-transform
-                if d > 0:
-                    # For differenced models
-                    in_sample_pred_transformed = model_fit.predict(start=d, end=len(transformed_values)-1)
-                    # Ensure lengths match for metric calculation
-                    actuals = values[d:]
-                    # Back-transform
-                    if min_value <= 0:
-                        in_sample_pred = np.exp(in_sample_pred_transformed) - MIN_VALUE
-                    else:
-                        in_sample_pred = np.exp(in_sample_pred_transformed)
-                else:
-                    # For non-differenced models
-                    in_sample_pred_transformed = model_fit.predict(start=0, end=len(transformed_values)-1)
-                    actuals = values
-                    # Back-transform
-                    if min_value <= 0:
-                        in_sample_pred = np.exp(in_sample_pred_transformed) - MIN_VALUE
-                    else:
-                        in_sample_pred = np.exp(in_sample_pred_transformed)
-                
-                # Ensure non-negative predictions
-                in_sample_pred = np.maximum(in_sample_pred, 0)
+            # Train ARIMA model
+            model = ARIMA(values, order=(p, d, q))
+            model_fit = model.fit()
+            
+            # Calculate in-sample predictions
+            if d > 0:
+                # For differenced models
+                in_sample_pred = model_fit.predict(start=d, end=len(values)-1)
+                # Ensure lengths match for metric calculation
+                actuals = values[d:]
             else:
-                # Standard ARIMA without transformation
-                model = ARIMA(values, order=(p, d, q))
-                model_fit = model.fit()
-                
-                # Calculate in-sample predictions
-                if d > 0:
-                    # For differenced models
-                    in_sample_pred = model_fit.predict(start=d, end=len(values)-1)
-                    # Ensure lengths match for metric calculation
-                    actuals = values[d:]
-                else:
-                    in_sample_pred = model_fit.predict(start=0, end=len(values)-1)
-                    actuals = values
-                
-                # Ensure non-negative predictions if required
-                if ENFORCE_NON_NEGATIVE:
-                    in_sample_pred = np.maximum(in_sample_pred, 0)
+                in_sample_pred = model_fit.predict(start=0, end=len(values)-1)
+                actuals = values
+            
+            # Ensure in-sample predictions are non-negative if required
+            if ENFORCE_NON_NEGATIVE:
+                in_sample_pred = np.maximum(in_sample_pred, 0)
             
             # Calculate metrics
             metrics = calculate_metrics(actuals, in_sample_pred)
+            
+            # Print model summary
+            print(f"ARIMA model summary for Owner: {owner}")
+            print(model_fit.summary())
+            
+            # Print metrics
+            print(f"ARIMA model metrics for {owner}:")
+            for metric_name, metric_value in metrics.items():
+                print(f"  {metric_name.upper()}: {metric_value:.4f}")
             
             # Store ARIMA results
             arima_results[owner] = {
                 'model_fit': model_fit,
                 'order': (p, d, q),
                 'values': values,
-                'transformed': LOG_TRANSFORM and ENFORCE_NON_NEGATIVE,
-                'min_value': min_value if LOG_TRANSFORM and ENFORCE_NON_NEGATIVE and min_value <= 0 else 0,
                 'dates': dates,
                 'model_type': f"ARIMA({p},{d},{q})",
                 'in_sample_pred': in_sample_pred,
                 'metrics': metrics
             }
-            
-            # Print metrics
-            print(f"ARIMA model metrics for {owner}:")
-            for metric_name, metric_value in metrics.items():
-                print(f"  {metric_name.upper()}: {metric_value:.4f}")
             
             logger.info(f"Successfully trained ARIMA({p},{d},{q}) for {owner}")
             
@@ -251,30 +191,16 @@ for owner in all_owners:
         for d in dates
     ]).reshape(-1, 1)
     
-    # Check if we should use constrained linear regression
-    if CONSTRAINED_LINEAR and ENFORCE_NON_NEGATIVE:
-        # Use Non-Negative Least Squares for constrained regression
-        X_with_const = np.column_stack((np.ones(X.shape[0]), X))
-        coeffs, _ = nnls(X_with_const, values)
-        
-        # Create a LinearRegression-like object
-        model = LinearRegression()
-        model.intercept_ = coeffs[0]
-        model.coef_ = np.array([coeffs[1]])
-        
-        # Generate in-sample predictions
-        in_sample_pred = model.intercept_ + X * model.coef_[0]
-    else:
-        # Standard linear regression
-        model = LinearRegression()
-        model.fit(X, values)
-        
-        # Generate in-sample predictions
-        in_sample_pred = model.predict(X)
-        
-        # Ensure non-negative predictions if required
-        if ENFORCE_NON_NEGATIVE:
-            in_sample_pred = np.maximum(in_sample_pred, 0)
+    # Standard linear regression
+    model = LinearRegression()
+    model.fit(X, values)
+    
+    # Generate in-sample predictions
+    in_sample_pred = model.predict(X)
+    
+    # Ensure in-sample predictions are non-negative if required
+    if ENFORCE_NON_NEGATIVE:
+        in_sample_pred = np.maximum(in_sample_pred, 0)
     
     # Calculate metrics
     metrics = calculate_metrics(values, in_sample_pred)
@@ -312,12 +238,8 @@ for owner in all_owners:
     logger.info(f"Generating initial forecast for Owner: {owner}")
     print(f"Generating initial forecast for Owner: {owner}")
     
-    # Choose the best model
-    if PREFER_LINEAR_REGRESSION and len(owner_data) <= MIN_MONTHS_FOR_ARIMA:
-        logger.info(f"Preferring Linear Regression for {owner} due to limited data")
-        use_arima = False
-    elif owner in arima_results and arima_results[owner] is not None:
-        # Compare metrics to choose the best model
+    # Compare metrics to choose the best model
+    if owner in arima_results and arima_results[owner] is not None:
         arima_metrics = arima_results[owner]['metrics']
         linear_metrics = linear_results[owner]['metrics']
         
@@ -339,8 +261,6 @@ for owner in all_owners:
         dates = arima_results[owner]['dates']
         model_type = arima_results[owner]['model_type']
         metrics = arima_results[owner]['metrics']
-        is_transformed = arima_results[owner].get('transformed', False)
-        min_value = arima_results[owner].get('min_value', 0)
         
         # Store model metadata
         model_metadata[owner] = {
@@ -354,54 +274,19 @@ for owner in all_owners:
         }
         
         # Generate forecast
-        if is_transformed:
-            # Generate forecast on transformed scale
-            forecast_transformed = model_fit.forecast(steps=FORECAST_MONTHS)
-            
-            # Back-transform to original scale
-            if min_value > 0:
-                forecast = np.exp(forecast_transformed)
-            else:
-                forecast = np.exp(forecast_transformed) - MIN_VALUE
-            
-            # Ensure non-negative values
+        forecast = model_fit.forecast(steps=FORECAST_MONTHS)
+        
+        # Ensure forecasts are non-negative if required
+        if ENFORCE_NON_NEGATIVE:
             forecast = np.maximum(forecast, 0)
-            
-            # Generate confidence intervals on transformed scale
-            forecast_conf = model_fit.get_forecast(steps=FORECAST_MONTHS)
-            conf_int_transformed = forecast_conf.conf_int(alpha=(1 - CONFIDENCE_LEVEL/100))
-            
-            # Back-transform confidence intervals
-            if min_value > 0:
-                conf_lower = np.exp(conf_int_transformed.iloc[:, 0])
-                conf_upper = np.exp(conf_int_transformed.iloc[:, 1])
-            else:
-                conf_lower = np.exp(conf_int_transformed.iloc[:, 0]) - MIN_VALUE
-                conf_upper = np.exp(conf_int_transformed.iloc[:, 1]) - MIN_VALUE
-            
-            # Ensure lower bound is non-negative
-            conf_lower = np.maximum(conf_lower, 0)
-            
-            # Create a DataFrame for confidence intervals
-            conf_int = pd.DataFrame({
-                'lower': conf_lower,
-                'upper': conf_upper
-            })
-        else:
-            # Generate forecast directly
-            forecast = model_fit.forecast(steps=FORECAST_MONTHS)
-            
-            # Ensure non-negative values if required
-            if ENFORCE_NON_NEGATIVE:
-                forecast = np.maximum(forecast, 0)
-            
-            # Generate confidence intervals
-            forecast_conf = model_fit.get_forecast(steps=FORECAST_MONTHS)
-            conf_int = forecast_conf.conf_int(alpha=(1 - CONFIDENCE_LEVEL/100))
-            
-            # Ensure lower bound is non-negative if required
-            if ENFORCE_NON_NEGATIVE:
-                conf_int.iloc[:, 0] = np.maximum(conf_int.iloc[:, 0], 0)
+        
+        # Generate confidence intervals
+        forecast_conf = model_fit.get_forecast(steps=FORECAST_MONTHS)
+        conf_int = forecast_conf.conf_int(alpha=(1 - CONFIDENCE_LEVEL/100))
+        
+        # Ensure confidence interval lower bounds are non-negative if required
+        if ENFORCE_NON_NEGATIVE:
+            conf_int.iloc[:, 0] = np.maximum(conf_int.iloc[:, 0], 0)
         
         # Generate future dates (monthly)
         last_date = to_python_datetime(dates[-1])
@@ -432,8 +317,7 @@ for owner in all_owners:
             'framework': 'sklearn.LinearRegression',
             'metrics': metrics,
             'params': {
-                'fit_intercept': True,
-                'constrained': CONSTRAINED_LINEAR and ENFORCE_NON_NEGATIVE
+                'fit_intercept': True
             }
         }
         
@@ -451,7 +335,7 @@ for owner in all_owners:
         # Generate forecast
         forecast = model_fit.predict(future_X)
         
-        # Ensure non-negative values if required
+        # Ensure forecasts are non-negative if required
         if ENFORCE_NON_NEGATIVE:
             forecast = np.maximum(forecast, 0)
         
@@ -460,7 +344,7 @@ for owner in all_owners:
         conf_lower = forecast - Z_VALUE * prediction_std
         conf_upper = forecast + Z_VALUE * prediction_std
         
-        # Ensure lower bound is non-negative if required
+        # Ensure confidence interval lower bounds are non-negative if required
         if ENFORCE_NON_NEGATIVE:
             conf_lower = np.maximum(conf_lower, 0)
         
@@ -538,7 +422,7 @@ if is_total_present:
                 adjustment = discrepancy[month] * proportion
                 reconciled_forecast_results[owner]["reconciled_forecast"][month] += adjustment
                 
-                # Ensure non-negative values after reconciliation
+                # Ensure non-negative values after reconciliation if required
                 if ENFORCE_NON_NEGATIVE:
                     reconciled_forecast_results[owner]["reconciled_forecast"][month] = max(
                         reconciled_forecast_results[owner]["reconciled_forecast"][month], 0
@@ -582,7 +466,7 @@ if is_total_present:
                 adjustment = discrepancy[month] * weights[owner]
                 reconciled_forecast_results[owner]["reconciled_forecast"][month] += adjustment
                 
-                # Ensure non-negative values after reconciliation
+                # Ensure non-negative values after reconciliation if required
                 if ENFORCE_NON_NEGATIVE:
                     reconciled_forecast_results[owner]["reconciled_forecast"][month] = max(
                         reconciled_forecast_results[owner]["reconciled_forecast"][month], 0
@@ -603,7 +487,7 @@ if is_total_present:
             merged_data = pd.merge(owner_data, total_data, on='Date', suffixes=('_owner', '_total'))
             # Calculate historical share
             merged_data['share'] = merged_data['Value_owner'] / merged_data['Value_total']
-            # Use average share over all available data (since we only have 6 months)
+            # Use average share over all available data
             avg_share = merged_data['share'].mean()
             historical_shares[owner] = avg_share
         
@@ -628,7 +512,7 @@ if is_total_present:
                 adjustment = discrepancy[month] * historical_shares[owner]
                 reconciled_forecast_results[owner]["reconciled_forecast"][month] += adjustment
                 
-                # Ensure non-negative values after reconciliation
+                # Ensure non-negative values after reconciliation if required
                 if ENFORCE_NON_NEGATIVE:
                     reconciled_forecast_results[owner]["reconciled_forecast"][month] = max(
                         reconciled_forecast_results[owner]["reconciled_forecast"][month], 0
