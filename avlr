@@ -33,18 +33,6 @@ MAX_LAGS_SEASONAL = 6  # Cannot detect yearly seasonality
 CONFIDENCE_LEVEL = 90  # 90% confidence as requested
 Z_VALUE = 1.645  # Corresponds to 90% confidence
 
-# ARIMA modeling parameters
-MAX_P = 1  # Very simple models only
-MAX_Q = 1  # Very simple models only
-MAX_D = 1  # At most one differencing
-
-# Simplified ARIMA approach 
-USE_SIMPLE_ARIMA = True  # Use predetermined simple models
-DEFAULT_ARIMA_ORDER = (1, 0, 0)  # Default to AR(1) model
-
-# Prefer linear regression flag
-PREFER_LINEAR_REGRESSION = True  # Linear regression may be more stable
-
 # Non-negativity constraints
 ENFORCE_NON_NEGATIVE = True  # Flag to ensure forecasts don't go below zero
 LOG_TRANSFORM = True  # Use log transformation for non-negative forecasts
@@ -72,11 +60,266 @@ warnings.filterwarnings("ignore")
 # Set plot style for better visualizations
 plt.style.use('seaborn-whitegrid')
 
+# Use the model_data DataFrame from previous code block instead of loading from CSV
+# We assume that model_data is available in the current namespace
+df = model_data.copy()
+logger.info(f"Using model_data DataFrame with {len(df)} rows")
+
+# Ensure Date is in datetime format
+if not pd.api.types.is_datetime64_any_dtype(df['Date']):
+    df['Date'] = pd.to_datetime(df['Date'])
+    logger.info("Converted Date column to datetime format")
+
+# Since data is monthly, ensure it's set to the first day of each month for consistency
+df['Date'] = df['Date'].apply(lambda x: x.replace(day=1))
+logger.info(f"Dates set to first day of each month for consistency")
+
+# Display the first few rows
+print("Data sample:")
+display(df.head())
+
+# Get basic statistics
+print("\nData summary:")
+display(df.describe())
+
+# Check for missing values
+print("\nMissing values:")
+display(df.isnull().sum())
+
+# Get unique owners
+all_owners = df['Owner'].unique()
+logger.info(f"Found {len(all_owners)} unique owners")
+
+# Separate "Total" from other owners
+is_total_present = "Total" in all_owners
+if is_total_present:
+    other_owners = [owner for owner in all_owners if owner != "Total"]
+    logger.info(f"Found 'Total' owner and {len(other_owners)} other owners")
+else:
+    other_owners = all_owners
+    logger.info("No 'Total' owner found, treating all owners individually")
+
+print(f"\nNumber of unique owners: {len(all_owners)}")
+print("Owners:", all_owners)
+
+# Count data points per owner
+owner_counts = df.groupby('Owner').size().reset_index(name='Count')
+print("\nData points per owner:")
+display(owner_counts)
+
 # Helper function to convert numpy.datetime64 to Python datetime
 def to_python_datetime(dt):
     if isinstance(dt, np.datetime64):
         return pd.Timestamp(dt).to_pydatetime()
     return dt
+
+# Check date ranges per owner
+date_ranges = []
+for owner in all_owners:
+    owner_data = df[df['Owner'] == owner].sort_values('Date')
+    first_date = to_python_datetime(owner_data['Date'].min())
+    last_date = to_python_datetime(owner_data['Date'].max())
+    
+    # Calculate months difference properly
+    months_diff = (last_date.year - first_date.year) * 12 + last_date.month - first_date.month + 1
+    
+    date_ranges.append({
+        'Owner': owner,
+        'First Month': first_date.strftime('%Y-%m'),
+        'Last Month': last_date.strftime('%Y-%m'),
+        'Months Count': len(owner_data),
+        'Expected Months': months_diff,
+        'Is Continuous': len(owner_data) == months_diff
+    })
+
+date_range_df = pd.DataFrame(date_ranges)
+print("\nDate ranges per owner:")
+display(date_range_df)
+
+# Define stationarity check function
+def check_stationarity(timeseries, owner_name=None):
+    """
+    Test stationarity using Augmented Dickey-Fuller test
+    """
+    # Perform ADF test
+    result = adfuller(timeseries)
+    
+    # Extract results
+    dftest = pd.Series(
+        result[0:4],
+        index=['Test Statistic', 'p-value', '#Lags Used', 'Number of Observations Used']
+    )
+    
+    for key, value in result[4].items():
+        dftest[f'Critical Value ({key})'] = value
+    
+    # Determine if stationary
+    is_stationary = result[1] <= 0.05
+    
+    # Display results
+    if owner_name:
+        print(f"Results of Augmented Dickey-Fuller Test for Owner: {owner_name}")
+    else:
+        print("Results of Augmented Dickey-Fuller Test:")
+    
+    print(dftest)
+    print(f"Is the series stationary? {'Yes' if is_stationary else 'No'}")
+    print("-" * 50)
+    
+    return is_stationary, result[1]
+
+# Plot time series for each owner
+logger.info("Plotting time series for each owner")
+plt.figure(figsize=(FIGSIZE_TIMESERIES[0], len(all_owners) * 4))
+
+for i, owner in enumerate(all_owners):
+    owner_data = df[df['Owner'] == owner].sort_values('Date')
+    
+    plt.subplot(len(all_owners), 1, i+1)
+    plt.plot(owner_data['Date'], owner_data['Value'], marker='o', linestyle='-', label=f"Data Points: {len(owner_data)}")
+    plt.title(f'Monthly Time Series for Owner: {owner}')
+    plt.ylabel('Value')
+    plt.grid(True)
+    plt.legend()
+    
+    # Format x-axis to show month-year
+    plt.gca().xaxis.set_major_formatter(plt.matplotlib.dates.DateFormatter('%b %Y'))
+    plt.gcf().autofmt_xdate()
+
+plt.tight_layout()
+display(plt.gcf())
+plt.close()
+
+# Test stationarity for each owner
+logger.info("Testing stationarity for each owner")
+stationarity_results = {}
+
+for owner in all_owners:
+    owner_data = df[df['Owner'] == owner].sort_values('Date')
+    values = owner_data['Value'].values
+    
+    # Only test if we have enough data points
+    if len(values) >= MIN_MONTHS_FOR_STATIONARITY:
+        logger.info(f"Testing stationarity for owner: {owner}")
+        is_stationary, p_value = check_stationarity(values, owner)
+        stationarity_results[owner] = {
+            'is_stationary': is_stationary,
+            'p_value': p_value,
+            'data_points': len(values)
+        }
+    else:
+        logger.warning(f"Owner {owner} has only {len(values)} months of data, not enough for stationarity test.")
+        print(f"Owner {owner} has only {len(values)} months of data, not enough for stationarity test.")
+        stationarity_results[owner] = {
+            'is_stationary': None,
+            'p_value': None,
+            'data_points': len(values)
+        }
+
+# Function to analyze and plot ACF and PACF
+def analyze_acf_pacf(timeseries, owner_name, max_lags=MAX_LAGS_DEFAULT):
+    """
+    Analyze and plot ACF and PACF to determine ARIMA order
+    """
+    logger.info(f"Analyzing ACF/PACF for owner: {owner_name}, max_lags: {max_lags}")
+    
+    # Compute ACF and PACF
+    acf_values = acf(timeseries, nlags=max_lags, fft=True)
+    pacf_values = pacf(timeseries, nlags=max_lags, method='ols')
+    
+    # Plot
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=FIGSIZE_ACF_PACF)
+    
+    # ACF plot
+    plot_acf(timeseries, ax=ax1, lags=max_lags)
+    ax1.set_title(f'Autocorrelation Function for Owner: {owner_name}')
+    
+    # PACF plot
+    plot_pacf(timeseries, ax=ax2, lags=max_lags)
+    ax2.set_title(f'Partial Autocorrelation Function for Owner: {owner_name}')
+    
+    plt.tight_layout()
+    display(plt.gcf())
+    plt.close()
+    
+    # Find significant lags (95% confidence)
+    significance_level = 1.96/np.sqrt(len(timeseries))
+    
+    # Significant lags in ACF (for MA/q order)
+    significant_acf = [i for i in range(1, max_lags + 1) if abs(acf_values[i]) > significance_level]
+    
+    # Significant lags in PACF (for AR/p order)
+    significant_pacf = [i for i in range(1, max_lags + 1) if abs(pacf_values[i]) > significance_level]
+    
+    print(f"Owner: {owner_name}")
+    print(f"Significant lags in ACF (suggests MA/q order): {significant_acf}")
+    print(f"Significant lags in PACF (suggests AR/p order): {significant_pacf}")
+    
+    # Check for seasonality (12 months)
+    if max_lags >= 12 and len(timeseries) >= 24:
+        seasonal_lag = 12
+        if seasonal_lag in significant_acf or seasonal_lag in significant_pacf:
+            logger.info(f"Potential yearly seasonality detected at lag {seasonal_lag} for {owner_name}")
+            print(f"Potential yearly seasonality detected at lag {seasonal_lag}")
+    
+    print("-" * 50)
+    
+    # Suggested order
+    p = max(significant_pacf) if significant_pacf else 1
+    q = max(significant_acf) if significant_acf else 1
+    
+    return p, q, acf_values, pacf_values
+
+# Analyze ACF and PACF for each owner with sufficient data
+logger.info("Analyzing ACF/PACF for each owner")
+acf_pacf_results = {}
+
+for owner in all_owners:
+    owner_data = df[df['Owner'] == owner].sort_values('Date')
+    values = owner_data['Value'].values
+    
+    # Only analyze if we have enough data points
+    if len(values) >= MIN_MONTHS_FOR_ARIMA:
+        print(f"Analyzing ACF/PACF for Owner: {owner} (Months of data: {len(values)})")
+        
+        # Check if differencing is needed
+        is_stationary, _ = stationarity_results[owner]['is_stationary'], stationarity_results[owner]['p_value']
+        
+        # If not stationary, difference the series
+        if not is_stationary:
+            logger.info(f"Series for {owner} is not stationary, applying differencing")
+            print(f"Series for {owner} is not stationary, applying differencing")
+            values_diff = np.diff(values)
+            p, q, acf_vals, pacf_vals = analyze_acf_pacf(values_diff, f"{owner} (differenced)")
+            d = 1
+        else:
+            p, q, acf_vals, pacf_vals = analyze_acf_pacf(values, owner)
+            d = 0
+            
+        # For monthly data, we might need higher max_lags to catch seasonality
+        if len(values) >= 36:  # If we have at least 3 years of data
+            logger.info(f"Checking for seasonality with additional lags for {owner}")
+            p_seasonal, q_seasonal, _, _ = analyze_acf_pacf(values if is_stationary else values_diff, 
+                                                         f"{owner} (seasonal check)", 
+                                                         max_lags=MAX_LAGS_SEASONAL)
+            # Use the higher of the two if seasonal analysis found something
+            p = max(p, p_seasonal) if p_seasonal > p else p
+            q = max(q, q_seasonal) if q_seasonal > q else q
+            
+        acf_pacf_results[owner] = {
+            'p': p,
+            'd': d,
+            'q': q,
+            'acf_values': acf_vals,
+            'pacf_values': pacf_vals
+        }
+        
+        logger.info(f"Suggested ARIMA order for {owner}: ({p}, {d}, {q})")
+        print(f"Suggested ARIMA order for {owner}: ({p}, {d}, {q})")
+    else:
+        logger.warning(f"Owner {owner} has only {len(values)} months of data, not enough for robust ACF/PACF analysis.")
+        print(f"Owner {owner} has only {len(values)} months of data, not enough for robust ACF/PACF analysis.")
+        acf_pacf_results[owner] = None
 
 # Function to calculate evaluation metrics
 def calculate_metrics(y_true, y_pred):
@@ -126,18 +369,12 @@ for owner in all_owners:
         logger.info(f"Training ARIMA model for Owner: {owner}")
         print(f"Training ARIMA model for Owner: {owner}")
         
-        # Get order parameters
-        if USE_SIMPLE_ARIMA:
-            # Skip complex analysis and use simple models
-            logger.info(f"Using simple predetermined ARIMA order for {owner} due to limited data")
-            p, d, q = DEFAULT_ARIMA_ORDER
-        else:
-            # Get suggested order from previous analysis
+        # Get suggested order from previous analysis
+        if owner in acf_pacf_results and acf_pacf_results[owner] is not None:
             p, d, q = acf_pacf_results[owner]['p'], acf_pacf_results[owner]['d'], acf_pacf_results[owner]['q']
-            # Limit to maximum values
-            p = min(p, MAX_P)
-            d = min(d, MAX_D)
-            q = min(q, MAX_Q)
+        else:
+            # Simple default if not available
+            p, d, q = 1, 0, 0
         
         try:
             # Apply transformation if needed for non-negative forecasts
@@ -312,11 +549,8 @@ for owner in all_owners:
     logger.info(f"Generating initial forecast for Owner: {owner}")
     print(f"Generating initial forecast for Owner: {owner}")
     
-    # Choose the best model
-    if PREFER_LINEAR_REGRESSION and len(owner_data) <= MIN_MONTHS_FOR_ARIMA:
-        logger.info(f"Preferring Linear Regression for {owner} due to limited data")
-        use_arima = False
-    elif owner in arima_results and arima_results[owner] is not None:
+    # Compare metrics to choose the best model
+    if owner in arima_results and arima_results[owner] is not None:
         # Compare metrics to choose the best model
         arima_metrics = arima_results[owner]['metrics']
         linear_metrics = linear_results[owner]['metrics']
@@ -538,7 +772,7 @@ if is_total_present:
                 adjustment = discrepancy[month] * proportion
                 reconciled_forecast_results[owner]["reconciled_forecast"][month] += adjustment
                 
-                # Ensure non-negative values after reconciliation
+                # Ensure non-negative values after reconciliation if required
                 if ENFORCE_NON_NEGATIVE:
                     reconciled_forecast_results[owner]["reconciled_forecast"][month] = max(
                         reconciled_forecast_results[owner]["reconciled_forecast"][month], 0
@@ -582,7 +816,7 @@ if is_total_present:
                 adjustment = discrepancy[month] * weights[owner]
                 reconciled_forecast_results[owner]["reconciled_forecast"][month] += adjustment
                 
-                # Ensure non-negative values after reconciliation
+                # Ensure non-negative values after reconciliation if required
                 if ENFORCE_NON_NEGATIVE:
                     reconciled_forecast_results[owner]["reconciled_forecast"][month] = max(
                         reconciled_forecast_results[owner]["reconciled_forecast"][month], 0
@@ -628,7 +862,7 @@ if is_total_present:
                 adjustment = discrepancy[month] * historical_shares[owner]
                 reconciled_forecast_results[owner]["reconciled_forecast"][month] += adjustment
                 
-                # Ensure non-negative values after reconciliation
+                # Ensure non-negative values after reconciliation if required
                 if ENFORCE_NON_NEGATIVE:
                     reconciled_forecast_results[owner]["reconciled_forecast"][month] = max(
                         reconciled_forecast_results[owner]["reconciled_forecast"][month], 0
@@ -668,3 +902,137 @@ if is_total_present:
 else:
     # If no "Total" owner, use initial forecasts
     forecast_results = initial_forecast_results
+
+# Create model comparison table
+logger.info("Creating model comparison table")
+model_comparison = []
+
+for owner in all_owners:
+    metrics_arima = arima_results[owner]['metrics'] if owner in arima_results and arima_results[owner] is not None else None
+    metrics_linear = linear_results[owner]['metrics']
+    
+    # Choose the best model based on RMSE
+    best_model = None
+    if metrics_arima is not None:
+        if metrics_arima['rmse'] < metrics_linear['rmse']:
+            best_model = "ARIMA"
+        else:
+            best_model = "Linear"
+    else:
+        best_model = "Linear"
+    
+    model_comparison.append({
+        'Owner': owner,
+        'ARIMA_R2': metrics_arima['r2'] if metrics_arima else None,
+        'ARIMA_RMSE': metrics_arima['rmse'] if metrics_arima else None,
+        'ARIMA_MAE': metrics_arima['mae'] if metrics_arima else None,
+        'ARIMA_MAPE': metrics_arima['mape'] if metrics_arima else None,
+        'Linear_R2': metrics_linear['r2'],
+        'Linear_RMSE': metrics_linear['rmse'],
+        'Linear_MAE': metrics_linear['mae'],
+        'Linear_MAPE': metrics_linear['mape'],
+        'Best_Model': best_model,
+        'Selected_Model': forecast_results[owner]['model_type']
+    })
+
+# Create and display model comparison DataFrame
+model_comparison_df = pd.DataFrame(model_comparison)
+print("\nModel Comparison:")
+display(model_comparison_df)
+
+# Create forecast summary report
+summary_data = []
+
+for owner in all_owners:
+    # Get original data
+    owner_data = df[df['Owner'] == owner]
+    
+    # Get forecast data
+    forecast = forecast_results[owner]['forecast']
+    model_type = forecast_results[owner]['model_type']
+    future_dates = forecast_results[owner]['future_dates']
+    
+    # Get metrics for the selected model
+    if "ARIMA" in model_type:
+        metrics = arima_results[owner]['metrics']
+    else:
+        metrics = linear_results[owner]['metrics']
+    
+    # Get initial forecast if reconciled
+    is_reconciled = is_total_present and owner != "Total" and 'initial_forecast' in forecast_results[owner]
+    if is_reconciled:
+        initial_forecast = forecast_results[owner]['initial_forecast']
+    
+    # Calculate growth metrics
+    last_value = owner_data['Value'].iloc[-1]
+    forecast_first = forecast[0]  # First month forecast
+    forecast_third = forecast[2] if len(forecast) > 2 else np.nan  # 3-month forecast
+    forecast_last = forecast[-1]  # Last month forecast
+    
+    # Calculate percentage changes
+    pct_change_1m = ((forecast_first - last_value) / last_value) * 100 if last_value != 0 else np.inf
+    pct_change_3m = ((forecast_third - last_value) / last_value) * 100 if last_value != 0 else np.inf
+    pct_change_last = ((forecast_last - last_value) / last_value) * 100 if last_value != 0 else np.inf
+    
+    # Prepare summary data
+    summary_item = {
+        'Owner': owner,
+        'Model_Type': model_type,
+        'Months_of_Data': len(owner_data),
+        'R2': round(metrics['r2'], 3),
+        'RMSE': round(metrics['rmse'], 3),
+        'MAPE': round(metrics['mape'], 2),
+        'Last_Actual_Value': round(last_value, 2),
+        'Forecast_1M': round(forecast_first, 2),
+        'Forecast_3M': round(forecast_third, 2) if not np.isnan(forecast_third) else np.nan,
+        'Forecast_Last': round(forecast_last, 2),
+        '%_Change_1M': round(pct_change_1m, 2),
+        '%_Change_3M': round(pct_change_3m, 2) if not np.isnan(forecast_third) else np.nan,
+        '%_Change_Last': round(pct_change_last, 2)
+    }
+    
+    # Add reconciliation info if applicable
+    if is_reconciled:
+        summary_item['Initial_Forecast_1M'] = round(initial_forecast[0], 2)
+        summary_item['Initial_Forecast_Last'] = round(initial_forecast[-1], 2)
+        summary_item['Reconciliation_Adjust_1M'] = round(forecast_first - initial_forecast[0], 2)
+        summary_item['Reconciliation_Adjust_Last'] = round(forecast_last - initial_forecast[-1], 2)
+    
+    summary_data.append(summary_item)
+
+# Create DataFrame and display summary
+summary_df = pd.DataFrame(summary_data)
+print("Forecast Summary Report:")
+display(summary_df)
+
+# Create detailed forecast tables for each owner
+detailed_forecast_data = []
+
+for owner in all_owners:
+    # Get forecast data
+    forecast = forecast_results[owner]['forecast']
+    future_dates = forecast_results[owner]['future_dates']
+    model_type = forecast_results[owner]['model_type']
+    
+    # Add each month's forecast to the detailed data
+    for i, (date, value) in enumerate(zip(future_dates, forecast)):
+        forecast_row = {
+            'Owner': owner,
+            'Month': date.strftime('%Y-%m'),
+            'Forecast': round(value, 2),
+            'Model': model_type
+        }
+        
+        # Add initial forecast if reconciled
+        if is_total_present and owner != "Total" and 'initial_forecast' in forecast_results[owner]:
+            initial_value = forecast_results[owner]['initial_forecast'][i]
+            adjustment = value - initial_value
+            forecast_row['Initial_Forecast'] = round(initial_value, 2)
+            forecast_row['Adjustment'] = round(adjustment, 2)
+        
+        detailed_forecast_data.append(forecast_row)
+
+# Create the detailed forecast DataFrame
+detailed_forecast_df = pd.DataFrame(detailed_forecast_data)
+print("\nDetailed Forecast by Month:")
+display(detailed_forecast_df)
