@@ -5,6 +5,13 @@ import warnings
 warnings.filterwarnings('ignore')
 
 #######################################################################
+# FILE LOCATION - Defined once for easy modification
+#######################################################################
+
+# Path to the GPR data file
+FILE_PATH = ""
+
+#######################################################################
 # CENTRALIZED PARAMETER SECTION - All parameters defined only once
 #######################################################################
 
@@ -58,7 +65,7 @@ DEFAULT_COUNTRY_CODE_MAP = {
 }
 
 def create_composite_gpr(
-        file_path, 
+        file_path=FILE_PATH, 
         weights=DEFAULT_WEIGHTS,
         recency_weight=DEFAULT_RECENCY_WEIGHT, 
         outlier_sensitivity=DEFAULT_OUTLIER_SENSITIVITY,
@@ -103,7 +110,7 @@ def create_composite_gpr(
     
     # Read the data
     df = pd.read_csv(file_path)
-    print(f"Data loaded with {len(df)} rows")
+    print(f"Data loaded with {len(df)} rows from {file_path}")
     
     # Convert month column to datetime
     df['date'] = pd.to_datetime(df['month'])
@@ -437,21 +444,10 @@ def main():
     Main function to run the GPR composite rating calculator.
     Uses centralized default parameters defined at the top of the file.
     """
-    # File path to the GPR data
-    file_path = ""
-    
     # Create composite GPR using the centralized parameters
     # All parameters have defaults defined at the top of the file
     # Any parameter can be overridden here if needed
-    result_df = create_composite_gpr(
-        file_path=file_path,
-        # All other parameters use defaults unless explicitly specified here
-        
-        # Example of overriding default parameters:
-        # coverage_adjustment_exclusions=['USA', 'CHN', 'HKG'],  # Add USA to exclusion list
-        # forecast_method='ema',  # Change forecasting method
-        # forecast_alpha=0.4  # Adjust forecast parameters
-    )
+    result_df = create_composite_gpr()
     
     # Display results
     print(f"Composite GPR Ratings (weights: {DEFAULT_WEIGHTS})")
