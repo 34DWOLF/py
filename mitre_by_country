@@ -114,11 +114,10 @@ def train_custom_ner_model(base_model: str = "en_core_web_sm",
     except OSError:
         print(f"Base model {base_model} not found. Creating blank English model.")
         nlp = spacy.blank("en")
-        nlp.add_pipe("ner")
     
-    # Get the NER component
+    # Get or create the NER component
     if "ner" not in nlp.pipe_names:
-        ner = nlp.add_pipe("ner")
+        ner = nlp.add_pipe("ner", last=True)
     else:
         ner = nlp.get_pipe("ner")
     
@@ -130,40 +129,63 @@ def train_custom_ner_model(base_model: str = "en_core_web_sm",
     # Get training data
     train_data = create_cybersecurity_training_data()
     
-    # Convert training data to spaCy format
+    # Convert training data to spaCy format and validate
     examples = []
     for text, annotations in train_data:
-        doc = nlp.make_doc(text)
-        example = Example.from_dict(doc, annotations)
-        examples.append(example)
+        try:
+            doc = nlp.make_doc(text)
+            example = Example.from_dict(doc, annotations)
+            # Validate the example
+            if example.reference.has_annotation("ENT_IOB"):
+                examples.append(example)
+        except Exception as e:
+            print(f"Skipping invalid training example: {e}")
+            continue
+    
+    if not examples:
+        print("No valid training examples found!")
+        return nlp
+    
+    print(f"Training with {len(examples)} valid examples...")
+    
+    # Start training - use nlp.initialize() to properly set up the model
+    nlp.initialize(lambda: examples)
     
     # Disable other pipeline components during training
     other_pipes = [pipe for pipe in nlp.pipe_names if pipe != "ner"]
+    
+    # Training loop with error handling
     with nlp.disable_pipes(*other_pipes):
-        # Training loop
         for i in range(n_iter):
             print(f"Training iteration {i+1}/{n_iter}")
             random.shuffle(examples)
             losses = {}
             
-            # Batch the examples
-            batches = minibatch(examples, size=compounding(4.0, 32.0, 1.001))
-            for batch in batches:
-                nlp.update(batch, losses=losses, drop=0.2)
-            
-            print(f"Losses: {losses}")
+            try:
+                # Batch the examples with smaller batches
+                batches = minibatch(examples, size=compounding(2.0, 16.0, 1.001))
+                for batch in batches:
+                    nlp.update(batch, losses=losses, drop=0.1)
+                
+                print(f"Losses: {losses}")
+            except Exception as e:
+                print(f"Training error at iteration {i+1}: {e}")
+                break
     
     # Save the model
-    if not os.path.exists(output_dir):
-        os.makedirs(output_dir)
-    nlp.to_disk(output_dir)
-    print(f"Model saved to {output_dir}")
+    try:
+        if not os.path.exists(output_dir):
+            os.makedirs(output_dir)
+        nlp.to_disk(output_dir)
+        print(f"Model saved to {output_dir}")
+    except Exception as e:
+        print(f"Error saving model: {e}")
     
     return nlp
 
 def load_or_train_cybersec_model(force_retrain: bool = False) -> spacy.Language:
     """
-    Load existing custom model or train a new one
+    Load existing custom model or train a new one with fallback options
     """
     model_path = "./custom_cybersec_model"
     
@@ -174,20 +196,44 @@ def load_or_train_cybersec_model(force_retrain: bool = False) -> spacy.Language:
             return nlp
         except Exception as e:
             print(f"Error loading custom model: {e}")
-            print("Training new model...")
+            print("Falling back to base model with enhanced rules...")
     
-    # Train new model
-    return train_custom_ner_model()
+    # Try to train new model, but fallback to base model if training fails
+    try:
+        return train_custom_ner_model()
+    except Exception as e:
+        print(f"Error training custom model: {e}")
+        print("Falling back to base spaCy model with rule-based patterns...")
+        
+        # Fallback to base model with enhanced pattern matching
+        try:
+            nlp = spacy.load("en_core_web_sm")
+        except OSError:
+            try:
+                nlp = spacy.load("en_core_web_md")
+            except OSError:
+                try:
+                    nlp = spacy.load("en_core_web_lg")
+                except OSError:
+                    print("No spaCy model found. Please install: python -m spacy download en_core_web_sm")
+                    return None
+        
+        return nlp
 
 def extract_nation_state_with_custom_model(description: str, nlp) -> Optional[str]:
     """
     Use custom-trained spaCy model to extract nation state information
+    Enhanced with fallback rule-based patterns
     """
     if not description or not nlp:
         return None
     
-    # Process the text with the custom model
-    doc = nlp(description)
+    # Process the text with the model
+    try:
+        doc = nlp(description)
+    except Exception as e:
+        print(f"Error processing text with spaCy: {e}")
+        return extract_nation_state_fallback(description)
     
     # Attribution context patterns (more refined)
     attribution_patterns = [
@@ -207,25 +253,29 @@ def extract_nation_state_with_custom_model(description: str, nlp) -> Optional[st
     # Extract potential countries from entities
     potential_countries = set()
     
-    # Use custom NER to find entities
-    for ent in doc.ents:
-        if ent.label_ in ["GPE"]:  # Focus on geopolitical entities
-            # Check if this entity appears in attribution context
-            for pattern in attribution_patterns:
-                if re.search(pattern.replace("([^.]*?)", f".*?{re.escape(ent.text)}.*?"), 
-                           description, re.IGNORECASE):
-                    potential_countries.add(ent.text.title())
-        elif ent.label_ in ["NATIONALITY"]:
-            # Convert nationality to country name
-            nationality_to_country = {
-                'Chinese': 'China', 'Russian': 'Russia', 'Iranian': 'Iran',
-                'North Korean': 'North Korea', 'Israeli': 'Israel',
-                'Turkish': 'Turkey', 'Vietnamese': 'Vietnam',
-                'Pakistani': 'Pakistan', 'Syrian': 'Syria',
-                'Lebanese': 'Lebanon', 'Korean': 'South Korea'
-            }
-            country = nationality_to_country.get(ent.text, ent.text)
-            potential_countries.add(country)
+    # Use NER to find entities (with error handling)
+    try:
+        for ent in doc.ents:
+            if ent.label_ in ["GPE"]:  # Focus on geopolitical entities
+                # Check if this entity appears in attribution context
+                for pattern in attribution_patterns:
+                    if re.search(pattern.replace("([^.]*?)", f".*?{re.escape(ent.text)}.*?"), 
+                               description, re.IGNORECASE):
+                        potential_countries.add(ent.text.title())
+            elif ent.label_ in ["NATIONALITY"]:
+                # Convert nationality to country name
+                nationality_to_country = {
+                    'Chinese': 'China', 'Russian': 'Russia', 'Iranian': 'Iran',
+                    'North Korean': 'North Korea', 'Israeli': 'Israel',
+                    'Turkish': 'Turkey', 'Vietnamese': 'Vietnam',
+                    'Pakistani': 'Pakistan', 'Syrian': 'Syria',
+                    'Lebanese': 'Lebanon', 'Korean': 'South Korea'
+                }
+                country = nationality_to_country.get(ent.text, ent.text)
+                potential_countries.add(country)
+    except Exception as e:
+        print(f"Error in NER processing: {e}")
+        return extract_nation_state_fallback(description)
     
     # Check for target patterns and exclude those countries
     targets = set()
@@ -245,6 +295,45 @@ def extract_nation_state_with_custom_model(description: str, nlp) -> Optional[st
             if country in attribution_countries:
                 return country
         return list(attribution_countries)[0]
+    
+    # Fallback to rule-based extraction if NER didn't find anything
+    return extract_nation_state_fallback(description)
+
+def extract_nation_state_fallback(description: str) -> Optional[str]:
+    """
+    Fallback rule-based nation state extraction without spaCy NER
+    """
+    if not description:
+        return None
+    
+    # Simple keyword-based patterns for attribution (not targets)
+    attribution_keywords = {
+        # Chinese patterns
+        r"(?:attributed to|linked to|associated with|operated by)\s+.*?(?:chinese|china|pla|people's liberation army)": 'China',
+        r"(?:chinese|china)\s+(?:government|intelligence|military|state|ministry)": 'China',
+        
+        # Russian patterns  
+        r"(?:attributed to|linked to|associated with|operated by)\s+.*?(?:russian|russia|svr|gru|fsb)": 'Russia',
+        r"(?:russian|russia)\s+(?:government|intelligence|military|state|ministry)": 'Russia',
+        
+        # North Korean patterns
+        r"(?:attributed to|linked to|associated with|operated by)\s+.*?(?:north korean|north korea|dprk)": 'North Korea',
+        r"(?:north korean|north korea)\s+(?:government|intelligence|military|state)": 'North Korea',
+        
+        # Iranian patterns
+        r"(?:attributed to|linked to|associated with|operated by)\s+.*?(?:iranian|iran|irgc)": 'Iran',
+        r"(?:iranian|iran)\s+(?:government|intelligence|military|state|ministry)": 'Iran',
+        
+        # Israeli patterns
+        r"(?:attributed to|linked to|associated with|operated by)\s+.*?(?:israeli|israel)": 'Israel',
+        r"(?:israeli|israel)\s+(?:government|intelligence|military|state|unit)": 'Israel',
+    }
+    
+    description_lower = description.lower()
+    
+    for pattern, country in attribution_keywords.items():
+        if re.search(pattern, description_lower):
+            return country
     
     return None
 
