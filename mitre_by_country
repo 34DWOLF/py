@@ -504,66 +504,23 @@ def test_custom_model():
         entities = [(ent.text, ent.label_) for ent in doc.ents]
         print(f"Entities: {entities}")
 
-def main():
+def main(raw_df: pd.DataFrame = None, 
+         threat_actor_column: str = 'Threat Actor Name', 
+         country_column: str = 'country'):
     """
-    Example usage with custom cybersecurity NER model
+    Main function to process threat actor data
+    
+    Args:
+        raw_df: Your existing DataFrame with threat actor data
+        threat_actor_column: Column name containing threat actor names
+        country_column: Column name containing existing country data
     """
-    # Test the custom model first
-    test_custom_model()
+    if raw_df is None:
+        print("Error: No DataFrame provided.")
+        return None
     
-    print("\n" + "="*70 + "\n")
-    
-    # Example DataFrame - matches your expected structure
-    sample_data = {
-        'Threat Actor Name': [
-            'APT1',
-            'Lazarus Group', 
-            'Cozy Bear',
-            'Unknown Actor',
-            'APT29',
-            'Fancy Bear',
-            'New Group XYZ'
-        ],
-        'country': [
-            'China',        # Existing data - should be prioritized
-            '',             # Empty - will use MITRE/spaCy
-            'Russia',       # Existing data - should be prioritized  
-            'Unknown',      # Treated as empty - will use MITRE/spaCy
-            None,           # Null - will use MITRE/spaCy
-            '',             # Empty - will use MITRE/spaCy
-            'Iran'          # Existing data - should be prioritized even if wrong
-        ]
-    }
-    
-    raw_df = pd.DataFrame(sample_data)
-    print("Original DataFrame:")
-    print(raw_df)
-    print("\n" + "="*50 + "\n")
-    
-    # Match threat actors with priority logic:
-    # 1. Existing country data (if not null/empty)
-    # 2. MITRE ATT&CK matching
-    # 3. spaCy NER (future enhancement)
-    result_df = match_threat_actors(raw_df, 'Threat Actor Name', 'country')
-    
-    print("Result DataFrame with primary_nation_state:")
-    print(result_df[['Threat Actor Name', 'country', 'primary_nation_state']])
-    
-    print("\nPriority Logic Explanation:")
-    print("- APT1: Used existing 'China' (Priority 1)")
-    print("- Lazarus Group: Empty country, matched via MITRE → North Korea (Priority 2)")  
-    print("- Cozy Bear: Used existing 'Russia' (Priority 1)")
-    print("- Unknown Actor: 'Unknown' treated as empty, no MITRE match → blank (Priority 2)")
-    print("- APT29: Null country, matched via MITRE → Russia (Priority 2)")
-    print("- Fancy Bear: Empty country, matched via MITRE → Russia (Priority 2)")
-    print("- New Group XYZ: Used existing 'Iran' even if potentially incorrect (Priority 1)")
-    
+    result_df = match_threat_actors(raw_df, threat_actor_column, country_column)
     return result_df
 
 if __name__ == "__main__":
-    # Run the example
-    result = main()
-    
-    # Optionally save results
-    # result.to_csv('threat_actors_with_nation_state_custom.csv', index=False)
-    # print("\nResults saved to 'threat_actors_with_nation_state_custom.csv'")
+    test_custom_model()
