@@ -405,27 +405,72 @@ def match_threat_actors(raw_df: pd.DataFrame,
     
     print(f"Found {len(mitre_df)} threat actors in MITRE ATT&CK dataset")
     
+    # STEP 4: Display MITRE instances by country
+    print("\n" + "="*80)
+    print("STEP 4: MITRE ATT&CK Instances by Country")
+    print("="*80)
+    country_counts = mitre_df['primary_nation_state'].value_counts()
+    print("Country distribution in MITRE data:")
+    for country, count in country_counts.items():
+        if pd.notna(country) and country:
+            print(f"  {country}: {count} groups")
+    unattributed = country_counts.get(None, 0) + country_counts.get('', 0)
+    if unattributed > 0:
+        print(f"  Unattributed: {unattributed} groups")
+    
     # Create a copy of the raw dataframe
     result_df = raw_df.copy()
     
     # Initialize the primary_nation_state column
     result_df['primary_nation_state'] = ''
     
-    # Create a mapping dictionary for faster lookups
+    # STEP 1: Create mapping and show MITRE data details
+    print("\n" + "="*80)
+    print("STEP 1: MITRE Name to Country Mapping")
+    print("="*80)
+    
+    name_to_data = {}  # Store full data for debugging
     name_to_nation_state = {}
     
+    print("MITRE Threat Actors with Attributions:")
     for _, row in mitre_df.iterrows():
-        # Add primary name
-        if pd.notna(row['name']) and pd.notna(row['primary_nation_state']):
-            name_to_nation_state[row['name'].lower()] = row['primary_nation_state']
+        mitre_name = row['name']
+        mitre_desc = row['description'][:100] + "..." if len(row['description']) > 100 else row['description']
+        mitre_country = row['primary_nation_state']
+        aliases = row['aliases'] if row['aliases'] else []
         
-        # Add aliases
-        if row['aliases'] and pd.notna(row['primary_nation_state']):
-            for alias in row['aliases']:
+        # Store full data
+        actor_data = {
+            'name': mitre_name,
+            'description': mitre_desc,
+            'country': mitre_country,
+            'aliases': aliases
+        }
+        
+        if pd.notna(mitre_name) and pd.notna(mitre_country) and mitre_country:
+            print(f"\nMITRE Name: {mitre_name}")
+            print(f"Description: {mitre_desc}")
+            print(f"Country: {mitre_country}")
+            if aliases:
+                print(f"Aliases: {', '.join(aliases)}")
+            
+            # Add to lookup dictionaries
+            name_to_nation_state[mitre_name.lower()] = mitre_country
+            name_to_data[mitre_name.lower()] = actor_data
+            
+            # Add aliases
+            for alias in aliases:
                 if alias:
-                    name_to_nation_state[alias.lower()] = row['primary_nation_state']
+                    name_to_nation_state[alias.lower()] = mitre_country
+                    name_to_data[alias.lower()] = actor_data
     
-    # Match threat actor names with priority logic
+    print(f"\nTotal mappable entries: {len(name_to_nation_state)}")
+    
+    # STEP 2: Match process with detailed output
+    print("\n" + "="*80)
+    print("STEP 2: Matching Process (Raw Data vs MITRE)")
+    print("="*80)
+    
     existing_country_count = 0
     mitre_matched_count = 0
     spacy_matched_count = 0
@@ -434,43 +479,89 @@ def match_threat_actors(raw_df: pd.DataFrame,
         threat_actor_name = row.get(threat_actor_column, '')
         existing_country = row.get(country_column, '')
         
-        # Priority 1: Use existing country data if available and not null/empty
+        print(f"\n--- Processing Row {idx+1} ---")
+        print(f"Raw Threat Actor: '{threat_actor_name}'")
+        print(f"Raw Country: '{existing_country}'")
+        
+        # Priority 1: Use existing country data if available and valid
         if (pd.notna(existing_country) and 
             existing_country and 
             existing_country.lower() not in ['none', 'null', 'unknown', '']):
             result_df.at[idx, 'primary_nation_state'] = existing_country
             existing_country_count += 1
+            print(f"DECISION: Used existing country '{existing_country}' (Priority 1)")
             continue
         
-        # Priority 2: Try MITRE ATT&CK name matching if threat actor name exists
+        # Priority 2: Try MITRE ATT&CK name matching
         if pd.notna(threat_actor_name) and threat_actor_name:
-            # Try exact match first
-            nation_state = name_to_nation_state.get(threat_actor_name.lower().strip())
+            threat_actor_lower = threat_actor_name.lower().strip()
             
-            if nation_state:
+            # Try exact match first
+            if threat_actor_lower in name_to_nation_state:
+                matched_data = name_to_data[threat_actor_lower]
+                nation_state = name_to_nation_state[threat_actor_lower]
+                
+                print(f"EXACT MATCH FOUND:")
+                print(f"  MITRE Name: {matched_data['name']}")
+                print(f"  MITRE Desc: {matched_data['description']}")
+                print(f"  MITRE Country: {matched_data['country']}")
+                
                 result_df.at[idx, 'primary_nation_state'] = nation_state
                 mitre_matched_count += 1
+                print(f"DECISION: Used MITRE exact match '{nation_state}' (Priority 2)")
                 continue
-            else:
-                # Try partial matching
-                threat_actor_lower = threat_actor_name.lower().strip()
-                matched = False
-                for mitre_name, nation in name_to_nation_state.items():
-                    if (mitre_name in threat_actor_lower or 
-                        threat_actor_lower in mitre_name):
-                        result_df.at[idx, 'primary_nation_state'] = nation
-                        mitre_matched_count += 1
-                        matched = True
-                        break
-                
-                if matched:
-                    continue
+            
+            # Try partial matching
+            partial_match_found = False
+            for mitre_name_lower, nation_state in name_to_nation_state.items():
+                if (mitre_name_lower in threat_actor_lower or 
+                    threat_actor_lower in mitre_name_lower):
+                    
+                    matched_data = name_to_data[mitre_name_lower]
+                    
+                    print(f"PARTIAL MATCH FOUND:")
+                    print(f"  Raw Name: '{threat_actor_name}'")
+                    print(f"  MITRE Name: {matched_data['name']}")
+                    print(f"  MITRE Desc: {matched_data['description']}")
+                    print(f"  MITRE Country: {matched_data['country']}")
+                    
+                    result_df.at[idx, 'primary_nation_state'] = nation_state
+                    mitre_matched_count += 1
+                    partial_match_found = True
+                    print(f"DECISION: Used MITRE partial match '{nation_state}' (Priority 2)")
+                    break
+            
+            if partial_match_found:
+                continue
         
-        # Priority 3: Use spaCy NER as fallback (if no MITRE match found)
-        # This would require additional context/description column
-        # For now, leave blank if no match found
+        # No match found
         result_df.at[idx, 'primary_nation_state'] = ''
+        print(f"NO MATCH FOUND - leaving blank")
     
+    # STEP 3: Final country decisions summary
+    print("\n" + "="*80)
+    print("STEP 3: Final Country Decisions Summary")
+    print("="*80)
+    
+    final_results = []
+    for idx, row in result_df.iterrows():
+        threat_actor_name = row.get(threat_actor_column, '')
+        existing_country = row.get(country_column, '')
+        final_country = row.get('primary_nation_state', '')
+        
+        final_results.append({
+            'threat_actor': threat_actor_name,
+            'original_country': existing_country,
+            'final_country': final_country
+        })
+    
+    for i, result in enumerate(final_results):
+        print(f"{i+1}. '{result['threat_actor']}': '{result['original_country']}' → '{result['final_country']}'")
+    
+    # Summary statistics
+    print(f"\n" + "="*80)
+    print("MATCHING SUMMARY")
+    print("="*80)
     print(f"Attribution sources:")
     print(f"  - Existing country data: {existing_country_count}")
     print(f"  - MITRE ATT&CK matches: {mitre_matched_count}")
