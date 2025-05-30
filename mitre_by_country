@@ -2,616 +2,261 @@ import pandas as pd
 import requests
 import json
 import spacy
-from spacy.training.example import Example
+from spacy.training import Example
 from spacy.util import minibatch, compounding
 import random
-from typing import Optional, List, Tuple, Dict
 import re
-import os
+import warnings
+warnings.filterwarnings('ignore')
 
-def create_cybersecurity_training_data() -> List[Tuple[str, Dict]]:
+def fetch_mitre_attack_data():
     """
-    Create training data for cybersecurity-specific threat actor attribution patterns
+    Fetch MITRE ATT&CK data from GitHub
     """
-    training_data = [
-        # Chinese attribution patterns
-        ("APT1 is a Chinese cyber espionage group linked to the People's Liberation Army Unit 61398.", 
-         {"entities": [(8, 15, "NATIONALITY"), (49, 78, "ORGANIZATION"), (84, 91, "GPE")]}),
-        
-        ("The threat actor is believed to be associated with Chinese government intelligence services.",
-         {"entities": [(47, 54, "NATIONALITY")]}),
-        
-        ("This group has been attributed to China's Ministry of State Security by multiple security researchers.",
-         {"entities": [(34, 39, "GPE"), (42, 68, "ORGANIZATION")]}),
-        
-        ("Lazarus Group is a North Korean state-sponsored hacking collective operating since 2009.",
-         {"entities": [(18, 30, "GPE")]}),
-        
-        # Russian attribution patterns
-        ("APT29 is attributed to Russia's Foreign Intelligence Service (SVR).",
-         {"entities": [(19, 26, "GPE"), (29, 62, "ORGANIZATION")]}),
-        
-        ("Cozy Bear is believed to be operated by Russian intelligence agencies.",
-         {"entities": [(40, 47, "NATIONALITY")]}),
-        
-        ("The campaign shows hallmarks of Russian state-sponsored cyber operations.",
-         {"entities": [(32, 39, "NATIONALITY")]}),
-        
-        ("Fancy Bear, also known as APT28, is linked to Russia's military intelligence unit GRU.",
-         {"entities": [(47, 54, "GPE"), (83, 86, "ORGANIZATION")]}),
-        
-        # Iranian attribution patterns
-        ("APT33 is an Iranian threat group that has targeted aerospace and energy sectors.",
-         {"entities": [(11, 18, "NATIONALITY")]}),
-        
-        ("The attackers are assessed to be working on behalf of Iranian government interests.",
-         {"entities": [(55, 62, "NATIONALITY")]}),
-        
-        ("Charming Kitten is attributed to Iran's Islamic Revolutionary Guard Corps.",
-         {"entities": [(33, 38, "GPE"), (41, 73, "ORGANIZATION")]}),
-        
-        # North Korean patterns
-        ("The Lazarus Group is a North Korean advanced persistent threat group.",
-         {"entities": [(23, 35, "GPE")]}),
-        
-        ("Hidden Cobra activities have been linked to the North Korean government.",
-         {"entities": [(49, 61, "GPE")]}),
-        
-        ("APT38 is believed to be a North Korean state-sponsored group focused on financial theft.",
-         {"entities": [(26, 38, "GPE")]}),
-        
-        # Multi-national and other patterns
-        ("The threat actor group is suspected to be operating from Vietnam.",
-         {"entities": [(59, 66, "GPE")]}),
-        
-        ("Turkish-nexus threat actors have been observed targeting Kurdish groups.",
-         {"entities": [(0, 7, "NATIONALITY"), (56, 63, "NATIONALITY")]}),
-        
-        ("Israeli cyber unit 8200 has been linked to several advanced malware campaigns.",
-         {"entities": [(0, 7, "NATIONALITY"), (14, 19, "CARDINAL")]}),
-        
-        # Negative examples (targets, not origins)
-        ("The group primarily targets Chinese manufacturing companies and government agencies.",
-         {"entities": [(32, 39, "NATIONALITY")]}),
-        
-        ("Russian energy companies were the primary victims of this campaign.",
-         {"entities": [(0, 7, "NATIONALITY")]}),
-        
-        ("The malware was used to attack Iranian nuclear facilities.",
-         {"entities": [(35, 42, "NATIONALITY")]}),
-        
-        # Additional attribution patterns
-        ("OceanLotus is assessed to be a Vietnamese state-sponsored APT group.",
-         {"entities": [(31, 41, "NATIONALITY")]}),
-        
-        ("The group operates on behalf of Pakistani intelligence services.",
-         {"entities": [(32, 41, "NATIONALITY")]}),
-        
-        ("Stone Panda is believed to be affiliated with China's People's Liberation Army.",
-         {"entities": [(46, 51, "GPE"), (54, 79, "ORGANIZATION")]}),
-        
-        ("The Syrian Electronic Army is a pro-government hacker group.",
-         {"entities": [(4, 10, "NATIONALITY")]}),
-        
-        ("Lebanese Cedar APT has been linked to Hezbollah operations.",
-         {"entities": [(0, 8, "NATIONALITY"), (38, 47, "ORGANIZATION")]}),
-    ]
+    print("Fetching MITRE ATT&CK data...")
     
-    return training_data
-
-def train_custom_ner_model(base_model: str = "en_core_web_sm", 
-                          output_dir: str = "./custom_cybersec_model",
-                          n_iter: int = 20) -> spacy.Language:
-    """
-    Train a custom NER model for cybersecurity threat actor attribution
-    """
-    print("Training custom cybersecurity NER model...")
-    
-    # Load the base model
-    try:
-        nlp = spacy.load(base_model)
-        print(f"Loaded base model: {base_model}")
-    except OSError:
-        print(f"Base model {base_model} not found. Creating blank English model.")
-        nlp = spacy.blank("en")
-    
-    # Get or create the NER component
-    if "ner" not in nlp.pipe_names:
-        ner = nlp.add_pipe("ner", last=True)
-    else:
-        ner = nlp.get_pipe("ner")
-    
-    # Add labels to the NER component
-    labels = ["GPE", "NATIONALITY", "ORGANIZATION", "CARDINAL"]
-    for label in labels:
-        ner.add_label(label)
-    
-    # Get training data
-    train_data = create_cybersecurity_training_data()
-    
-    # Convert training data to spaCy format and validate
-    examples = []
-    for text, annotations in train_data:
-        try:
-            doc = nlp.make_doc(text)
-            example = Example.from_dict(doc, annotations)
-            # Validate the example
-            if example.reference.has_annotation("ENT_IOB"):
-                examples.append(example)
-        except Exception as e:
-            print(f"Skipping invalid training example: {e}")
-            continue
-    
-    if not examples:
-        print("No valid training examples found!")
-        return nlp
-    
-    print(f"Training with {len(examples)} valid examples...")
-    
-    # Start training - use nlp.initialize() to properly set up the model
-    nlp.initialize(lambda: examples)
-    
-    # Disable other pipeline components during training
-    other_pipes = [pipe for pipe in nlp.pipe_names if pipe != "ner"]
-    
-    # Training loop with error handling
-    with nlp.disable_pipes(*other_pipes):
-        for i in range(n_iter):
-            print(f"Training iteration {i+1}/{n_iter}")
-            random.shuffle(examples)
-            losses = {}
-            
-            try:
-                # Batch the examples with smaller batches
-                batches = minibatch(examples, size=compounding(2.0, 16.0, 1.001))
-                for batch in batches:
-                    nlp.update(batch, losses=losses, drop=0.1)
-                
-                print(f"Losses: {losses}")
-            except Exception as e:
-                print(f"Training error at iteration {i+1}: {e}")
-                break
-    
-    # Save the model
-    try:
-        if not os.path.exists(output_dir):
-            os.makedirs(output_dir)
-        nlp.to_disk(output_dir)
-        print(f"Model saved to {output_dir}")
-    except Exception as e:
-        print(f"Error saving model: {e}")
-    
-    return nlp
-
-def load_or_train_cybersec_model(force_retrain: bool = False) -> spacy.Language:
-    """
-    Load existing custom model or train a new one with fallback options
-    """
-    model_path = "./custom_cybersec_model"
-    
-    if os.path.exists(model_path) and not force_retrain:
-        try:
-            print("Loading existing custom cybersecurity model...")
-            nlp = spacy.load(model_path)
-            return nlp
-        except Exception as e:
-            print(f"Error loading custom model: {e}")
-            print("Falling back to base model with enhanced rules...")
-    
-    # Try to train new model, but fallback to base model if training fails
-    try:
-        return train_custom_ner_model()
-    except Exception as e:
-        print(f"Error training custom model: {e}")
-        print("Falling back to base spaCy model with rule-based patterns...")
-        
-        # Fallback to base model with enhanced pattern matching
-        try:
-            nlp = spacy.load("en_core_web_sm")
-        except OSError:
-            try:
-                nlp = spacy.load("en_core_web_md")
-            except OSError:
-                try:
-                    nlp = spacy.load("en_core_web_lg")
-                except OSError:
-                    print("No spaCy model found. Please install: python -m spacy download en_core_web_sm")
-                    return None
-        
-        return nlp
-
-def extract_nation_state_with_custom_model(description: str, nlp) -> Optional[str]:
-    """
-    Use custom-trained spaCy model to extract nation state information
-    Enhanced with fallback rule-based patterns
-    """
-    if not description or not nlp:
-        return None
-    
-    # Process the text with the model
-    try:
-        doc = nlp(description)
-    except Exception as e:
-        print(f"Error processing text with spaCy: {e}")
-        return extract_nation_state_fallback(description)
-    
-    # Attribution context patterns (more refined)
-    attribution_patterns = [
-        r"(?:attributed to|linked to|associated with|operated by|sponsored by|backed by)\s+([^.]*?)(?:government|intelligence|military|state|ministry)",
-        r"([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)\s+(?:government|state|military|intelligence|ministry)(?:\s+(?:sponsored|backed|operated|linked))?",
-        r"(?:believed to be|suspected to be|assessed to be)\s+(?:associated with|linked to|operated by)\s+([^.]*?)(?:government|intelligence|state)",
-        r"(?:originating from|based in|operating from)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)",
-        r"([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)\s+(?:state-sponsored|government-backed|nation-state)"
-    ]
-    
-    # Target exclusion patterns (to avoid mapping targets as origins)
-    target_patterns = [
-        r"(?:targeting|attacked|victims?|against)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)",
-        r"([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)\s+(?:companies|organizations|infrastructure|facilities|entities)\s+(?:were|are)\s+(?:targeted|attacked)"
-    ]
-    
-    # Extract potential countries from entities
-    potential_countries = set()
-    
-    # Use NER to find entities (with error handling)
-    try:
-        for ent in doc.ents:
-            if ent.label_ in ["GPE"]:  # Focus on geopolitical entities
-                # Check if this entity appears in attribution context
-                for pattern in attribution_patterns:
-                    if re.search(pattern.replace("([^.]*?)", f".*?{re.escape(ent.text)}.*?"), 
-                               description, re.IGNORECASE):
-                        potential_countries.add(ent.text.title())
-            elif ent.label_ in ["NATIONALITY"]:
-                # Convert nationality to country name
-                nationality_to_country = {
-                    'Chinese': 'China', 'Russian': 'Russia', 'Iranian': 'Iran',
-                    'North Korean': 'North Korea', 'Israeli': 'Israel',
-                    'Turkish': 'Turkey', 'Vietnamese': 'Vietnam',
-                    'Pakistani': 'Pakistan', 'Syrian': 'Syria',
-                    'Lebanese': 'Lebanon', 'Korean': 'South Korea'
-                }
-                country = nationality_to_country.get(ent.text, ent.text)
-                potential_countries.add(country)
-    except Exception as e:
-        print(f"Error in NER processing: {e}")
-        return extract_nation_state_fallback(description)
-    
-    # Check for target patterns and exclude those countries
-    targets = set()
-    for pattern in target_patterns:
-        matches = re.finditer(pattern, description, re.IGNORECASE)
-        for match in matches:
-            targets.add(match.group(1).title())
-    
-    # Remove targets from potential countries
-    attribution_countries = potential_countries - targets
-    
-    # Return the most likely attribution
-    if attribution_countries:
-        # Prioritize common nation-state actors
-        priority_countries = {'China', 'Russia', 'North Korea', 'Iran', 'Israel'}
-        for country in priority_countries:
-            if country in attribution_countries:
-                return country
-        return list(attribution_countries)[0]
-    
-    # Fallback to rule-based extraction if NER didn't find anything
-    return extract_nation_state_fallback(description)
-
-def extract_nation_state_fallback(description: str) -> Optional[str]:
-    """
-    Fallback rule-based nation state extraction without spaCy NER
-    """
-    if not description:
-        return None
-    
-    # Simple keyword-based patterns for attribution (not targets)
-    attribution_keywords = {
-        # Chinese patterns
-        r"(?:attributed to|linked to|associated with|operated by)\s+.*?(?:chinese|china|pla|people's liberation army)": 'China',
-        r"(?:chinese|china)\s+(?:government|intelligence|military|state|ministry)": 'China',
-        
-        # Russian patterns  
-        r"(?:attributed to|linked to|associated with|operated by)\s+.*?(?:russian|russia|svr|gru|fsb)": 'Russia',
-        r"(?:russian|russia)\s+(?:government|intelligence|military|state|ministry)": 'Russia',
-        
-        # North Korean patterns
-        r"(?:attributed to|linked to|associated with|operated by)\s+.*?(?:north korean|north korea|dprk)": 'North Korea',
-        r"(?:north korean|north korea)\s+(?:government|intelligence|military|state)": 'North Korea',
-        
-        # Iranian patterns
-        r"(?:attributed to|linked to|associated with|operated by)\s+.*?(?:iranian|iran|irgc)": 'Iran',
-        r"(?:iranian|iran)\s+(?:government|intelligence|military|state|ministry)": 'Iran',
-        
-        # Israeli patterns
-        r"(?:attributed to|linked to|associated with|operated by)\s+.*?(?:israeli|israel)": 'Israel',
-        r"(?:israeli|israel)\s+(?:government|intelligence|military|state|unit)": 'Israel',
-    }
-    
-    description_lower = description.lower()
-    
-    for pattern, country in attribution_keywords.items():
-        if re.search(pattern, description_lower):
-            return country
-    
-    return None
-
-def fetch_mitre_attack_data() -> pd.DataFrame:
-    """
-    Fetch MITRE ATT&CK data from the official GitHub repository
-    Returns a DataFrame with threat actor information using custom NER model
-    """
-    # Load or train custom model
-    nlp = load_or_train_cybersec_model()
-    
-    # MITRE ATT&CK Enterprise dataset URL
+    # MITRE ATT&CK STIX data URL
     url = "https://raw.githubusercontent.com/mitre/cti/master/enterprise-attack/enterprise-attack.json"
     
     try:
         response = requests.get(url)
         response.raise_for_status()
-        attack_data = response.json()
+        data = response.json()
         
-        # Extract threat actors (groups) from the STIX data
+        # Extract threat actors (intrusion-sets)
         threat_actors = []
-        
-        for obj in attack_data.get('objects', []):
-            if obj.get('type') == 'intrusion-set':
-                description = obj.get('description', '')
-                
+        for obj in data['objects']:
+            if obj['type'] == 'intrusion-set':
                 actor_info = {
-                    'id': obj.get('id'),
-                    'name': obj.get('name'),
-                    'aliases': obj.get('aliases', []),
-                    'description': description,
-                    'primary_nation_state': extract_nation_state_with_custom_model(description, nlp)
+                    'Name': obj.get('name', ''),
+                    'Description': obj.get('description', ''),
+                    'Aliases': obj.get('aliases', []),
+                    'Created': obj.get('created', ''),
+                    'Modified': obj.get('modified', '')
                 }
-                
                 threat_actors.append(actor_info)
         
-        return pd.DataFrame(threat_actors)
+        mitre_df = pd.DataFrame(threat_actors)
+        print(f"Successfully fetched {len(mitre_df)} threat actors from MITRE ATT&CK")
+        return mitre_df
     
-    except requests.RequestException as e:
-        print(f"Error fetching MITRE ATT&CK data: {e}")
-        return pd.DataFrame()
-    except json.JSONDecodeError as e:
-        print(f"Error parsing JSON data: {e}")
+    except Exception as e:
+        print(f"Error fetching MITRE data: {e}")
         return pd.DataFrame()
 
-def match_threat_actors(raw_df: pd.DataFrame, 
-                       threat_actor_column: str = 'Threat Actor Name',
-                       country_column: str = 'country') -> pd.DataFrame:
+def match_threat_actors(result_df, raw_df):
     """
-    Match threat actor names from raw_df with MITRE ATT&CK data using custom NER model
-    Prioritizes existing country data over spaCy extraction
-    
-    Args:
-        raw_df: DataFrame containing threat actor names and countries
-        threat_actor_column: Column name containing threat actor names
-        country_column: Column name containing existing country data
-    
-    Returns:
-        DataFrame with added/updated primary_nation_state column
+    Match MITRE threat actors with raw_df based on threat actor names
+    Only processes entries that don't already have a nation state
     """
-    # Fetch MITRE ATT&CK data
-    print("Fetching MITRE ATT&CK data with custom cybersecurity NER model...")
-    mitre_df = fetch_mitre_attack_data()
+    print("\nMatching remaining threat actors with raw_df...")
     
-    if mitre_df.empty:
-        print("Failed to fetch MITRE ATT&CK data")
-        raw_df['primary_nation_state'] = raw_df.get(country_column, '')
-        return raw_df
+    # Normalize names for better matching
+    def normalize_name(name):
+        if pd.isna(name):
+            return ''
+        # Remove special characters and extra spaces
+        name = str(name).strip().lower()
+        name = re.sub(r'[^\w\s-]', '', name)
+        return name
     
-    print(f"Found {len(mitre_df)} threat actors in MITRE ATT&CK dataset")
+    # Create normalized columns for matching
+    result_df['name_normalized'] = result_df['Name'].apply(normalize_name)
+    raw_df['threat_actor_normalized'] = raw_df['Threat actor name'].apply(normalize_name)
     
-    # STEP 4: Display MITRE instances by country
-    print("\n" + "="*80)
-    print("STEP 4: MITRE ATT&CK Instances by Country")
-    print("="*80)
-    country_counts = mitre_df['primary_nation_state'].value_counts()
-    print("Country distribution in MITRE data:")
-    for country, count in country_counts.items():
-        if pd.notna(country) and country:
-            print(f"  {country}: {count} groups")
-    unattributed = country_counts.get(None, 0) + country_counts.get('', 0)
-    if unattributed > 0:
-        print(f"  Unattributed: {unattributed} groups")
+    # Only process entries without nation states
+    no_nation_mask = result_df['primary_nation_state'] == ''
+    matched_count = 0
     
-    # Create a copy of the raw dataframe
-    result_df = raw_df.copy()
-    
-    # Initialize the primary_nation_state column
-    result_df['primary_nation_state'] = ''
-    
-    # STEP 1: Create mapping and show MITRE data details
-    print("\n" + "="*80)
-    print("STEP 1: MITRE Name to Country Mapping")
-    print("="*80)
-    
-    name_to_data = {}  # Store full data for debugging
-    name_to_nation_state = {}
-    
-    print("MITRE Threat Actors with Attributions:")
-    for _, row in mitre_df.iterrows():
-        mitre_name = row['name']
-        mitre_desc = row['description'][:100] + "..." if len(row['description']) > 100 else row['description']
-        mitre_country = row['primary_nation_state']
-        aliases = row['aliases'] if row['aliases'] else []
+    for idx in result_df[no_nation_mask].index:
+        mitre_name = result_df.at[idx, 'name_normalized']
         
-        # Store full data
-        actor_data = {
-            'name': mitre_name,
-            'description': mitre_desc,
-            'country': mitre_country,
-            'aliases': aliases
-        }
-        
-        if pd.notna(mitre_name) and pd.notna(mitre_country) and mitre_country:
-            print(f"\nMITRE Name: {mitre_name}")
-            print(f"Description: {mitre_desc}")
-            print(f"Country: {mitre_country}")
-            if aliases:
-                print(f"Aliases: {', '.join(aliases)}")
-            
-            # Add to lookup dictionaries
-            name_to_nation_state[mitre_name.lower()] = mitre_country
-            name_to_data[mitre_name.lower()] = actor_data
-            
-            # Add aliases
-            for alias in aliases:
-                if alias:
-                    name_to_nation_state[alias.lower()] = mitre_country
-                    name_to_data[alias.lower()] = actor_data
-    
-    print(f"\nTotal mappable entries: {len(name_to_nation_state)}")
-    
-    # STEP 2: Match process with detailed output
-    print("\n" + "="*80)
-    print("STEP 2: Matching Process (Raw Data vs MITRE)")
-    print("="*80)
-    
-    existing_country_count = 0
-    mitre_matched_count = 0
-    spacy_matched_count = 0
-    
-    for idx, row in result_df.iterrows():
-        threat_actor_name = row.get(threat_actor_column, '')
-        existing_country = row.get(country_column, '')
-        
-        print(f"\n--- Processing Row {idx+1} ---")
-        print(f"Raw Threat Actor: '{threat_actor_name}'")
-        print(f"Raw Country: '{existing_country}'")
-        
-        # Priority 1: Use existing country data if available and valid
-        if (pd.notna(existing_country) and 
-            existing_country and 
-            existing_country.lower() not in ['none', 'null', 'unknown', '']):
-            result_df.at[idx, 'primary_nation_state'] = existing_country
-            existing_country_count += 1
-            print(f"DECISION: Used existing country '{existing_country}' (Priority 1)")
-            continue
-        
-        # Priority 2: Try MITRE ATT&CK name matching
-        if pd.notna(threat_actor_name) and threat_actor_name:
-            threat_actor_lower = threat_actor_name.lower().strip()
-            
-            # Try exact match first
-            if threat_actor_lower in name_to_nation_state:
-                matched_data = name_to_data[threat_actor_lower]
-                nation_state = name_to_nation_state[threat_actor_lower]
-                
-                print(f"EXACT MATCH FOUND:")
-                print(f"  MITRE Name: {matched_data['name']}")
-                print(f"  MITRE Desc: {matched_data['description']}")
-                print(f"  MITRE Country: {matched_data['country']}")
-                
-                result_df.at[idx, 'primary_nation_state'] = nation_state
-                mitre_matched_count += 1
-                print(f"DECISION: Used MITRE exact match '{nation_state}' (Priority 2)")
+        # Check direct match
+        match = raw_df[raw_df['threat_actor_normalized'] == mitre_name]
+        if not match.empty:
+            nation = match.iloc[0]['primary_nation_state']
+            if pd.notna(nation) and nation.strip():
+                result_df.at[idx, 'primary_nation_state'] = nation
+                result_df.at[idx, 'match_source'] = 'threat_actors_exact'
+                matched_count += 1
                 continue
-            
-            # Try partial matching
-            partial_match_found = False
-            for mitre_name_lower, nation_state in name_to_nation_state.items():
-                if (mitre_name_lower in threat_actor_lower or 
-                    threat_actor_lower in mitre_name_lower):
-                    
-                    matched_data = name_to_data[mitre_name_lower]
-                    
-                    print(f"PARTIAL MATCH FOUND:")
-                    print(f"  Raw Name: '{threat_actor_name}'")
-                    print(f"  MITRE Name: {matched_data['name']}")
-                    print(f"  MITRE Desc: {matched_data['description']}")
-                    print(f"  MITRE Country: {matched_data['country']}")
-                    
-                    result_df.at[idx, 'primary_nation_state'] = nation_state
-                    mitre_matched_count += 1
-                    partial_match_found = True
-                    print(f"DECISION: Used MITRE partial match '{nation_state}' (Priority 2)")
+        
+        # Check if MITRE name is in raw_df threat actor name (partial match)
+        for _, raw_row in raw_df.iterrows():
+            if mitre_name and (mitre_name in raw_row['threat_actor_normalized'] or \
+               raw_row['threat_actor_normalized'] in mitre_name):
+                nation = raw_row['primary_nation_state']
+                if pd.notna(nation) and nation.strip():
+                    result_df.at[idx, 'primary_nation_state'] = nation
+                    result_df.at[idx, 'match_source'] = 'threat_actors_partial'
+                    matched_count += 1
                     break
-            
-            if partial_match_found:
-                continue
         
-        # No match found
-        result_df.at[idx, 'primary_nation_state'] = ''
-        print(f"NO MATCH FOUND - leaving blank")
+        # Check aliases
+        if result_df.at[idx, 'primary_nation_state'] == '':
+            aliases = result_df.at[idx, 'Aliases']
+            if isinstance(aliases, list):
+                for alias in aliases:
+                    alias_normalized = normalize_name(alias)
+                    match = raw_df[raw_df['threat_actor_normalized'] == alias_normalized]
+                    if not match.empty:
+                        nation = match.iloc[0]['primary_nation_state']
+                        if pd.notna(nation) and nation.strip():
+                            result_df.at[idx, 'primary_nation_state'] = nation
+                            result_df.at[idx, 'match_source'] = 'threat_actors_alias'
+                            matched_count += 1
+                            break
     
-    # STEP 3: Final country decisions summary
-    print("\n" + "="*80)
-    print("STEP 3: Final Country Decisions Summary")
-    print("="*80)
+    # Clean up temporary columns
+    result_df = result_df.drop(['name_normalized'], axis=1)
     
-    final_results = []
+    print(f"Matched {matched_count} additional threat actors from raw_df")
+    
+    return result_df
+
+def extract_nation_states_from_text(text):
+    """
+    Extract nation states from text using pattern matching
+    """
+    if not text or pd.isna(text):
+        return ''
+    
+    text = str(text)
+    
+    # Define nation patterns with variations
+    nation_patterns = {
+        'Russia': [r'\bRussia\b', r'\bRussian\b', r'\bRussian Federation\b', r'\bUSSR\b', r'\bSoviet\b'],
+        'China': [r'\bChina\b', r'\bChinese\b', r'\bPRC\b', r"\bPeople's Republic of China\b"],
+        'Iran': [r'\bIran\b', r'\bIranian\b', r'\bPersia\b', r'\bPersian\b'],
+        'North Korea': [r'\bNorth Korea\b', r'\bNorth Korean\b', r'\bDPRK\b'],
+        'United States': [r'\bUnited States\b', r'\bAmerican\b', r'\bUSA\b', r'\bUS\b', r'\bU\.S\.\b'],
+        'Israel': [r'\bIsrael\b', r'\bIsraeli\b'],
+        'India': [r'\bIndia\b', r'\bIndian\b'],
+        'Pakistan': [r'\bPakistan\b', r'\bPakistani\b'],
+        'Vietnam': [r'\bVietnam\b', r'\bVietnamese\b'],
+        'Lebanon': [r'\bLebanon\b', r'\bLebanese\b'],
+        'Syria': [r'\bSyria\b', r'\bSyrian\b'],
+        'Ukraine': [r'\bUkraine\b', r'\bUkrainian\b'],
+        'Belarus': [r'\bBelarus\b', r'\bBelarusian\b'],
+        'South Korea': [r'\bSouth Korea\b', r'\bSouth Korean\b', r'\bROK\b', r'\bRepublic of Korea\b'],
+        'United Kingdom': [r'\bUnited Kingdom\b', r'\bUK\b', r'\bBritish\b', r'\bBritain\b'],
+        'France': [r'\bFrance\b', r'\bFrench\b'],
+        'Germany': [r'\bGermany\b', r'\bGerman\b'],
+        'Turkey': [r'\bTurkey\b', r'\bTurkish\b', r'\bTürkiye\b'],
+        'Saudi Arabia': [r'\bSaudi Arabia\b', r'\bSaudi\b'],
+        'UAE': [r'\bUAE\b', r'\bUnited Arab Emirates\b', r'\bEmirati\b'],
+    }
+    
+    # Check each nation pattern
+    for nation, patterns in nation_patterns.items():
+        for pattern in patterns:
+            if re.search(pattern, text, re.IGNORECASE):
+                return nation
+    
+    return ''
+
+def extract_nation_states_from_descriptions(mitre_df):
+    """
+    Extract nation states from MITRE descriptions using pattern matching
+    """
+    print("\nExtracting nation states from MITRE descriptions...")
+    
+    # Create a copy to store results
+    result_df = mitre_df.copy()
+    result_df['primary_nation_state'] = ''
+    result_df['match_source'] = ''
+    
+    extracted_count = 0
+    
     for idx, row in result_df.iterrows():
-        threat_actor_name = row.get(threat_actor_column, '')
-        existing_country = row.get(country_column, '')
-        final_country = row.get('primary_nation_state', '')
+        # Combine name, description and aliases for context
+        name = row['Name']
+        description = row['Description']
+        aliases = row['Aliases']
         
-        final_results.append({
-            'threat_actor': threat_actor_name,
-            'original_country': existing_country,
-            'final_country': final_country
-        })
+        # Create text for analysis
+        text_parts = []
+        if name:
+            text_parts.append(str(name))
+        if description:
+            text_parts.append(str(description))  # Use full description
+        if isinstance(aliases, list) and aliases:
+            text_parts.extend([str(alias) for alias in aliases])
+        
+        combined_text = ' '.join(text_parts)
+        
+        # Extract nation state
+        nation = extract_nation_states_from_text(combined_text)
+        
+        if nation:
+            result_df.at[idx, 'primary_nation_state'] = nation
+            result_df.at[idx, 'match_source'] = 'text_extraction'
+            extracted_count += 1
     
-    for i, result in enumerate(final_results):
-        print(f"{i+1}. '{result['threat_actor']}': '{result['original_country']}' → '{result['final_country']}'")
+    print(f"Extracted nation states for {extracted_count} entries from descriptions")
+    return result_df
+
+def main(raw_df, df_spacy_train=None):
+    """
+    Main function to orchestrate the entire process
+    """
+    print("Starting MITRE ATT&CK threat actor matching process...")
+    
+    # Step 1: Fetch MITRE ATT&CK data
+    mitre_df = fetch_mitre_attack_data()
+    if mitre_df.empty:
+        print("Failed to fetch MITRE data. Exiting.")
+        return pd.DataFrame()
+    
+    # Step 2: First extract nation states from MITRE descriptions
+    result_df = extract_nation_states_from_descriptions(mitre_df)
+    
+    # Step 3: Then match with raw_df (only for those without nation states)
+    final_df = match_threat_actors(result_df, raw_df)
     
     # Summary statistics
-    print(f"\n" + "="*80)
-    print("MATCHING SUMMARY")
-    print("="*80)
-    print(f"Attribution sources:")
-    print(f"  - Existing country data: {existing_country_count}")
-    print(f"  - MITRE ATT&CK matches: {mitre_matched_count}")
-    print(f"  - spaCy NER matches: {spacy_matched_count}")
-    print(f"  - Total matched: {existing_country_count + mitre_matched_count + spacy_matched_count} out of {len(result_df)}")
+    print("\n=== Summary ===")
+    print(f"Total threat actors: {len(final_df)}")
+    print(f"Matched nation states: {(final_df['primary_nation_state'] != '').sum()}")
+    print(f"Blank nation states: {(final_df['primary_nation_state'] == '').sum()}")
     
-    return result_df
+    # Print breakdown by source
+    print("\n=== Match Source Breakdown ===")
+    source_counts = final_df['match_source'].value_counts()
+    for source, count in source_counts.items():
+        if source:
+            print(f"{source}: {count}")
+    
+    # Print all results with full details
+    print("\n=== Full Results ===")
+    # Prepare display dataframe
+    display_df = final_df[['Name', 'primary_nation_state', 'match_source', 'Description']].copy()
+    display_df['primary_nation_state'] = display_df['primary_nation_state'].fillna('')
+    display_df['match_source'] = display_df['match_source'].fillna('')
+    
+    # Truncate description for display
+    display_df['Description'] = display_df['Description'].apply(
+        lambda x: (str(x)[:100] + '...') if pd.notna(x) and len(str(x)) > 100 else str(x)
+    )
+    
+    # Set pandas display options for better output
+    pd.set_option('display.max_rows', None)
+    pd.set_option('display.max_columns', None)
+    pd.set_option('display.width', None)
+    pd.set_option('display.max_colwidth', None)
+    
+    print(display_df.to_string(index=False))
+    
+    # Reset display options
+    pd.reset_option('display.max_rows')
+    pd.reset_option('display.max_columns')
+    pd.reset_option('display.width')
+    pd.reset_option('display.max_colwidth')
+    
+    return final_df
 
-def test_custom_model():
-    """
-    Test the custom NER model with sample cybersecurity text
-    """
-    print("Testing custom cybersecurity NER model...")
-    nlp = load_or_train_cybersec_model()
-    
-    test_texts = [
-        "APT1 is attributed to China's People's Liberation Army Unit 61398.",
-        "The group targets Russian energy companies but originates from North Korea.",
-        "Lazarus Group is a North Korean state-sponsored threat actor.",
-        "Iranian hackers have been targeting Israeli infrastructure.",
-        "The campaign shows hallmarks of Russian intelligence operations."
-    ]
-    
-    for text in test_texts:
-        print(f"\nText: {text}")
-        nation_state = extract_nation_state_with_custom_model(text, nlp)
-        print(f"Extracted Nation State: {nation_state}")
-        
-        # Show entities detected
-        doc = nlp(text)
-        entities = [(ent.text, ent.label_) for ent in doc.ents]
-        print(f"Entities: {entities}")
-
-def main(raw_df: pd.DataFrame = None, 
-         threat_actor_column: str = 'Threat Actor Name', 
-         country_column: str = 'country'):
-    """
-    Main function to process threat actor data
-    
-    Args:
-        raw_df: Your existing DataFrame with threat actor data
-        threat_actor_column: Column name containing threat actor names
-        country_column: Column name containing existing country data
-    """
-    if raw_df is None:
-        print("Error: No DataFrame provided.")
-        return None
-    
-    result_df = match_threat_actors(raw_df, threat_actor_column, country_column)
-    return result_df
-
+# Run the script with raw_df from previous code block
 if __name__ == "__main__":
-    test_custom_model()
+    # raw_df is already available from previous code block
+    # Run the main function - this will print all results
+    result_df = main(raw_df)
