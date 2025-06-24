@@ -44,6 +44,178 @@ def fetch_mitre_attack_data():
         print(f"Error fetching MITRE data: {e}")
         return pd.DataFrame()
 
+def create_spacy_ner_model(df_spacy_train):
+    """
+    Create and train a spaCy NER model for nation state extraction
+    """
+    print("\nCreating spaCy NER model...")
+    
+    # Create blank English model
+    nlp = spacy.blank("en")
+    
+    # Add NER component
+    if "ner" not in nlp.pipe_names:
+        ner = nlp.add_pipe("ner")
+    else:
+        ner = nlp.get_pipe("ner")
+    
+    # Add label for nation states
+    ner.add_label("NATION_STATE")
+    
+    # Convert df_spacy_train to training format
+    print(f"Processing {len(df_spacy_train)} training examples from SQL data...")
+    training_data = []
+    
+    for _, row in df_spacy_train.iterrows():
+        text = str(row.get('Description', ''))
+        country = str(row.get('Suspect', ''))
+        
+        if not text or not country:
+            continue
+            
+        # Find all occurrences of the country and its variations in the text
+        entities = []
+        
+        # Country name variations
+        country_variations = {
+            'Russia': ['Russia', 'Russian', 'Russian Federation', 'USSR', 'Soviet'],
+            'China': ['China', 'Chinese', 'PRC', "People's Republic of China"],
+            'Iran': ['Iran', 'Iranian', 'Persia', 'Persian'],
+            'North Korea': ['North Korea', 'North Korean', 'DPRK'],
+            'United States': ['United States', 'American', 'USA', 'US', 'U.S.'],
+            'Israel': ['Israel', 'Israeli'],
+            'India': ['India', 'Indian'],
+            'Pakistan': ['Pakistan', 'Pakistani'],
+            'Vietnam': ['Vietnam', 'Vietnamese'],
+            'Lebanon': ['Lebanon', 'Lebanese'],
+            'South Korea': ['South Korea', 'South Korean', 'ROK', 'Republic of Korea'],
+            'United Kingdom': ['United Kingdom', 'UK', 'British', 'Britain'],
+            'Ukraine': ['Ukraine', 'Ukrainian'],
+            'Belarus': ['Belarus', 'Belarusian'],
+        }
+        
+        # Get variations for this country
+        variations = country_variations.get(country, [country])
+        
+        # Find each variation in the text
+        for variation in variations:
+            # Case insensitive search
+            for match in re.finditer(re.escape(variation), text, re.IGNORECASE):
+                start_idx = match.start()
+                end_idx = match.end()
+                entities.append((start_idx, end_idx, "NATION_STATE"))
+        
+        if entities:
+            # Remove duplicates and overlapping entities
+            entities = list(set(entities))
+            entities.sort(key=lambda x: x[0])
+            
+            # Remove overlapping entities
+            filtered_entities = []
+            last_end = -1
+            for start, end, label in entities:
+                if start >= last_end:
+                    filtered_entities.append((start, end, label))
+                    last_end = end
+            
+            training_data.append((text, {"entities": filtered_entities}))
+    
+    if not training_data:
+        raise ValueError("No valid training data found. Please ensure df_spacy_train contains valid data.")
+    
+    print(f"Created {len(training_data)} training examples with entities")
+    
+    # Convert to Example objects
+    examples = []
+    for text, annotations in training_data:
+        doc = nlp.make_doc(text)
+        example = Example.from_dict(doc, annotations)
+        examples.append(example)
+    
+    # Train the model
+    nlp.begin_training()
+    print("Training spaCy model...")
+    for i in range(30):
+        random.shuffle(examples)
+        losses = {}
+        for batch in minibatch(examples, size=compounding(4., 32., 1.001)):
+            nlp.update(batch, losses=losses)
+        if i % 10 == 0:
+            print(f"  Iteration {i}, Loss: {losses.get('ner', 0):.2f}")
+    
+    print("SpaCy model trained successfully")
+    return nlp
+
+def extract_nation_states_with_spacy(mitre_df, nlp):
+    """
+    Extract nation states from MITRE descriptions using trained spaCy NER model
+    """
+    print("\nExtracting nation states from MITRE descriptions using spaCy...")
+    
+    # Create a copy to store results
+    result_df = mitre_df.copy()
+    result_df['primary_nation_state'] = ''
+    result_df['match_source'] = ''
+    
+    extracted_count = 0
+    
+    for idx, row in result_df.iterrows():
+        # Combine name, description and aliases for context
+        name = row['Name']
+        description = row['Description']
+        aliases = row['Aliases']
+        
+        # Create text for analysis
+        text_parts = []
+        if name:
+            text_parts.append(str(name))
+        if description:
+            text_parts.append(str(description))
+        if isinstance(aliases, list) and aliases:
+            text_parts.extend([str(alias) for alias in aliases])
+        
+        combined_text = ' '.join(text_parts)
+        
+        # Process with spaCy
+        doc = nlp(combined_text)
+        nation_states = []
+        
+        for ent in doc.ents:
+            if ent.label_ == "NATION_STATE":
+                nation_states.append(ent.text)
+        
+        if nation_states:
+            # Normalize the extracted nation state
+            nation_text = nation_states[0]  # Take the first one
+            
+            # Map variations to standard names
+            nation_mapping = {
+                'russian': 'Russia', 'russia': 'Russia', 'russian federation': 'Russia',
+                'chinese': 'China', 'china': 'China', 'prc': 'China',
+                'iranian': 'Iran', 'iran': 'Iran', 'persia': 'Iran',
+                'north korean': 'North Korea', 'north korea': 'North Korea', 'dprk': 'North Korea',
+                'american': 'United States', 'united states': 'United States', 'usa': 'United States',
+                'israeli': 'Israel', 'israel': 'Israel',
+                'indian': 'India', 'india': 'India',
+                'pakistani': 'Pakistan', 'pakistan': 'Pakistan',
+                'vietnamese': 'Vietnam', 'vietnam': 'Vietnam',
+                'lebanese': 'Lebanon', 'lebanon': 'Lebanon',
+                'south korean': 'South Korea', 'south korea': 'South Korea',
+                'ukrainian': 'Ukraine', 'ukraine': 'Ukraine',
+                'belarusian': 'Belarus', 'belarus': 'Belarus',
+                'british': 'United Kingdom', 'united kingdom': 'United Kingdom', 'uk': 'United Kingdom',
+            }
+            
+            nation_lower = nation_text.lower()
+            nation = nation_mapping.get(nation_lower, nation_text)
+            
+            result_df.at[idx, 'primary_nation_state'] = nation
+            result_df.at[idx, 'match_source'] = 'spacy_extraction'
+            extracted_count += 1
+    
+    print(f"Extracted nation states for {extracted_count} entries using spaCy")
+    return result_df
+
 def match_threat_actors(result_df, raw_df):
     """
     Match MITRE threat actors with raw_df based on threat actor names
@@ -114,91 +286,10 @@ def match_threat_actors(result_df, raw_df):
     
     return result_df
 
-def extract_nation_states_from_text(text):
-    """
-    Extract nation states from text using pattern matching
-    """
-    if not text or pd.isna(text):
-        return ''
-    
-    text = str(text)
-    
-    # Define nation patterns with variations
-    nation_patterns = {
-        'Russia': [r'\bRussia\b', r'\bRussian\b', r'\bRussian Federation\b', r'\bUSSR\b', r'\bSoviet\b'],
-        'China': [r'\bChina\b', r'\bChinese\b', r'\bPRC\b', r"\bPeople's Republic of China\b"],
-        'Iran': [r'\bIran\b', r'\bIranian\b', r'\bPersia\b', r'\bPersian\b'],
-        'North Korea': [r'\bNorth Korea\b', r'\bNorth Korean\b', r'\bDPRK\b'],
-        'United States': [r'\bUnited States\b', r'\bAmerican\b', r'\bUSA\b', r'\bUS\b', r'\bU\.S\.\b'],
-        'Israel': [r'\bIsrael\b', r'\bIsraeli\b'],
-        'India': [r'\bIndia\b', r'\bIndian\b'],
-        'Pakistan': [r'\bPakistan\b', r'\bPakistani\b'],
-        'Vietnam': [r'\bVietnam\b', r'\bVietnamese\b'],
-        'Lebanon': [r'\bLebanon\b', r'\bLebanese\b'],
-        'Syria': [r'\bSyria\b', r'\bSyrian\b'],
-        'Ukraine': [r'\bUkraine\b', r'\bUkrainian\b'],
-        'Belarus': [r'\bBelarus\b', r'\bBelarusian\b'],
-        'South Korea': [r'\bSouth Korea\b', r'\bSouth Korean\b', r'\bROK\b', r'\bRepublic of Korea\b'],
-        'United Kingdom': [r'\bUnited Kingdom\b', r'\bUK\b', r'\bBritish\b', r'\bBritain\b'],
-        'France': [r'\bFrance\b', r'\bFrench\b'],
-        'Germany': [r'\bGermany\b', r'\bGerman\b'],
-        'Turkey': [r'\bTurkey\b', r'\bTurkish\b', r'\bTürkiye\b'],
-        'Saudi Arabia': [r'\bSaudi Arabia\b', r'\bSaudi\b'],
-        'UAE': [r'\bUAE\b', r'\bUnited Arab Emirates\b', r'\bEmirati\b'],
-    }
-    
-    # Check each nation pattern
-    for nation, patterns in nation_patterns.items():
-        for pattern in patterns:
-            if re.search(pattern, text, re.IGNORECASE):
-                return nation
-    
-    return ''
-
-def extract_nation_states_from_descriptions(mitre_df):
-    """
-    Extract nation states from MITRE descriptions using pattern matching
-    """
-    print("\nExtracting nation states from MITRE descriptions...")
-    
-    # Create a copy to store results
-    result_df = mitre_df.copy()
-    result_df['primary_nation_state'] = ''
-    result_df['match_source'] = ''
-    
-    extracted_count = 0
-    
-    for idx, row in result_df.iterrows():
-        # Combine name, description and aliases for context
-        name = row['Name']
-        description = row['Description']
-        aliases = row['Aliases']
-        
-        # Create text for analysis
-        text_parts = []
-        if name:
-            text_parts.append(str(name))
-        if description:
-            text_parts.append(str(description))  # Use full description
-        if isinstance(aliases, list) and aliases:
-            text_parts.extend([str(alias) for alias in aliases])
-        
-        combined_text = ' '.join(text_parts)
-        
-        # Extract nation state
-        nation = extract_nation_states_from_text(combined_text)
-        
-        if nation:
-            result_df.at[idx, 'primary_nation_state'] = nation
-            result_df.at[idx, 'match_source'] = 'text_extraction'
-            extracted_count += 1
-    
-    print(f"Extracted nation states for {extracted_count} entries from descriptions")
-    return result_df
-
-def main(raw_df, df_spacy_train=None):
+def main(raw_df, df_spacy_train):
     """
     Main function to orchestrate the entire process
+    Requires df_spacy_train with columns: 'Description' and 'Suspect'
     """
     print("Starting MITRE ATT&CK threat actor matching process...")
     
@@ -208,10 +299,17 @@ def main(raw_df, df_spacy_train=None):
         print("Failed to fetch MITRE data. Exiting.")
         return pd.DataFrame()
     
-    # Step 2: First extract nation states from MITRE descriptions
-    result_df = extract_nation_states_from_descriptions(mitre_df)
+    # Step 2: Train spaCy model with provided training data
+    try:
+        nlp = create_spacy_ner_model(df_spacy_train)
+    except ValueError as e:
+        print(f"Error: {e}")
+        return pd.DataFrame()
     
-    # Step 3: Then match with raw_df (only for those without nation states)
+    # Step 3: Extract nation states from MITRE descriptions using spaCy
+    result_df = extract_nation_states_with_spacy(mitre_df, nlp)
+    
+    # Step 4: Match remaining actors with raw_df
     final_df = match_threat_actors(result_df, raw_df)
     
     # Summary statistics
@@ -255,8 +353,29 @@ def main(raw_df, df_spacy_train=None):
     
     return final_df
 
-# Run the script with raw_df from previous code block
+# Execute the MITRE ATT&CK threat actor matching
 if __name__ == "__main__":
-    # raw_df is already available from previous code block
-    # Run the main function - this will print all results
-    result_df = main(raw_df)
+    # Load training data from SQL
+    # df_spacy_train = pd.read_sql(
+    #     'SELECT "Description", "Suspect" FROM threat_actor_training',
+    #     connection
+    # )
+    
+    # For testing, use sample training data
+    df_spacy_train = pd.DataFrame({
+        'Description': [
+            'APT28 is a threat group that has been attributed to Russia\'s General Staff Main Intelligence Directorate',
+            'Lazarus Group is a North Korean state-sponsored cyber threat group',
+            'APT1 is a Chinese cyber espionage group',
+            'Indrik Spider is a Russia-based cybercriminal group',
+        ],
+        'Suspect': [
+            'Russia',
+            'North Korea',
+            'China',
+            'Russia'
+        ]
+    })
+    
+    # Run the main function with required training data
+    result_df = main(raw_df, df_spacy_train)
