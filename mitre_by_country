@@ -1,13 +1,60 @@
 import pandas as pd
 import requests
 import json
-import spacy
-from spacy.training import Example
-from spacy.util import minibatch, compounding
-import random
+import torch
+from transformers import AutoTokenizer, AutoModelForTokenClassification, TrainingArguments, Trainer
+from transformers import DataCollatorForTokenClassification
+from torch.utils.data import Dataset
+import numpy as np
 import re
 import warnings
 warnings.filterwarnings('ignore')
+
+# Check if GPU is available
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f"Using device: {device}")
+
+class NERDataset(Dataset):
+    """Dataset class for BERT NER training"""
+    def __init__(self, texts, labels, tokenizer, max_length=512):
+        self.texts = texts
+        self.labels = labels
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+    
+    def __len__(self):
+        return len(self.texts)
+    
+    def __getitem__(self, idx):
+        text = self.texts[idx]
+        labels = self.labels[idx]
+        
+        # Tokenize
+        encoding = self.tokenizer(
+            text,
+            truncation=True,
+            padding='max_length',
+            max_length=self.max_length,
+            return_offsets_mapping=True,
+            return_tensors='pt'
+        )
+        
+        # Create label array
+        label_array = np.ones(self.max_length, dtype=int) * -100  # -100 is ignored by loss
+        
+        # Map labels to tokens
+        offset_mapping = encoding['offset_mapping'][0].numpy()
+        
+        for start, end, label_id in labels:
+            for idx, (token_start, token_end) in enumerate(offset_mapping):
+                if token_start >= start and token_end <= end and token_start != token_end:
+                    label_array[idx] = label_id
+        
+        encoding['labels'] = torch.tensor(label_array)
+        encoding['input_ids'] = encoding['input_ids'].squeeze()
+        encoding['attention_mask'] = encoding['attention_mask'].squeeze()
+        
+        return {k: v for k, v in encoding.items() if k != 'offset_mapping'}
 
 def fetch_mitre_attack_data():
     """
@@ -44,27 +91,50 @@ def fetch_mitre_attack_data():
         print(f"Error fetching MITRE data: {e}")
         return pd.DataFrame()
 
-def create_spacy_ner_model(df_spacy_train):
+def create_bert_ner_model(df_spacy_train):
     """
-    Create and train a spaCy NER model for nation state extraction
+    Create and train a BERT NER model for nation state extraction
     """
-    print("\nCreating spaCy NER model...")
+    print("\nCreating BERT NER model...")
     
-    # Create blank English model
-    nlp = spacy.blank("en")
+    # Load pre-trained BERT model and tokenizer
+    model_name = "bert-base-uncased"
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
     
-    # Add NER component
-    if "ner" not in nlp.pipe_names:
-        ner = nlp.add_pipe("ner")
-    else:
-        ner = nlp.get_pipe("ner")
+    # Label mappings
+    label2id = {"O": 0, "B-NATION": 1, "I-NATION": 2}
+    id2label = {v: k for k, v in label2id.items()}
     
-    # Add label for nation states
-    ner.add_label("NATION_STATE")
+    # Load model
+    model = AutoModelForTokenClassification.from_pretrained(
+        model_name,
+        num_labels=len(label2id),
+        label2id=label2id,
+        id2label=id2label
+    ).to(device)
     
-    # Convert df_spacy_train to training format
-    print(f"Processing {len(df_spacy_train)} training examples from SQL data...")
-    training_data = []
+    # Prepare training data
+    print(f"Processing {len(df_spacy_train)} training examples...")
+    texts = []
+    labels = []
+    
+    # Country name variations
+    country_variations = {
+        'Russia': ['Russia', 'Russian', 'Russian Federation', 'USSR', 'Soviet'],
+        'China': ['China', 'Chinese', 'PRC', "People's Republic of China"],
+        'Iran': ['Iran', 'Iranian', 'Persia', 'Persian'],
+        'North Korea': ['North Korea', 'North Korean', 'DPRK'],
+        'United States': ['United States', 'American', 'USA', 'US', 'U.S.'],
+        'Israel': ['Israel', 'Israeli'],
+        'India': ['India', 'Indian'],
+        'Pakistan': ['Pakistan', 'Pakistani'],
+        'Vietnam': ['Vietnam', 'Vietnamese'],
+        'Lebanon': ['Lebanon', 'Lebanese'],
+        'South Korea': ['South Korea', 'South Korean', 'ROK', 'Republic of Korea'],
+        'United Kingdom': ['United Kingdom', 'UK', 'British', 'Britain'],
+        'Ukraine': ['Ukraine', 'Ukrainian'],
+        'Belarus': ['Belarus', 'Belarusian'],
+    }
     
     for _, row in df_spacy_train.iterrows():
         text = str(row.get('Description', ''))
@@ -72,41 +142,20 @@ def create_spacy_ner_model(df_spacy_train):
         
         if not text or not country:
             continue
-            
-        # Find all occurrences of the country and its variations in the text
+        
+        # Find entities in text
         entities = []
-        
-        # Country name variations
-        country_variations = {
-            'Russia': ['Russia', 'Russian', 'Russian Federation', 'USSR', 'Soviet'],
-            'China': ['China', 'Chinese', 'PRC', "People's Republic of China"],
-            'Iran': ['Iran', 'Iranian', 'Persia', 'Persian'],
-            'North Korea': ['North Korea', 'North Korean', 'DPRK'],
-            'United States': ['United States', 'American', 'USA', 'US', 'U.S.'],
-            'Israel': ['Israel', 'Israeli'],
-            'India': ['India', 'Indian'],
-            'Pakistan': ['Pakistan', 'Pakistani'],
-            'Vietnam': ['Vietnam', 'Vietnamese'],
-            'Lebanon': ['Lebanon', 'Lebanese'],
-            'South Korea': ['South Korea', 'South Korean', 'ROK', 'Republic of Korea'],
-            'United Kingdom': ['United Kingdom', 'UK', 'British', 'Britain'],
-            'Ukraine': ['Ukraine', 'Ukrainian'],
-            'Belarus': ['Belarus', 'Belarusian'],
-        }
-        
-        # Get variations for this country
         variations = country_variations.get(country, [country])
         
-        # Find each variation in the text
         for variation in variations:
-            # Case insensitive search
             for match in re.finditer(re.escape(variation), text, re.IGNORECASE):
                 start_idx = match.start()
                 end_idx = match.end()
-                entities.append((start_idx, end_idx, "NATION_STATE"))
+                # Use B-NATION for beginning, I-NATION for inside
+                entities.append((start_idx, end_idx, 1))  # 1 is B-NATION
         
         if entities:
-            # Remove duplicates and overlapping entities
+            # Remove duplicates and sort
             entities = list(set(entities))
             entities.sort(key=lambda x: x[0])
             
@@ -118,39 +167,56 @@ def create_spacy_ner_model(df_spacy_train):
                     filtered_entities.append((start, end, label))
                     last_end = end
             
-            training_data.append((text, {"entities": filtered_entities}))
+            texts.append(text)
+            labels.append(filtered_entities)
     
-    if not training_data:
+    if not texts:
         raise ValueError("No valid training data found. Please ensure df_spacy_train contains valid data.")
     
-    print(f"Created {len(training_data)} training examples with entities")
+    print(f"Created {len(texts)} training examples")
     
-    # Convert to Example objects
-    examples = []
-    for text, annotations in training_data:
-        doc = nlp.make_doc(text)
-        example = Example.from_dict(doc, annotations)
-        examples.append(example)
+    # Create dataset
+    train_dataset = NERDataset(texts, labels, tokenizer)
+    
+    # Training arguments
+    training_args = TrainingArguments(
+        output_dir="./bert_ner_model",
+        num_train_epochs=3,
+        per_device_train_batch_size=8,
+        warmup_steps=100,
+        weight_decay=0.01,
+        logging_steps=10,
+        save_steps=1000,
+        eval_steps=1000,
+        save_total_limit=2,
+        load_best_model_at_end=False,
+        push_to_hub=False,
+        report_to="none",  # Disable wandb/tensorboard
+    )
+    
+    # Data collator
+    data_collator = DataCollatorForTokenClassification(tokenizer, pad_to_multiple_of=8)
+    
+    # Create trainer
+    trainer = Trainer(
+        model=model,
+        args=training_args,
+        train_dataset=train_dataset,
+        data_collator=data_collator,
+    )
     
     # Train the model
-    nlp.begin_training()
-    print("Training spaCy model...")
-    for i in range(30):
-        random.shuffle(examples)
-        losses = {}
-        for batch in minibatch(examples, size=compounding(4., 32., 1.001)):
-            nlp.update(batch, losses=losses)
-        if i % 10 == 0:
-            print(f"  Iteration {i}, Loss: {losses.get('ner', 0):.2f}")
+    print("Training BERT model...")
+    trainer.train()
     
-    print("SpaCy model trained successfully")
-    return nlp
+    print("BERT model trained successfully")
+    return model, tokenizer
 
-def extract_nation_states_with_spacy(mitre_df, nlp):
+def extract_nation_states_with_bert(mitre_df, model, tokenizer):
     """
-    Extract nation states from MITRE descriptions using trained spaCy NER model
+    Extract nation states from MITRE descriptions using trained BERT NER model
     """
-    print("\nExtracting nation states from MITRE descriptions using spaCy...")
+    print("\nExtracting nation states from MITRE descriptions using BERT...")
     
     # Create a copy to store results
     result_df = mitre_df.copy()
@@ -158,6 +224,24 @@ def extract_nation_states_with_spacy(mitre_df, nlp):
     result_df['match_source'] = ''
     
     extracted_count = 0
+    
+    # Nation mapping for normalization
+    nation_mapping = {
+        'russian': 'Russia', 'russia': 'Russia', 'russian federation': 'Russia', 'ussr': 'Russia', 'soviet': 'Russia',
+        'chinese': 'China', 'china': 'China', 'prc': 'China',
+        'iranian': 'Iran', 'iran': 'Iran', 'persia': 'Iran', 'persian': 'Iran',
+        'north korean': 'North Korea', 'north korea': 'North Korea', 'dprk': 'North Korea',
+        'american': 'United States', 'united states': 'United States', 'usa': 'United States', 'us': 'United States', 'u.s.': 'United States',
+        'israeli': 'Israel', 'israel': 'Israel',
+        'indian': 'India', 'india': 'India',
+        'pakistani': 'Pakistan', 'pakistan': 'Pakistan',
+        'vietnamese': 'Vietnam', 'vietnam': 'Vietnam',
+        'lebanese': 'Lebanon', 'lebanon': 'Lebanon',
+        'south korean': 'South Korea', 'south korea': 'South Korea', 'rok': 'South Korea',
+        'ukrainian': 'Ukraine', 'ukraine': 'Ukraine',
+        'belarusian': 'Belarus', 'belarus': 'Belarus',
+        'british': 'United Kingdom', 'united kingdom': 'United Kingdom', 'uk': 'United Kingdom',
+    }
     
     for idx, row in result_df.iterrows():
         # Combine name, description and aliases for context
@@ -176,44 +260,51 @@ def extract_nation_states_with_spacy(mitre_df, nlp):
         
         combined_text = ' '.join(text_parts)
         
-        # Process with spaCy
-        doc = nlp(combined_text)
-        nation_states = []
+        # Tokenize and predict
+        inputs = tokenizer(
+            combined_text,
+            truncation=True,
+            max_length=512,
+            return_tensors="pt"
+        ).to(device)
         
-        for ent in doc.ents:
-            if ent.label_ == "NATION_STATE":
-                nation_states.append(ent.text)
+        with torch.no_grad():
+            outputs = model(**inputs)
+            predictions = torch.argmax(outputs.logits, dim=-1)
         
-        if nation_states:
-            # Normalize the extracted nation state
-            nation_text = nation_states[0]  # Take the first one
-            
-            # Map variations to standard names
-            nation_mapping = {
-                'russian': 'Russia', 'russia': 'Russia', 'russian federation': 'Russia',
-                'chinese': 'China', 'china': 'China', 'prc': 'China',
-                'iranian': 'Iran', 'iran': 'Iran', 'persia': 'Iran',
-                'north korean': 'North Korea', 'north korea': 'North Korea', 'dprk': 'North Korea',
-                'american': 'United States', 'united states': 'United States', 'usa': 'United States',
-                'israeli': 'Israel', 'israel': 'Israel',
-                'indian': 'India', 'india': 'India',
-                'pakistani': 'Pakistan', 'pakistan': 'Pakistan',
-                'vietnamese': 'Vietnam', 'vietnam': 'Vietnam',
-                'lebanese': 'Lebanon', 'lebanon': 'Lebanon',
-                'south korean': 'South Korea', 'south korea': 'South Korea',
-                'ukrainian': 'Ukraine', 'ukraine': 'Ukraine',
-                'belarusian': 'Belarus', 'belarus': 'Belarus',
-                'british': 'United Kingdom', 'united kingdom': 'United Kingdom', 'uk': 'United Kingdom',
-            }
-            
-            nation_lower = nation_text.lower()
-            nation = nation_mapping.get(nation_lower, nation_text)
+        # Extract entities
+        tokens = tokenizer.convert_ids_to_tokens(inputs["input_ids"][0])
+        predictions = predictions[0].cpu().numpy()
+        
+        current_entity = []
+        entities = []
+        
+        for token, pred in zip(tokens, predictions):
+            if pred == 1:  # B-NATION
+                if current_entity:
+                    entities.append(' '.join(current_entity))
+                current_entity = [token.replace('##', '')]
+            elif pred == 2 and current_entity:  # I-NATION
+                current_entity.append(token.replace('##', ''))
+            else:
+                if current_entity:
+                    entities.append(' '.join(current_entity))
+                    current_entity = []
+        
+        if current_entity:
+            entities.append(' '.join(current_entity))
+        
+        # Normalize and select nation
+        if entities:
+            # Normalize the first entity found
+            nation_text = entities[0].lower().strip()
+            nation = nation_mapping.get(nation_text, entities[0])
             
             result_df.at[idx, 'primary_nation_state'] = nation
-            result_df.at[idx, 'match_source'] = 'spacy_extraction'
+            result_df.at[idx, 'match_source'] = 'bert_extraction'
             extracted_count += 1
     
-    print(f"Extracted nation states for {extracted_count} entries using spaCy")
+    print(f"Extracted nation states for {extracted_count} entries using BERT")
     return result_df
 
 def match_threat_actors(result_df, raw_df):
@@ -299,15 +390,15 @@ def main(raw_df, df_spacy_train):
         print("Failed to fetch MITRE data. Exiting.")
         return pd.DataFrame()
     
-    # Step 2: Train spaCy model with provided training data
+    # Step 2: Train BERT model with provided training data
     try:
-        nlp = create_spacy_ner_model(df_spacy_train)
+        model, tokenizer = create_bert_ner_model(df_spacy_train)
     except ValueError as e:
         print(f"Error: {e}")
         return pd.DataFrame()
     
-    # Step 3: Extract nation states from MITRE descriptions using spaCy
-    result_df = extract_nation_states_with_spacy(mitre_df, nlp)
+    # Step 3: Extract nation states from MITRE descriptions using BERT
+    result_df = extract_nation_states_with_bert(mitre_df, model, tokenizer)
     
     # Step 4: Match remaining actors with raw_df
     final_df = match_threat_actors(result_df, raw_df)
