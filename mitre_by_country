@@ -1,13 +1,51 @@
 import pandas as pd
 import requests
 import json
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.linear_model import LogisticRegression
-from sklearn.pipeline import Pipeline
+import torch
+from transformers import AutoTokenizer, AutoModelForSequenceClassification, Trainer, TrainingArguments
+from torch.utils.data import Dataset
 import numpy as np
 import re
 import warnings
 warnings.filterwarnings('ignore')
+
+# Check if GPU is available
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f"Using device: {device}")
+
+class ThreatActorDataset(Dataset):
+    """Dataset for BERT classification"""
+    def __init__(self, texts, labels, tokenizer, max_length=256):
+        self.texts = texts
+        self.labels = labels
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+        
+        # Create label to id mapping
+        unique_labels = sorted(list(set(labels)))
+        self.label2id = {label: i for i, label in enumerate(unique_labels)}
+        self.id2label = {i: label for label, i in self.label2id.items()}
+        
+    def __len__(self):
+        return len(self.texts)
+    
+    def __getitem__(self, idx):
+        text = self.texts[idx]
+        label = self.labels[idx]
+        
+        encoding = self.tokenizer(
+            text,
+            truncation=True,
+            padding='max_length',
+            max_length=self.max_length,
+            return_tensors='pt'
+        )
+        
+        return {
+            'input_ids': encoding['input_ids'].flatten(),
+            'attention_mask': encoding['attention_mask'].flatten(),
+            'labels': torch.tensor(self.label2id[label], dtype=torch.long)
+        }
 
 def fetch_mitre_attack_data():
     """
@@ -15,7 +53,6 @@ def fetch_mitre_attack_data():
     """
     print("Fetching MITRE ATT&CK data...")
     
-    # MITRE ATT&CK STIX data URL
     url = "https://raw.githubusercontent.com/mitre/cti/master/enterprise-attack/enterprise-attack.json"
     
     try:
@@ -23,7 +60,6 @@ def fetch_mitre_attack_data():
         response.raise_for_status()
         data = response.json()
         
-        # Extract threat actors (intrusion-sets)
         threat_actors = []
         for obj in data['objects']:
             if obj['type'] == 'intrusion-set':
@@ -44,131 +80,150 @@ def fetch_mitre_attack_data():
         print(f"Error fetching MITRE data: {e}")
         return pd.DataFrame()
 
-def create_ml_classifier(df_train):
+def create_bert_classifier(df_train):
     """
-    Create and train a lightweight ML classifier for nation state extraction
+    Create and train a BERT classifier for nation state identification
     """
-    print("\nCreating ML classifier...")
+    print("\nCreating BERT classifier...")
     
-    # Filter out empty entries
+    # Filter valid training data
     df_train = df_train[df_train['Description'].notna() & df_train['Suspect'].notna()]
     df_train = df_train[df_train['Suspect'].str.strip() != '']
     
     if len(df_train) == 0:
-        raise ValueError("No valid training data found. Please ensure df_train contains valid data.")
+        raise ValueError("No valid training data found.")
     
-    print(f"Training with {len(df_train)} examples...")
+    # Prepare data
+    texts = df_train['Description'].tolist()
+    labels = df_train['Suspect'].tolist()
     
-    # Create pipeline with TF-IDF and Logistic Regression
-    pipeline = Pipeline([
-        ('tfidf', TfidfVectorizer(
-            max_features=1000,
-            ngram_range=(1, 3),
-            stop_words='english',
-            lowercase=True
-        )),
-        ('classifier', LogisticRegression(
-            max_iter=1000,
-            random_state=42,
-            C=1.0
-        ))
-    ])
+    # Get unique labels
+    unique_labels = sorted(list(set(labels)))
+    label2id = {label: i for i, label in enumerate(unique_labels)}
+    id2label = {i: label for label, i in label2id.items()}
     
-    # Prepare training data
-    X_train = df_train['Description'].values
-    y_train = df_train['Suspect'].values
+    print(f"Training on {len(texts)} examples with {len(unique_labels)} nation states")
     
-    # Train the model
-    print("Training classifier...")
-    pipeline.fit(X_train, y_train)
+    # Load BERT model and tokenizer
+    model_name = "bert-base-uncased"
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
     
-    # Get unique classes for reference
-    classes = pipeline.named_steps['classifier'].classes_
-    print(f"Trained on {len(classes)} unique nation states")
+    model = AutoModelForSequenceClassification.from_pretrained(
+        model_name,
+        num_labels=len(unique_labels),
+        label2id=label2id,
+        id2label=id2label
+    ).to(device)
     
-    return pipeline
+    # Create dataset
+    dataset = ThreatActorDataset(texts, labels, tokenizer)
+    
+    # Training arguments
+    training_args = TrainingArguments(
+        output_dir="./bert_classifier",
+        num_train_epochs=5,
+        per_device_train_batch_size=8,
+        warmup_steps=100,
+        logging_steps=50,
+        save_strategy="no",
+        evaluation_strategy="no",
+        report_to="none",
+        fp16=torch.cuda.is_available(),
+    )
+    
+    # Create trainer
+    trainer = Trainer(
+        model=model,
+        args=training_args,
+        train_dataset=dataset,
+    )
+    
+    # Train
+    print("Training BERT classifier...")
+    trainer.train()
+    
+    print("BERT classifier trained successfully")
+    return model, tokenizer, dataset.label2id, dataset.id2label
 
-def extract_nation_states_with_ml(mitre_df, classifier):
+def extract_nation_states_with_bert(mitre_df, model, tokenizer, label2id, id2label):
     """
-    Extract nation states from MITRE descriptions using ML classifier
+    Extract nation states using BERT classifier
     """
-    print("\nExtracting nation states from MITRE descriptions...")
+    print("\nExtracting nation states from MITRE descriptions using BERT...")
     
-    # Create a copy to store results
     result_df = mitre_df.copy()
     result_df['primary_nation_state'] = ''
     result_df['match_source'] = ''
     result_df['confidence'] = 0.0
     
+    model.eval()
     extracted_count = 0
     
     for idx, row in result_df.iterrows():
-        # Combine name, description and aliases for context
-        name = row['Name']
+        # Prepare text
         description = row['Description']
+        name = row['Name']
         aliases = row['Aliases']
         
-        # Create text for analysis
-        text_parts = []
-        if description:  # Primary focus on description
-            text_parts.append(str(description))
-        if name:
-            text_parts.append(str(name))
-        if isinstance(aliases, list) and aliases:
-            text_parts.extend([str(alias) for alias in aliases])
-        
-        combined_text = ' '.join(text_parts)
-        
-        if not combined_text.strip():
+        if not description:
             continue
-        
-        try:
-            # Get prediction and probability
-            prediction = classifier.predict([combined_text])[0]
-            probabilities = classifier.predict_proba([combined_text])[0]
-            max_prob = probabilities.max()
             
-            # Only accept predictions with reasonable confidence
-            if max_prob > 0.3:  # Threshold can be adjusted
-                result_df.at[idx, 'primary_nation_state'] = prediction
-                result_df.at[idx, 'match_source'] = 'ml_extraction'
-                result_df.at[idx, 'confidence'] = max_prob
-                extracted_count += 1
-        except Exception as e:
-            # Skip if prediction fails
-            continue
+        # Use description as primary text
+        text = str(description)
+        
+        # Tokenize
+        inputs = tokenizer(
+            text,
+            truncation=True,
+            max_length=256,
+            padding='max_length',
+            return_tensors='pt'
+        ).to(device)
+        
+        # Predict
+        with torch.no_grad():
+            outputs = model(**inputs)
+            logits = outputs.logits
+            probabilities = torch.nn.functional.softmax(logits, dim=-1)
+            confidence, predicted_id = torch.max(probabilities, dim=-1)
+            
+        # Get nation
+        predicted_nation = id2label[predicted_id.item()]
+        confidence_score = confidence.item()
+        
+        # Only accept predictions with reasonable confidence
+        if confidence_score > 0.3:
+            result_df.at[idx, 'primary_nation_state'] = predicted_nation
+            result_df.at[idx, 'match_source'] = 'bert_extraction'
+            result_df.at[idx, 'confidence'] = confidence_score
+            extracted_count += 1
     
-    print(f"Extracted nation states for {extracted_count} entries using ML classifier")
+    print(f"Extracted nation states for {extracted_count} entries using BERT")
     return result_df
 
 def match_threat_actors(result_df, raw_df):
     """
-    Match MITRE threat actors with raw_df based on threat actor names
-    Only processes entries that don't already have a nation state
+    Match MITRE threat actors with raw_df for remaining entries
     """
     print("\nMatching remaining threat actors with raw_df...")
     
-    # Normalize names for better matching
     def normalize_name(name):
         if pd.isna(name):
             return ''
-        # Remove special characters and extra spaces
         name = str(name).strip().lower()
         name = re.sub(r'[^\w\s-]', '', name)
         return name
     
-    # Create normalized columns for matching
     result_df['name_normalized'] = result_df['Name'].apply(normalize_name)
     raw_df['threat_actor_normalized'] = raw_df['Threat actor name'].apply(normalize_name)
     
-    # Only process entries without nation states
     no_nation_mask = result_df['primary_nation_state'] == ''
     matched_count = 0
     
     for idx in result_df[no_nation_mask].index:
         mitre_name = result_df.at[idx, 'name_normalized']
         
-        # Check direct match
+        # Exact match
         match = raw_df[raw_df['threat_actor_normalized'] == mitre_name]
         if not match.empty:
             nation = match.iloc[0]['primary_nation_state']
@@ -179,10 +234,10 @@ def match_threat_actors(result_df, raw_df):
                 matched_count += 1
                 continue
         
-        # Check if MITRE name is in raw_df threat actor name (partial match)
+        # Partial match
         for _, raw_row in raw_df.iterrows():
-            if mitre_name and (mitre_name in raw_row['threat_actor_normalized'] or \
-               raw_row['threat_actor_normalized'] in mitre_name):
+            if mitre_name and (mitre_name in raw_row['threat_actor_normalized'] or 
+                             raw_row['threat_actor_normalized'] in mitre_name):
                 nation = raw_row['primary_nation_state']
                 if pd.notna(nation) and nation.strip():
                     result_df.at[idx, 'primary_nation_state'] = nation
@@ -191,7 +246,7 @@ def match_threat_actors(result_df, raw_df):
                     matched_count += 1
                     break
         
-        # Check aliases
+        # Alias match
         if result_df.at[idx, 'primary_nation_state'] == '':
             aliases = result_df.at[idx, 'Aliases']
             if isinstance(aliases, list):
@@ -207,73 +262,65 @@ def match_threat_actors(result_df, raw_df):
                             matched_count += 1
                             break
     
-    # Clean up temporary columns
     result_df = result_df.drop(['name_normalized'], axis=1)
-    
     print(f"Matched {matched_count} additional threat actors from raw_df")
     
     return result_df
 
 def main(raw_df, df_train):
     """
-    Main function to orchestrate the entire process
-    Requires df_train with columns: 'Description' and 'Suspect'
+    Main function - requires df_train with columns: 'Description' and 'Suspect'
     """
-    print("Starting MITRE ATT&CK threat actor matching process...")
+    print("Starting MITRE ATT&CK threat actor matching process with BERT...")
     
-    # Step 1: Fetch MITRE ATT&CK data
+    # Step 1: Fetch MITRE data
     mitre_df = fetch_mitre_attack_data()
     if mitre_df.empty:
-        print("Failed to fetch MITRE data. Exiting.")
+        print("Failed to fetch MITRE data.")
         return pd.DataFrame()
     
-    # Step 2: Train ML classifier with provided training data
+    # Step 2: Train BERT classifier
     try:
-        classifier = create_ml_classifier(df_train)
-    except ValueError as e:
-        print(f"Error: {e}")
+        model, tokenizer, label2id, id2label = create_bert_classifier(df_train)
+    except Exception as e:
+        print(f"Error training BERT: {e}")
         return pd.DataFrame()
     
-    # Step 3: Extract nation states from MITRE descriptions using ML
-    result_df = extract_nation_states_with_ml(mitre_df, classifier)
+    # Step 3: Extract nation states using BERT
+    result_df = extract_nation_states_with_bert(mitre_df, model, tokenizer, label2id, id2label)
     
-    # Step 4: Match remaining actors with raw_df
+    # Step 4: Match remaining with raw_df
     final_df = match_threat_actors(result_df, raw_df)
     
-    # Summary statistics
+    # Summary
     print("\n=== Summary ===")
     print(f"Total threat actors: {len(final_df)}")
     print(f"Matched nation states: {(final_df['primary_nation_state'] != '').sum()}")
     print(f"Blank nation states: {(final_df['primary_nation_state'] == '').sum()}")
     
-    # Print breakdown by source
     print("\n=== Match Source Breakdown ===")
     source_counts = final_df['match_source'].value_counts()
     for source, count in source_counts.items():
         if source:
             print(f"{source}: {count}")
     
-    # Show confidence statistics for ML predictions
-    ml_predictions = final_df[final_df['match_source'] == 'ml_extraction']
-    if len(ml_predictions) > 0:
-        print(f"\nML Confidence Stats:")
-        print(f"  Mean: {ml_predictions['confidence'].mean():.3f}")
-        print(f"  Min:  {ml_predictions['confidence'].min():.3f}")
-        print(f"  Max:  {ml_predictions['confidence'].max():.3f}")
+    # Confidence stats
+    bert_matches = final_df[final_df['match_source'] == 'bert_extraction']
+    if len(bert_matches) > 0:
+        print(f"\nBERT Confidence Stats:")
+        print(f"  Mean: {bert_matches['confidence'].mean():.3f}")
+        print(f"  Min:  {bert_matches['confidence'].min():.3f}")
+        print(f"  Max:  {bert_matches['confidence'].max():.3f}")
     
-    # Print all results with full details
+    # Print results
     print("\n=== Full Results ===")
-    # Prepare display dataframe
     display_df = final_df[['Name', 'primary_nation_state', 'match_source', 'Description']].copy()
     display_df['primary_nation_state'] = display_df['primary_nation_state'].fillna('')
     display_df['match_source'] = display_df['match_source'].fillna('')
-    
-    # Truncate description for display
     display_df['Description'] = display_df['Description'].apply(
         lambda x: (str(x)[:100] + '...') if pd.notna(x) and len(str(x)) > 100 else str(x)
     )
     
-    # Set pandas display options for better output
     pd.set_option('display.max_rows', None)
     pd.set_option('display.max_columns', None)
     pd.set_option('display.width', None)
@@ -281,26 +328,18 @@ def main(raw_df, df_train):
     
     print(display_df.to_string(index=False))
     
-    # Reset display options
     pd.reset_option('display.max_rows')
     pd.reset_option('display.max_columns')
     pd.reset_option('display.width')
     pd.reset_option('display.max_colwidth')
     
-    # Drop confidence column before returning
+    # Remove confidence column before returning
     final_df = final_df.drop(['confidence'], axis=1)
-    
     return final_df
 
-# Execute the MITRE ATT&CK threat actor matching
+# Execute
 if __name__ == "__main__":
-    # Load training data from SQL
-    # df_train = pd.read_sql(
-    #     'SELECT "Description", "Suspect" FROM threat_actor_training',
-    #     connection
-    # )
-    
-    # For testing, use sample training data
+    # Sample training data
     df_train = pd.DataFrame({
         'Description': [
             'APT28 is a threat group that has been attributed to Russia\'s General Staff Main Intelligence Directorate',
@@ -308,7 +347,7 @@ if __name__ == "__main__":
             'APT1 is a Chinese cyber espionage group',
             'Indrik Spider is a Russia-based cybercriminal group',
             'Charming Kitten is an Iranian cyber espionage group',
-            'Equation Group is tied to US intelligence',
+            'Equation Group is tied to United States intelligence',
         ],
         'Suspect': [
             'Russia',
@@ -320,5 +359,5 @@ if __name__ == "__main__":
         ]
     })
     
-    # Run the main function with required training data
+    # Run with BERT
     result_df = main(raw_df, df_train)
