@@ -1,60 +1,13 @@
 import pandas as pd
 import requests
 import json
-import torch
-from transformers import AutoTokenizer, AutoModelForTokenClassification, TrainingArguments, Trainer
-from transformers import DataCollatorForTokenClassification
-from torch.utils.data import Dataset
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.linear_model import LogisticRegression
+from sklearn.pipeline import Pipeline
 import numpy as np
 import re
 import warnings
 warnings.filterwarnings('ignore')
-
-# Check if GPU is available
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-print(f"Using device: {device}")
-
-class NERDataset(Dataset):
-    """Dataset class for BERT NER training"""
-    def __init__(self, texts, labels, tokenizer, max_length=512):
-        self.texts = texts
-        self.labels = labels
-        self.tokenizer = tokenizer
-        self.max_length = max_length
-    
-    def __len__(self):
-        return len(self.texts)
-    
-    def __getitem__(self, idx):
-        text = self.texts[idx]
-        labels = self.labels[idx]
-        
-        # Tokenize
-        encoding = self.tokenizer(
-            text,
-            truncation=True,
-            padding='max_length',
-            max_length=self.max_length,
-            return_offsets_mapping=True,
-            return_tensors='pt'
-        )
-        
-        # Create label array
-        label_array = np.ones(self.max_length, dtype=int) * -100  # -100 is ignored by loss
-        
-        # Map labels to tokens
-        offset_mapping = encoding['offset_mapping'][0].numpy()
-        
-        for start, end, label_id in labels:
-            for idx, (token_start, token_end) in enumerate(offset_mapping):
-                if token_start >= start and token_end <= end and token_start != token_end:
-                    label_array[idx] = label_id
-        
-        encoding['labels'] = torch.tensor(label_array)
-        encoding['input_ids'] = encoding['input_ids'].squeeze()
-        encoding['attention_mask'] = encoding['attention_mask'].squeeze()
-        
-        return {k: v for k, v in encoding.items() if k != 'offset_mapping'}
 
 def fetch_mitre_attack_data():
     """
@@ -91,157 +44,63 @@ def fetch_mitre_attack_data():
         print(f"Error fetching MITRE data: {e}")
         return pd.DataFrame()
 
-def create_bert_ner_model(df_spacy_train):
+def create_ml_classifier(df_train):
     """
-    Create and train a BERT NER model for nation state extraction
+    Create and train a lightweight ML classifier for nation state extraction
     """
-    print("\nCreating BERT NER model...")
+    print("\nCreating ML classifier...")
     
-    # Load pre-trained BERT model and tokenizer
-    model_name = "bert-base-uncased"
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    # Filter out empty entries
+    df_train = df_train[df_train['Description'].notna() & df_train['Suspect'].notna()]
+    df_train = df_train[df_train['Suspect'].str.strip() != '']
     
-    # Label mappings
-    label2id = {"O": 0, "B-NATION": 1, "I-NATION": 2}
-    id2label = {v: k for k, v in label2id.items()}
+    if len(df_train) == 0:
+        raise ValueError("No valid training data found. Please ensure df_train contains valid data.")
     
-    # Load model
-    model = AutoModelForTokenClassification.from_pretrained(
-        model_name,
-        num_labels=len(label2id),
-        label2id=label2id,
-        id2label=id2label
-    ).to(device)
+    print(f"Training with {len(df_train)} examples...")
+    
+    # Create pipeline with TF-IDF and Logistic Regression
+    pipeline = Pipeline([
+        ('tfidf', TfidfVectorizer(
+            max_features=1000,
+            ngram_range=(1, 3),
+            stop_words='english',
+            lowercase=True
+        )),
+        ('classifier', LogisticRegression(
+            max_iter=1000,
+            random_state=42,
+            C=1.0
+        ))
+    ])
     
     # Prepare training data
-    print(f"Processing {len(df_spacy_train)} training examples...")
-    texts = []
-    labels = []
-    
-    # Country name variations
-    country_variations = {
-        'Russia': ['Russia', 'Russian', 'Russian Federation', 'USSR', 'Soviet'],
-        'China': ['China', 'Chinese', 'PRC', "People's Republic of China"],
-        'Iran': ['Iran', 'Iranian', 'Persia', 'Persian'],
-        'North Korea': ['North Korea', 'North Korean', 'DPRK'],
-        'United States': ['United States', 'American', 'USA', 'US', 'U.S.'],
-        'Israel': ['Israel', 'Israeli'],
-        'India': ['India', 'Indian'],
-        'Pakistan': ['Pakistan', 'Pakistani'],
-        'Vietnam': ['Vietnam', 'Vietnamese'],
-        'Lebanon': ['Lebanon', 'Lebanese'],
-        'South Korea': ['South Korea', 'South Korean', 'ROK', 'Republic of Korea'],
-        'United Kingdom': ['United Kingdom', 'UK', 'British', 'Britain'],
-        'Ukraine': ['Ukraine', 'Ukrainian'],
-        'Belarus': ['Belarus', 'Belarusian'],
-    }
-    
-    for _, row in df_spacy_train.iterrows():
-        text = str(row.get('Description', ''))
-        country = str(row.get('Suspect', ''))
-        
-        if not text or not country:
-            continue
-        
-        # Find entities in text
-        entities = []
-        variations = country_variations.get(country, [country])
-        
-        for variation in variations:
-            for match in re.finditer(re.escape(variation), text, re.IGNORECASE):
-                start_idx = match.start()
-                end_idx = match.end()
-                # Use B-NATION for beginning, I-NATION for inside
-                entities.append((start_idx, end_idx, 1))  # 1 is B-NATION
-        
-        if entities:
-            # Remove duplicates and sort
-            entities = list(set(entities))
-            entities.sort(key=lambda x: x[0])
-            
-            # Remove overlapping entities
-            filtered_entities = []
-            last_end = -1
-            for start, end, label in entities:
-                if start >= last_end:
-                    filtered_entities.append((start, end, label))
-                    last_end = end
-            
-            texts.append(text)
-            labels.append(filtered_entities)
-    
-    if not texts:
-        raise ValueError("No valid training data found. Please ensure df_spacy_train contains valid data.")
-    
-    print(f"Created {len(texts)} training examples")
-    
-    # Create dataset
-    train_dataset = NERDataset(texts, labels, tokenizer)
-    
-    # Training arguments
-    training_args = TrainingArguments(
-        output_dir="./bert_ner_model",
-        num_train_epochs=3,
-        per_device_train_batch_size=8,
-        warmup_steps=100,
-        weight_decay=0.01,
-        logging_steps=10,
-        save_steps=1000,
-        eval_steps=1000,
-        save_total_limit=2,
-        load_best_model_at_end=False,
-        push_to_hub=False,
-        report_to="none",  # Disable wandb/tensorboard
-    )
-    
-    # Data collator
-    data_collator = DataCollatorForTokenClassification(tokenizer, pad_to_multiple_of=8)
-    
-    # Create trainer
-    trainer = Trainer(
-        model=model,
-        args=training_args,
-        train_dataset=train_dataset,
-        data_collator=data_collator,
-    )
+    X_train = df_train['Description'].values
+    y_train = df_train['Suspect'].values
     
     # Train the model
-    print("Training BERT model...")
-    trainer.train()
+    print("Training classifier...")
+    pipeline.fit(X_train, y_train)
     
-    print("BERT model trained successfully")
-    return model, tokenizer
+    # Get unique classes for reference
+    classes = pipeline.named_steps['classifier'].classes_
+    print(f"Trained on {len(classes)} unique nation states")
+    
+    return pipeline
 
-def extract_nation_states_with_bert(mitre_df, model, tokenizer):
+def extract_nation_states_with_ml(mitre_df, classifier):
     """
-    Extract nation states from MITRE descriptions using trained BERT NER model
+    Extract nation states from MITRE descriptions using ML classifier
     """
-    print("\nExtracting nation states from MITRE descriptions using BERT...")
+    print("\nExtracting nation states from MITRE descriptions...")
     
     # Create a copy to store results
     result_df = mitre_df.copy()
     result_df['primary_nation_state'] = ''
     result_df['match_source'] = ''
+    result_df['confidence'] = 0.0
     
     extracted_count = 0
-    
-    # Nation mapping for normalization
-    nation_mapping = {
-        'russian': 'Russia', 'russia': 'Russia', 'russian federation': 'Russia', 'ussr': 'Russia', 'soviet': 'Russia',
-        'chinese': 'China', 'china': 'China', 'prc': 'China',
-        'iranian': 'Iran', 'iran': 'Iran', 'persia': 'Iran', 'persian': 'Iran',
-        'north korean': 'North Korea', 'north korea': 'North Korea', 'dprk': 'North Korea',
-        'american': 'United States', 'united states': 'United States', 'usa': 'United States', 'us': 'United States', 'u.s.': 'United States',
-        'israeli': 'Israel', 'israel': 'Israel',
-        'indian': 'India', 'india': 'India',
-        'pakistani': 'Pakistan', 'pakistan': 'Pakistan',
-        'vietnamese': 'Vietnam', 'vietnam': 'Vietnam',
-        'lebanese': 'Lebanon', 'lebanon': 'Lebanon',
-        'south korean': 'South Korea', 'south korea': 'South Korea', 'rok': 'South Korea',
-        'ukrainian': 'Ukraine', 'ukraine': 'Ukraine',
-        'belarusian': 'Belarus', 'belarus': 'Belarus',
-        'british': 'United Kingdom', 'united kingdom': 'United Kingdom', 'uk': 'United Kingdom',
-    }
     
     for idx, row in result_df.iterrows():
         # Combine name, description and aliases for context
@@ -251,60 +110,35 @@ def extract_nation_states_with_bert(mitre_df, model, tokenizer):
         
         # Create text for analysis
         text_parts = []
+        if description:  # Primary focus on description
+            text_parts.append(str(description))
         if name:
             text_parts.append(str(name))
-        if description:
-            text_parts.append(str(description))
         if isinstance(aliases, list) and aliases:
             text_parts.extend([str(alias) for alias in aliases])
         
         combined_text = ' '.join(text_parts)
         
-        # Tokenize and predict
-        inputs = tokenizer(
-            combined_text,
-            truncation=True,
-            max_length=512,
-            return_tensors="pt"
-        ).to(device)
+        if not combined_text.strip():
+            continue
         
-        with torch.no_grad():
-            outputs = model(**inputs)
-            predictions = torch.argmax(outputs.logits, dim=-1)
-        
-        # Extract entities
-        tokens = tokenizer.convert_ids_to_tokens(inputs["input_ids"][0])
-        predictions = predictions[0].cpu().numpy()
-        
-        current_entity = []
-        entities = []
-        
-        for token, pred in zip(tokens, predictions):
-            if pred == 1:  # B-NATION
-                if current_entity:
-                    entities.append(' '.join(current_entity))
-                current_entity = [token.replace('##', '')]
-            elif pred == 2 and current_entity:  # I-NATION
-                current_entity.append(token.replace('##', ''))
-            else:
-                if current_entity:
-                    entities.append(' '.join(current_entity))
-                    current_entity = []
-        
-        if current_entity:
-            entities.append(' '.join(current_entity))
-        
-        # Normalize and select nation
-        if entities:
-            # Normalize the first entity found
-            nation_text = entities[0].lower().strip()
-            nation = nation_mapping.get(nation_text, entities[0])
+        try:
+            # Get prediction and probability
+            prediction = classifier.predict([combined_text])[0]
+            probabilities = classifier.predict_proba([combined_text])[0]
+            max_prob = probabilities.max()
             
-            result_df.at[idx, 'primary_nation_state'] = nation
-            result_df.at[idx, 'match_source'] = 'bert_extraction'
-            extracted_count += 1
+            # Only accept predictions with reasonable confidence
+            if max_prob > 0.3:  # Threshold can be adjusted
+                result_df.at[idx, 'primary_nation_state'] = prediction
+                result_df.at[idx, 'match_source'] = 'ml_extraction'
+                result_df.at[idx, 'confidence'] = max_prob
+                extracted_count += 1
+        except Exception as e:
+            # Skip if prediction fails
+            continue
     
-    print(f"Extracted nation states for {extracted_count} entries using BERT")
+    print(f"Extracted nation states for {extracted_count} entries using ML classifier")
     return result_df
 
 def match_threat_actors(result_df, raw_df):
@@ -341,6 +175,7 @@ def match_threat_actors(result_df, raw_df):
             if pd.notna(nation) and nation.strip():
                 result_df.at[idx, 'primary_nation_state'] = nation
                 result_df.at[idx, 'match_source'] = 'threat_actors_exact'
+                result_df.at[idx, 'confidence'] = 1.0
                 matched_count += 1
                 continue
         
@@ -352,6 +187,7 @@ def match_threat_actors(result_df, raw_df):
                 if pd.notna(nation) and nation.strip():
                     result_df.at[idx, 'primary_nation_state'] = nation
                     result_df.at[idx, 'match_source'] = 'threat_actors_partial'
+                    result_df.at[idx, 'confidence'] = 0.8
                     matched_count += 1
                     break
         
@@ -367,6 +203,7 @@ def match_threat_actors(result_df, raw_df):
                         if pd.notna(nation) and nation.strip():
                             result_df.at[idx, 'primary_nation_state'] = nation
                             result_df.at[idx, 'match_source'] = 'threat_actors_alias'
+                            result_df.at[idx, 'confidence'] = 0.9
                             matched_count += 1
                             break
     
@@ -377,10 +214,10 @@ def match_threat_actors(result_df, raw_df):
     
     return result_df
 
-def main(raw_df, df_spacy_train):
+def main(raw_df, df_train):
     """
     Main function to orchestrate the entire process
-    Requires df_spacy_train with columns: 'Description' and 'Suspect'
+    Requires df_train with columns: 'Description' and 'Suspect'
     """
     print("Starting MITRE ATT&CK threat actor matching process...")
     
@@ -390,15 +227,15 @@ def main(raw_df, df_spacy_train):
         print("Failed to fetch MITRE data. Exiting.")
         return pd.DataFrame()
     
-    # Step 2: Train BERT model with provided training data
+    # Step 2: Train ML classifier with provided training data
     try:
-        model, tokenizer = create_bert_ner_model(df_spacy_train)
+        classifier = create_ml_classifier(df_train)
     except ValueError as e:
         print(f"Error: {e}")
         return pd.DataFrame()
     
-    # Step 3: Extract nation states from MITRE descriptions using BERT
-    result_df = extract_nation_states_with_bert(mitre_df, model, tokenizer)
+    # Step 3: Extract nation states from MITRE descriptions using ML
+    result_df = extract_nation_states_with_ml(mitre_df, classifier)
     
     # Step 4: Match remaining actors with raw_df
     final_df = match_threat_actors(result_df, raw_df)
@@ -415,6 +252,14 @@ def main(raw_df, df_spacy_train):
     for source, count in source_counts.items():
         if source:
             print(f"{source}: {count}")
+    
+    # Show confidence statistics for ML predictions
+    ml_predictions = final_df[final_df['match_source'] == 'ml_extraction']
+    if len(ml_predictions) > 0:
+        print(f"\nML Confidence Stats:")
+        print(f"  Mean: {ml_predictions['confidence'].mean():.3f}")
+        print(f"  Min:  {ml_predictions['confidence'].min():.3f}")
+        print(f"  Max:  {ml_predictions['confidence'].max():.3f}")
     
     # Print all results with full details
     print("\n=== Full Results ===")
@@ -442,31 +287,38 @@ def main(raw_df, df_spacy_train):
     pd.reset_option('display.width')
     pd.reset_option('display.max_colwidth')
     
+    # Drop confidence column before returning
+    final_df = final_df.drop(['confidence'], axis=1)
+    
     return final_df
 
 # Execute the MITRE ATT&CK threat actor matching
 if __name__ == "__main__":
     # Load training data from SQL
-    # df_spacy_train = pd.read_sql(
+    # df_train = pd.read_sql(
     #     'SELECT "Description", "Suspect" FROM threat_actor_training',
     #     connection
     # )
     
     # For testing, use sample training data
-    df_spacy_train = pd.DataFrame({
+    df_train = pd.DataFrame({
         'Description': [
             'APT28 is a threat group that has been attributed to Russia\'s General Staff Main Intelligence Directorate',
             'Lazarus Group is a North Korean state-sponsored cyber threat group',
             'APT1 is a Chinese cyber espionage group',
             'Indrik Spider is a Russia-based cybercriminal group',
+            'Charming Kitten is an Iranian cyber espionage group',
+            'Equation Group is tied to US intelligence',
         ],
         'Suspect': [
             'Russia',
             'North Korea',
             'China',
-            'Russia'
+            'Russia',
+            'Iran',
+            'United States'
         ]
     })
     
     # Run the main function with required training data
-    result_df = main(raw_df, df_spacy_train)
+    result_df = main(raw_df, df_train)
