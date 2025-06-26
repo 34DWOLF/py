@@ -294,31 +294,5 @@ def main(raw_df, df_train):
 
 # Execute the MITRE ATT&CK threat actor matching
 if __name__ == "__main__":
-    # Load training data from SQL
-    # df_train = pd.read_sql(
-    #     'SELECT "Description", "Suspect" FROM threat_actor_training',
-    #     connection
-    # )
-    
-    # For testing, use sample training data
-    df_train = pd.DataFrame({
-        'Description': [
-            'APT28 is a threat group that has been attributed to Russia\'s General Staff Main Intelligence Directorate',
-            'Lazarus Group is a North Korean state-sponsored cyber threat group',
-            'APT1 is a Chinese cyber espionage group',
-            'Indrik Spider is a Russia-based cybercriminal group',
-            'Charming Kitten is an Iranian cyber espionage group',
-            'Equation Group is tied to US intelligence',
-        ],
-        'Suspect': [
-            'Russia',
-            'North Korea',
-            'China',
-            'Russia',
-            'Iran',
-            'United States'
-        ]
-    })
-    
     # Run the main function with required training data
     result_df = main(raw_df, df_train)
