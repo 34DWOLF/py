@@ -251,8 +251,96 @@ if __name__ == "__main__":
     print("\nThis will:")
     print("1. Prepare your time series data")
     print("2. Run AutoML for each use case")
-    print("3. Rank models by R² score")
+    print("3. Rank models by RMSE score (lower is better)")
     print("4. Return best overall model and top 2 per use case")
+
+# Additional utility functions for working with results
+
+def get_model_predictions(automl_result, forecast_horizon=30):
+    """
+    Get predictions from the best model
+    """
+    try:
+        # Get the best model
+        best_model = automl_result.best_trial.model
+        
+        # Make predictions
+        predictions = automl_result.predict(forecast_horizon)
+        
+        return predictions
+    except Exception as e:
+        print(f"Error getting predictions: {str(e)}")
+        return None
+
+def save_best_models(results, model_registry_prefix="ts_forecast"):
+    """
+    Save the best models to MLflow Model Registry
+    """
+    try:
+        # Save best overall model
+        best_model_result = results['best_overall_model']['automl_result']
+        if best_model_result:
+            model_name = f"{model_registry_prefix}_best_overall"
+            mlflow.register_model(
+                model_uri=best_model_result.best_trial.model_path,
+                name=model_name
+            )
+            print(f"Best overall model registered as: {model_name}")
+        
+        # Save best model for each use case
+        for use_case, automl_result in results['all_automl_results'].items():
+            model_name = f"{model_registry_prefix}_{use_case.replace(' ', '_')}"
+            mlflow.register_model(
+                model_uri=automl_result.best_trial.model_path,
+                name=model_name
+            )
+            print(f"Best model for {use_case} registered as: {model_name}")
+            
+    except Exception as e:
+        print(f"Error saving models: {str(e)}")
+
+def compare_models_across_metrics(results, metric_preference="rmse"):
+    """
+    Compare models using different metrics to help choose the best one
+    
+    Args:
+        results: Output from main_automl_pipeline
+        metric_preference: "rmse", "mae", "mape", or "smape"
+    """
+    print(f"\n📊 MODEL COMPARISON BY {metric_preference.upper()}:")
+    print("="*60)
+    
+    all_models = []
+    
+    # Collect all models from all use cases
+    for use_case, models in results['top_models_per_use_case'].items():
+        for model in models:
+            model_info = model.copy()
+            model_info['use_case'] = use_case
+            all_models.append(model_info)
+    
+    # Sort by the preferred metric
+    if metric_preference.lower() in ["rmse", "mae"]:
+        # Lower is better
+        sorted_models = sorted(all_models, key=lambda x: x.get(metric_preference.lower(), float('inf')))
+    elif metric_preference.lower() in ["mape", "smape"]:
+        # Lower is better, but handle None values
+        sorted_models = sorted(all_models, 
+                             key=lambda x: x.get(metric_preference.lower()) if x.get(metric_preference.lower()) is not None else float('inf'))
+    
+    # Display top 5 models
+    print(f"\nTop 5 Models by {metric_preference.upper()}:")
+    for i, model in enumerate(sorted_models[:5], 1):
+        print(f"\n{i}. Use Case: {model['use_case']}")
+        print(f"   Model: {model['model_type']}")
+        print(f"   RMSE: {model['rmse']:.4f}")
+        print(f"   MAE: {model['mae']:.4f}")
+        if model.get('mape') is not None:
+            print(f"   MAPE: {model['mape']:.4f}")
+        if model.get('smape') is not None:
+            print(f"   SMAPE: {model['smape']:.4f}")
+    
+    return sorted_models
 
 # Additional utility functions for working with results
 
