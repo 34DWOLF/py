@@ -259,18 +259,27 @@ if __name__ == "__main__":
 def get_model_predictions(automl_result, forecast_horizon=30):
     """
     Get predictions from the best model
+    Note: forecast_horizon is used here for making predictions, not in the AutoML call
     """
     try:
-        # Get the best model
-        best_model = automl_result.best_trial.model
+        # Get predictions using the trained model
+        # The forecast horizon is specified when making predictions
+        predictions_df = automl_result.predict(num_periods=forecast_horizon)
         
-        # Make predictions
-        predictions = automl_result.predict(forecast_horizon)
-        
-        return predictions
+        return predictions_df
     except Exception as e:
         print(f"Error getting predictions: {str(e)}")
-        return None
+        print("Note: You may need to use the model directly for predictions")
+        try:
+            # Alternative approach - get the model and use it directly
+            best_model_uri = automl_result.best_trial.model_path
+            loaded_model = mlflow.pyfunc.load_model(best_model_uri)
+            print(f"Model loaded from: {best_model_uri}")
+            print("Use loaded_model.predict() with appropriate input data")
+            return loaded_model
+        except Exception as e2:
+            print(f"Error loading model: {str(e2)}")
+            return None
 
 def save_best_models(results, model_registry_prefix="ts_forecast"):
     """
