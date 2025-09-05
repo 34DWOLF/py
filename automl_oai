@@ -1,0 +1,116 @@
+# Databricks runtime: ML cluster
+# Libraries available: databricks.automl, mlflow
+
+from databricks import automl
+import mlflow
+from mlflow.tracking import MlflowClient
+from pyspark.sql import functions as F
+from pyspark.sql.types import TimestampType
+import pandas as pd
+import numpy as np
+
+# --- 1) Prep data ---
+# Normalize column names and types
+sdf = (model_data
+       .withColumnRenamed("use case", "use_case")
+       .withColumn("date", F.col("date").cast(TimestampType()))
+       .withColumn("count", F.col("count").cast("double"))
+       .dropna(subset=["use_case", "date", "count"]))
+
+# Collect the list of use cases
+use_cases = [r["use_case"] for r in sdf.select("use_case").distinct().collect()]
+use_cases = sorted(use_cases)
+
+# --- 2) Helper: run AutoML for one series and return top-2 by R² ---
+client = MlflowClient()
+
+def run_automl_for_series(series_name: str, timeout_minutes: int = 20, horizon: int = 12):
+    series_sdf = sdf.filter(F.col("use_case") == series_name).orderBy("date")
+    pdf = series_sdf.toPandas().sort_values("date")
+    if pdf.empty or len(pdf) < 10:
+        return {"use_case": series_name, "top2": [], "experiment_id": None}
+
+    # Optional: try to infer frequency for transparency; AutoML can infer if omitted
+    try:
+        freq = pd.infer_freq(pdf["date"])
+    except Exception:
+        freq = None
+    # Map to AutoML frequency string if recognized (keep None if unknown)
+    freq_map = {
+        "D": "d", "H": "h", "W-SUN": "w", "W-MON": "w",
+        "MS": "m", "M": "m", "QS": "q", "Q": "q"
+    }
+    aml_freq = freq_map.get(freq, None)
+
+    # Put each series in its own MLflow experiment for easy ranking
+    exp_name = f"/Shared/automl_forecast_{series_name}".replace(" ", "_")
+    mlflow.set_experiment(exp_name)
+
+    # --- 3) Start AutoML forecasting run for THIS series ---
+    # Note: identity_col is not needed here because we’re running one series at a time.
+    summary = automl.forecast(
+        dataset=pdf,                 # pandas or spark df is OK
+        target_col="count",
+        time_col="date",
+        horizon=horizon,             # adjust to your typical forecast need
+        frequency=aml_freq,          # None lets AutoML infer; set if you want explicit control
+        primary_metric="r2",         # we’ll also rank by R² manually just in case
+        timeout_minutes=timeout_minutes,
+    )
+
+    # --- 4) Rank all finished trials by R² using MLflow ---
+    exp = client.get_experiment_by_name(exp_name)
+    rsql = "attributes.status = 'FINISHED'"
+    runs = client.search_runs(
+        [exp.experiment_id],
+        filter_string=rsql,
+        max_results=1000,
+        order_by=["metrics.r2 DESC"]
+    )
+
+    top2 = []
+    for r in runs[:2]:
+        top2.append({
+            "run_id": r.info.run_id,
+            "r2": r.data.metrics.get("r2", float("-inf")),
+            "rmse": r.data.metrics.get("rmse", np.nan),
+            "mae": r.data.metrics.get("mae", np.nan),
+            "trial_name": r.data.tags.get("mlflow.runName"),
+            "algorithm": r.data.tags.get("estimator_name") or r.data.tags.get("flavor"),
+            "experiment_id": r.info.experiment_id,
+        })
+
+    return {"use_case": series_name, "top2": top2, "experiment_id": exp.experiment_id}
+
+# --- 5) Run for all series & compute the overall best by R² ---
+series_results = []
+for uc in use_cases:
+    res = run_automl_for_series(uc, timeout_minutes=20, horizon=12)
+    series_results.append(res)
+
+# Best overall = best R² across all series’ top models
+overall_best = None
+for res in series_results:
+    if res["top2"]:
+        top = res["top2"][0]
+        if (overall_best is None) or (top["r2"] > overall_best["r2"]):
+            overall_best = {"use_case": res["use_case"], **top}
+
+# --- 6) Pretty print the report ---
+print("===== Best overall model by R² =====")
+if overall_best:
+    print(f"Use case: {overall_best['use_case']}")
+    print(f"Trial: {overall_best['trial_name']} | Algo: {overall_best.get('algorithm')}")
+    print(f"R²: {overall_best['r2']:.4f} | RMSE: {overall_best.get('rmse', np.nan)} | MAE: {overall_best.get('mae', np.nan)}")
+    print(f"MLflow Experiment ID: {overall_best['experiment_id']} | Run ID: {overall_best['run_id']}")
+else:
+    print("No successful trials found.")
+
+print("\n===== Top 2 models per use case (by R²) =====")
+for res in series_results:
+    print(f"\n• Use case: {res['use_case']}")
+    if not res["top2"]:
+        print("  (No trials / insufficient data.)")
+        continue
+    for i, m in enumerate(res["top2"], start=1):
+        print(f"  {i}) {m['trial_name']} | Algo: {m.get('algorithm')} | R²: {m['r2']:.4f} | Run: {m['run_id']} (Exp {m['experiment_id']})")
