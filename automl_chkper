@@ -1,0 +1,413 @@
+import pandas as pd
+import numpy as np
+from datetime import datetime, timedelta
+import warnings
+warnings.filterwarnings('ignore')
+
+# Databricks AutoML imports
+import databricks.automl as automl
+from databricks.automl import forecast
+import mlflow
+import mlflow.sklearn
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import col, to_date
+import pyspark.sql.functions as F
+
+# Initialize Spark session
+spark = SparkSession.builder.appName("TimeSeriesAutoML").getOrCreate()
+
+def prepare_timeseries_data(df, date_col='date', target_col='count', id_col='use_case'):
+    """
+    Prepare data for time series forecasting with AutoML
+    """
+    # Ensure date column is properly formatted
+    if isinstance(df, pd.DataFrame):
+        # Convert pandas DataFrame to Spark DataFrame
+        spark_df = spark.createDataFrame(df)
+    else:
+        spark_df = df
+    
+    # Convert date column to proper date type
+    spark_df = spark_df.withColumn(date_col, to_date(col(date_col)))
+    
+    # Sort by use case and date
+    spark_df = spark_df.orderBy(id_col, date_col)
+    
+    return spark_df
+
+def run_automl_for_use_case(df, use_case_value, date_col='date', target_col='count', 
+                           experiment_name=None, timeout_minutes=30):
+    """
+    Run AutoML for a specific use case
+    """
+    # Filter data for specific use case
+    use_case_df = df.filter(col('use_case') == use_case_value)
+    
+    # Set experiment name
+    if experiment_name is None:
+        experiment_name = f"/tmp/automl_forecast_{use_case_value}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    
+    try:
+        # Run AutoML forecast
+        forecast_result = automl.forecast(
+            dataset=use_case_df,
+            target_col=target_col,
+            time_col=date_col,
+            frequency="D",  # Daily frequency - adjust as needed
+            primary_metric="rmse",  # Valid metrics: "rmse", "mae", "mape", "smape"
+            timeout_minutes=timeout_minutes,  # Adjust based on your needs
+            experiment_name=experiment_name
+        )
+        
+        return forecast_result
+    
+    except Exception as e:
+        print(f"Error running AutoML for use case {use_case_value}: {str(e)}")
+        return None
+
+def extract_model_performance(forecast_result):
+    """
+    Extract model performance metrics from AutoML results
+    """
+    if forecast_result is None:
+        return []
+    
+    try:
+        # Get the best trial
+        best_trial = forecast_result.best_trial
+        
+        # Get all trials sorted by primary metric
+        trials_df = forecast_result.trials
+        
+        # Sort by rmse score (ascending - lower is better)
+        sorted_trials = trials_df.orderBy(col("rmse").asc())
+        
+        # Extract performance data
+        performance_data = []
+        trials_list = sorted_trials.collect()
+        
+        for trial in trials_list:
+            performance_data.append({
+                'trial_id': trial.trial_id,
+                'model_type': trial.model_description,
+                'rmse': trial.rmse,
+                'mae': trial.mae,
+                'mape': trial.mape if hasattr(trial, 'mape') else None,
+                'smape': trial.smape if hasattr(trial, 'smape') else None
+            })
+        
+        return performance_data
+    
+    except Exception as e:
+        print(f"Error extracting model performance: {str(e)}")
+        return []
+
+def main_automl_pipeline(model_data, timeout_minutes=30):
+    """
+    Main pipeline to run AutoML for all use cases and return best models
+    """
+    print("Starting Databricks AutoML Time Series Pipeline...")
+    
+    # Prepare the data
+    prepared_data = prepare_timeseries_data(model_data)
+    
+    # Get unique use cases
+    use_cases = [row.use_case for row in prepared_data.select('use_case').distinct().collect()]
+    print(f"Found {len(use_cases)} unique use cases: {use_cases}")
+    
+    # Storage for results
+    all_results = {}
+    use_case_performances = {}
+    
+    # Run AutoML for each use case
+    for use_case in use_cases:
+        print(f"\nProcessing use case: {use_case}")
+        
+        # Create experiment name for this use case
+        experiment_name = f"/tmp/automl_forecast_{use_case}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        
+        # Run AutoML
+        forecast_result = run_automl_for_use_case(
+            prepared_data, 
+            use_case, 
+            experiment_name=experiment_name,
+            timeout_minutes=timeout_minutes
+        )
+        
+        if forecast_result is not None:
+            all_results[use_case] = forecast_result
+            
+            # Extract performance metrics
+            performance_data = extract_model_performance(forecast_result)
+            use_case_performances[use_case] = performance_data
+            
+            print(f"Completed AutoML for {use_case}. Found {len(performance_data)} models.")
+        else:
+            print(f"Failed to run AutoML for {use_case}")
+    
+    # Analyze results and find best models
+    return analyze_results(all_results, use_case_performances)
+
+def analyze_results(all_results, use_case_performances):
+    """
+    Analyze results to find best overall model and top 2 models per use case
+    """
+    print("\n" + "="*60)
+    print("ANALYZING AUTOML RESULTS")
+    print("="*60)
+    
+    # Find best overall model across all use cases (lowest RMSE)
+    best_overall = None
+    best_overall_rmse = float('inf')
+    best_overall_use_case = None
+    
+    # Storage for top models per use case
+    top_models_per_use_case = {}
+    
+    # Analyze each use case
+    for use_case, performance_data in use_case_performances.items():
+        if not performance_data:
+            continue
+            
+        print(f"\n--- Use Case: {use_case} ---")
+        
+        # Sort by RMSE score (ascending - lower is better)
+        sorted_models = sorted(performance_data, key=lambda x: x['rmse'])
+        
+        # Get top 2 models for this use case (lowest RMSE)
+        top_2_models = sorted_models[:2]
+        top_models_per_use_case[use_case] = top_2_models
+        
+        # Check if this is the best overall model (lowest RMSE)
+        if sorted_models[0]['rmse'] < best_overall_rmse:
+            best_overall_rmse = sorted_models[0]['rmse']
+            best_overall = sorted_models[0]
+            best_overall_use_case = use_case
+        
+        # Print top 2 models for this use case
+        for i, model in enumerate(top_2_models, 1):
+            print(f"  Rank {i}: {model['model_type']}")
+            print(f"    RMSE: {model['rmse']:.4f}")
+            print(f"    MAE: {model['mae']:.4f}")
+            if model['mape'] is not None:
+                print(f"    MAPE: {model['mape']:.4f}")
+            if model['smape'] is not None:
+                print(f"    SMAPE: {model['smape']:.4f}")
+            print()
+    
+    # Print summary results
+    print("\n" + "="*60)
+    print("FINAL RESULTS SUMMARY")
+    print("="*60)
+    
+    if best_overall:
+        print(f"\n🏆 BEST OVERALL MODEL:")
+        print(f"   Use Case: {best_overall_use_case}")
+        print(f"   Model Type: {best_overall['model_type']}")
+        print(f"   RMSE: {best_overall_rmse:.4f}")
+        print(f"   MAE: {best_overall['mae']:.4f}")
+        if best_overall.get('mape') is not None:
+            print(f"   MAPE: {best_overall['mape']:.4f}")
+        if best_overall.get('smape') is not None:
+            print(f"   SMAPE: {best_overall['smape']:.4f}")
+    
+    print(f"\n📊 TOP 2 MODELS PER USE CASE:")
+    for use_case, models in top_models_per_use_case.items():
+        print(f"\n   {use_case}:")
+        for i, model in enumerate(models, 1):
+            print(f"     {i}. {model['model_type']} (RMSE: {model['rmse']:.4f})")
+    
+    # Return structured results
+    results = {
+        'best_overall_model': {
+            'use_case': best_overall_use_case,
+            'model_details': best_overall,
+            'automl_result': all_results.get(best_overall_use_case) if best_overall_use_case else None
+        },
+        'top_models_per_use_case': top_models_per_use_case,
+        'all_automl_results': all_results,
+        'summary_stats': {
+            'total_use_cases': len(use_case_performances),
+            'successful_use_cases': len([uc for uc, perf in use_case_performances.items() if perf]),
+            'best_overall_rmse': best_overall_rmse
+        }
+    }
+    
+    return results
+
+# Example usage and execution
+if __name__ == "__main__":
+    # Assuming 'model_data' DataFrame is already available with columns: date, count, use_case
+    
+    # Example of how to call the pipeline
+    # results = main_automl_pipeline(model_data, timeout_minutes=30)
+    
+    # To access results:
+    # best_model = results['best_overall_model']
+    # top_models = results['top_models_per_use_case']
+    # all_results = results['all_automl_results']
+    
+    print("AutoML Time Series Script Ready!")
+    print("\nTo execute:")
+    print("results = main_automl_pipeline(model_data, timeout_minutes=30)")
+    print("\nThis will:")
+    print("1. Prepare your time series data")
+    print("2. Run AutoML for each use case")
+    print("3. Rank models by RMSE score (lower is better)")
+    print("4. Return best overall model and top 2 per use case")
+
+# Additional utility functions for working with results
+
+def get_model_predictions(automl_result, forecast_horizon=30):
+    """
+    Get predictions from the best model
+    Note: forecast_horizon is used here for making predictions, not in the AutoML call
+    """
+    try:
+        # Get predictions using the trained model
+        # The forecast horizon is specified when making predictions
+        predictions_df = automl_result.predict(num_periods=forecast_horizon)
+        
+        return predictions_df
+    except Exception as e:
+        print(f"Error getting predictions: {str(e)}")
+        print("Note: You may need to use the model directly for predictions")
+        try:
+            # Alternative approach - get the model and use it directly
+            best_model_uri = automl_result.best_trial.model_path
+            loaded_model = mlflow.pyfunc.load_model(best_model_uri)
+            print(f"Model loaded from: {best_model_uri}")
+            print("Use loaded_model.predict() with appropriate input data")
+            return loaded_model
+        except Exception as e2:
+            print(f"Error loading model: {str(e2)}")
+            return None
+
+def save_best_models(results, model_registry_prefix="ts_forecast"):
+    """
+    Save the best models to MLflow Model Registry
+    """
+    try:
+        # Save best overall model
+        best_model_result = results['best_overall_model']['automl_result']
+        if best_model_result:
+            model_name = f"{model_registry_prefix}_best_overall"
+            mlflow.register_model(
+                model_uri=best_model_result.best_trial.model_path,
+                name=model_name
+            )
+            print(f"Best overall model registered as: {model_name}")
+        
+        # Save best model for each use case
+        for use_case, automl_result in results['all_automl_results'].items():
+            model_name = f"{model_registry_prefix}_{use_case.replace(' ', '_')}"
+            mlflow.register_model(
+                model_uri=automl_result.best_trial.model_path,
+                name=model_name
+            )
+            print(f"Best model for {use_case} registered as: {model_name}")
+            
+    except Exception as e:
+        print(f"Error saving models: {str(e)}")
+
+def compare_models_across_metrics(results, metric_preference="rmse"):
+    """
+    Compare models using different metrics to help choose the best one
+    
+    Args:
+        results: Output from main_automl_pipeline
+        metric_preference: "rmse", "mae", "mape", or "smape"
+    """
+    print(f"\n📊 MODEL COMPARISON BY {metric_preference.upper()}:")
+    print("="*60)
+    
+    all_models = []
+    
+    # Collect all models from all use cases
+    for use_case, models in results['top_models_per_use_case'].items():
+        for model in models:
+            model_info = model.copy()
+            model_info['use_case'] = use_case
+            all_models.append(model_info)
+    
+    # Sort by the preferred metric
+    if metric_preference.lower() in ["rmse", "mae"]:
+        # Lower is better
+        sorted_models = sorted(all_models, key=lambda x: x.get(metric_preference.lower(), float('inf')))
+    elif metric_preference.lower() in ["mape", "smape"]:
+        # Lower is better, but handle None values
+        sorted_models = sorted(all_models, 
+                             key=lambda x: x.get(metric_preference.lower()) if x.get(metric_preference.lower()) is not None else float('inf'))
+    
+    # Display top 5 models
+    print(f"\nTop 5 Models by {metric_preference.upper()}:")
+    for i, model in enumerate(sorted_models[:5], 1):
+        print(f"\n{i}. Use Case: {model['use_case']}")
+        print(f"   Model: {model['model_type']}")
+        print(f"   RMSE: {model['rmse']:.4f}")
+        print(f"   MAE: {model['mae']:.4f}")
+        if model.get('mape') is not None:
+            print(f"   MAPE: {model['mape']:.4f}")
+        if model.get('smape') is not None:
+            print(f"   SMAPE: {model['smape']:.4f}")
+    
+    return sorted_models
+
+# Run the pipeline
+print("\n" + "="*60)
+print("DATABRICKS AUTOML TIME SERIES PIPELINE")
+print("="*60)
+print("\nExecute with:")
+print("results = main_automl_pipeline(model_data)")
+
+print("\n" + "="*40)
+print("TROUBLESHOOTING PERMISSIONS:")
+print("="*40)
+print("""
+If you encounter permission errors:
+
+1. Check workspace permissions:
+   - Ensure you have 'Can Manage' or 'Can Edit' permissions on the workspace
+   - Verify MLflow experiment permissions
+
+2. Alternative experiment locations:
+   - The script will automatically try different experiment paths
+   - Uses /Users/{current_user}/ instead of /tmp/
+
+3. Manual experiment creation:
+   - Create an experiment manually in MLflow UI first
+   - Pass the experiment path to the function
+
+4. Workspace admin may need to:
+   - Grant MLflow permissions
+   - Enable AutoML features for your user
+""")
+
+# Example workflow after running the pipeline:
+print("\n" + "="*40)
+print("EXAMPLE WORKFLOW:")
+print("="*40)
+print("""
+# 1. Run the main pipeline
+results = main_automl_pipeline(model_data, timeout_minutes=30)
+
+# 2. Get best overall model
+best_model = results['best_overall_model']
+print(f"Best model: {best_model['model_details']['model_type']}")
+print(f"RMSE: {best_model['model_details']['rmse']:.4f}")
+
+# 3. Get predictions with the best model
+best_automl_result = best_model['automl_result']
+predictions = get_model_predictions(best_automl_result, forecast_horizon=30)
+
+# 4. Compare models by different metrics
+rmse_ranking = compare_models_across_metrics(results, "rmse")
+mae_ranking = compare_models_across_metrics(results, "mae")
+
+# 5. Save models to registry
+save_best_models(results, model_registry_prefix="production_forecast")
+
+# 6. Access top models per use case
+for use_case, models in results['top_models_per_use_case'].items():
+    print(f"{use_case}: {models[0]['model_type']} (RMSE: {models[0]['rmse']:.4f})")
+""")
