@@ -1,32 +1,40 @@
-def debug_model_dates(model_uri, run_id):
+def arima_forecasts(model_uri, run_id, n_forecast_periods=1):
     """
-    Debug what dates the model actually has in its index
+    Monthly forecast using model's known date range
     """
-    # Load the underlying model to inspect its date index
-    import mlflow
+    loaded_model = mlflow.pyfunc.load_model(model_uri)
     
-    # Try to get the original model (not pyfunc wrapper)
-    run = mlflow.tracking.MlflowClient().get_run(run_id)
-    
-    # Download and inspect the model artifacts
-    artifact_path = mlflow.tracking.MlflowClient().download_artifacts(run_id, "arima_model")
-    
-    print(f"Model artifacts location: {artifact_path}")
-    
-    # Also check what the last few dates in training were
+    # Get date info from parameters
+    client = mlflow.tracking.MlflowClient()
+    run = client.get_run(run_id)
     last_training_date = pd.to_datetime(run.data.params["last_training_date"])
-    print(f"Last training date from params: {last_training_date}")
     
-    # Try a range around that date
-    test_dates = pd.date_range(
-        start=last_training_date - pd.DateOffset(months=2),
-        end=last_training_date + pd.DateOffset(months=2),
+    # Use the last training date (which the model knows about)
+    # and forecast from there
+    start_date = last_training_date  # 2025-08-01 (model knows this date)
+    end_date = start_date + pd.DateOffset(months=n_forecast_periods)
+    
+    input_data = pd.DataFrame({
+        'start': [start_date],
+        'end': [end_date]
+    })
+    
+    forecast = loaded_model.predict(input_data)
+    
+    # Create output index for the forecasted periods
+    # Start from the next month after training
+    forecast_start = last_training_date + pd.DateOffset(months=1)  # 2025-09-01
+    forecast_dates = pd.date_range(
+        start=forecast_start,
+        periods=n_forecast_periods,
         freq='MS'
     )
     
-    print("Test date range around last training date:")
-    for date in test_dates:
-        print(f"  {date}")
+    return pd.DataFrame({'forecast': forecast.flatten()}, index=forecast_dates)
 
-# Run this first to see what dates are available
-debug_model_dates(model_uri="runs:/<run_id>/arima_model", run_id="<run_id>")
+# Usage - this should forecast for September 2025
+predictions = arima_forecasts(
+    model_uri="runs:/<run_id>/arima_model",
+    run_id="<run_id>",
+    n_forecast_periods=1
+)
