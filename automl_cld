@@ -1,70 +1,57 @@
-import pandas as pd
-import matplotlib.pyplot as plt
-from statsmodels.tsa.arima.model import ARIMA
+def build_param_vector(endog, order, params_dict):
+    m = ARIMA(endog, order=order, freq="MS")
+    names = m.param_names                      # e.g. ['const','ar.L1','ma.L1','sigma2']
+    return [params_dict[name] for name in names], names
 
-# -----------------------
-# 1. Parse coefficient string
-# -----------------------
-param_str = coefficients  # <-- replace with your loaded text string
-param_str = param_str.replace("dtype: float64", "").strip()
+# --- 3) Rolling / expanding forecasting without fitting
+y = model_data["Value"].copy()                 # start from initial history
+last_obs = y.index.max()
 
-# Parse text into dict
-params_dict = dict(line.split() for line in param_str.splitlines())
-params_dict = {k: float(v) for k, v in params_dict.items()}
+# ensure output column exists
+if "forecast_mean" not in df.columns:
+    df["forecast_mean"] = pd.NA
 
-# -----------------------
-# 2. Prepare your data
-# -----------------------
-# Ensure datetime index with monthly frequency
-model_data.index = pd.to_datetime(model_data.index)
-model_data = model_data.asfreq("MS")   # use "M" if your data is month-end
+for i, row in df.iterrows():
+    target = row["reportingMonth"]
 
-# -----------------------
-# 3. Define ARIMA structure
-# -----------------------
-order = (1, 0, 1)   # update to your (p,d,q)
-model = ARIMA(model_data["Value"], order=order, freq="MS")
+    # Only fill if predictedValue is null
+    if pd.isna(row["predictedValue"]):
 
-# -----------------------
-# 4. Align params to correct order
-# -----------------------
-print("Model parameter names:", model.param_names)
+        # If target is BEFORE or equal to the end of our current series:
+        # produce an in-sample (or 1-step-ahead) prediction at that date.
+        # If it's AFTER, produce an out-of-sample forecast and append it to y.
+        if target <= y.index.max():
+            # in-sample prediction at specific index
+            param_vec, _ = build_param_vector(y, order, params_dict)
+            fitted = ARIMA(y, order=order, freq="MS").filter(param_vec)
+            # steps ahead from start to this position:
+            # use get_prediction with index 'target' for aligned mean
+            pred = fitted.get_prediction(start=target, end=target)
+            df.at[i, "forecast_mean"] = float(pred.predicted_mean.iloc[0])
+        else:
+            # how many months ahead from the last known point?
+            last = y.index.max()
+            steps = (target.year - last.year) * 12 + (target.month - last.month)
+            if steps <= 0:
+                steps = 1  # safety
 
-param_vector = [params_dict[name] for name in model.param_names]
-print("Ordered parameter vector:", param_vector)
+            param_vec, _ = build_param_vector(y, order, params_dict)
+            fitted = ARIMA(y, order=order, freq="MS").filter(param_vec)
 
-# -----------------------
-# 5. Apply parameters (skip fitting)
-# -----------------------
-fitted_model = model.filter(param_vector)
+            fc = fitted.get_forecast(steps=steps).predicted_mean
+            val = float(fc.iloc[-1])
 
-# -----------------------
-# 6. Forecast
-# -----------------------
-steps = 12  # forecast 12 months ahead
-forecast_res = fitted_model.get_forecast(steps=steps)
-forecast_mean = forecast_res.predicted_mean
-forecast_ci = forecast_res.conf_int()
+            # write forecast for this row
+            df.at[i, "forecast_mean"] = val
 
-# Output forecast
-print("\nForecasted Values:")
-print(forecast_mean)
+            # append this forecast to the series so subsequent rows can build on it
+            # (this is what makes the process “expanding” without refitting)
+            # fill any skipped months in between by taking the intermediate forecasts too
+            new_index = pd.date_range(start=last + pd.offsets.MonthBegin(1),
+                                      end=target, freq="MS")
+            # if steps > 1, fc contains intermediate months leading to target
+            y = pd.concat([y, pd.Series(fc.values, index=new_index)], axis=0)
 
-print("\nConfidence Intervals:")
-print(forecast_ci)
-
-# -----------------------
-# 7. Plot
-# -----------------------
-plt.figure(figsize=(10,6))
-plt.plot(model_data.index, model_data["Value"], label="Observed", color="black")
-plt.plot(forecast_mean.index, forecast_mean, label="Forecast", color="blue")
-plt.fill_between(forecast_ci.index,
-                 forecast_ci.iloc[:, 0],
-                 forecast_ci.iloc[:, 1],
-                 color="lightblue", alpha=0.4)
-plt.title("ARIMA Forecast with Locked Coefficients")
-plt.xlabel("Date")
-plt.ylabel("Value")
-plt.legend()
-plt.show()
+# --- Result: df now has forecast_mean for blank predictedValue rows
+# display/return df
+df
