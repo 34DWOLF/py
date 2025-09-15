@@ -1,38 +1,61 @@
 import pandas as pd
-
-# Example string
-param_str = """const    13
-ar.L1    -13
-ma.L1     13
-sigma2   13"""
-
-# Parse into dict
-params = dict(line.split() for line in param_str.splitlines())
-params = {k: float(v) for k, v in params.items()}
-
-print(params)
-
-from statsmodels.tsa.arima.model import ARIMA
 import matplotlib.pyplot as plt
+from statsmodels.tsa.arima.model import ARIMA
 
-# Ensure monthly frequency
+# -----------------------
+# 1. Parse coefficient string
+# -----------------------
+param_str = coefficients  # <-- replace with your loaded text string
+param_str = param_str.replace("dtype: float64", "").strip()
+
+# Parse text into dict
+params_dict = dict(line.split() for line in param_str.splitlines())
+params_dict = {k: float(v) for k, v in params_dict.items()}
+
+# -----------------------
+# 2. Prepare your data
+# -----------------------
+# Ensure datetime index with monthly frequency
 model_data.index = pd.to_datetime(model_data.index)
-model_data = model_data.asfreq("MS")
+model_data = model_data.asfreq("MS")   # use "M" if your data is month-end
 
-# Define ARIMA structure
-order = (1, 1, 1)
+# -----------------------
+# 3. Define ARIMA structure
+# -----------------------
+order = (1, 0, 1)   # update to your (p,d,q)
 model = ARIMA(model_data["Value"], order=order, freq="MS")
 
-# Apply coefficients directly
-fitted_model = model.filter(params)
+# -----------------------
+# 4. Align params to correct order
+# -----------------------
+print("Model parameter names:", model.param_names)
 
-# Forecast
-steps = 12
+param_vector = [params_dict[name] for name in model.param_names]
+print("Ordered parameter vector:", param_vector)
+
+# -----------------------
+# 5. Apply parameters (skip fitting)
+# -----------------------
+fitted_model = model.filter(param_vector)
+
+# -----------------------
+# 6. Forecast
+# -----------------------
+steps = 12  # forecast 12 months ahead
 forecast_res = fitted_model.get_forecast(steps=steps)
 forecast_mean = forecast_res.predicted_mean
 forecast_ci = forecast_res.conf_int()
 
-# Plot
+# Output forecast
+print("\nForecasted Values:")
+print(forecast_mean)
+
+print("\nConfidence Intervals:")
+print(forecast_ci)
+
+# -----------------------
+# 7. Plot
+# -----------------------
 plt.figure(figsize=(10,6))
 plt.plot(model_data.index, model_data["Value"], label="Observed", color="black")
 plt.plot(forecast_mean.index, forecast_mean, label="Forecast", color="blue")
