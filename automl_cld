@@ -1,90 +1,73 @@
 import pandas as pd
-from statsmodels.tsa.arima.model import ARIMA
+from pmdarima import auto_arima
+from dateutil.relativedelta import relativedelta
 
-def fill_missing_forecasts(df, model_data, order, coefficients):
+def forecast_open_counts(df, forecast_horizon=6):
     """
-    Fill forecast_mean values for rows in df where predictedValue is null.
+    Forecasts open_count for each use case using AutoARIMA.
     
     Parameters
     ----------
     df : pd.DataFrame
-        Must contain columns ['reportingMonth', 'predictedValue'].
-    model_data : pd.DataFrame
-        Must have a datetime index and a column 'Value' with historical data.
-    order : tuple
-        The (p,d,q) order of the ARIMA model.
-    coefficients : str
-        Text string of model parameters, e.g. printed from a statsmodels ARIMA fit.
-    
+        Must contain columns: ['use_case', 'month', 'open_count', 'closed_count'].
+        'month' should be convertible to datetime.
+    forecast_horizon : int
+        Number of months to forecast forward (default = 6).
+        
     Returns
     -------
-    df : pd.DataFrame
-        Original df with an added/updated 'forecast_mean' column.
+    pd.DataFrame
+        A DataFrame with use_case, forecast_month, and forecast_open_count.
     """
 
-    # --- Parse coefficient string into dictionary ---
-    param_str = str(coefficients).replace("dtype: float64", "").strip()
-    params_dict = dict(line.split() for line in param_str.splitlines())
-    params_dict = {k: float(v) for k, v in params_dict.items()}
+    # Ensure month column is datetime
+    df['month'] = pd.to_datetime(df['month'])
 
-    # --- Prep model_data (monthly frequency, sorted) ---
-    y = model_data.copy()
-    y.index = pd.to_datetime(y.index)
-    y = y.asfreq("MS").sort_index()
+    results = []
 
-    # --- Prep df (ensure datetime and sort) ---
-    df = df.copy()
-    df["reportingMonth"] = pd.to_datetime(df["reportingMonth"])
-    df = df.sort_values("reportingMonth").reset_index(drop=True)
-    if "forecast_mean" not in df.columns:
-        df["forecast_mean"] = pd.NA
+    # Loop over each use case
+    for use_case, group in df.groupby('use_case'):
+        group = group.sort_values('month')
 
-    # --- Helper: build parameter vector aligned with model.param_names ---
-    def build_param_vector(endog):
-        m = ARIMA(endog, order=order, freq="MS")
-        names = m.param_names
-        return [params_dict[name] for name in names], names
+        # Extract the open counts
+        y = group['open_count']
 
-    # --- Walk rows ---
-    for i, row in df.iterrows():
-        target = row["reportingMonth"]
+        # Fit AutoARIMA
+        model = auto_arima(
+            y,
+            seasonal=True,
+            m=12,   # monthly seasonality
+            stepwise=True,
+            suppress_warnings=True,
+            error_action="ignore"
+        )
 
-        if pd.isna(row["predictedValue"]):
-            if target <= y.index.max():
-                # In-sample prediction
-                param_vec, _ = build_param_vector(y)
-                fitted = ARIMA(y, order=order, freq="MS").filter(param_vec)
-                pred = fitted.get_prediction(start=target, end=target)
-                df.at[i, "forecast_mean"] = float(pred.predicted_mean.iloc[0])
-            else:
-                # Forecast ahead
-                last = y.index.max()
-                steps = (target.year - last.year) * 12 + (target.month - last.month)
-                if steps <= 0:
-                    steps = 1
+        # Forecast
+        forecast = model.predict(n_periods=forecast_horizon)
 
-                param_vec, _ = build_param_vector(y)
-                fitted = ARIMA(y, order=order, freq="MS").filter(param_vec)
+        # Build forecast months
+        last_month = group['month'].max()
+        forecast_months = [last_month + relativedelta(months=i+1) for i in range(forecast_horizon)]
 
-                fc = fitted.get_forecast(steps=steps).predicted_mean
-                val = float(fc.iloc[-1])
-                df.at[i, "forecast_mean"] = val
+        # Collect results
+        use_case_results = pd.DataFrame({
+            'use_case': use_case,
+            'forecast_month': forecast_months,
+            'forecast_open_count': forecast
+        })
 
-                # Append forecasts to y so future rows build on them
-                new_index = pd.date_range(start=last + pd.offsets.MonthBegin(1),
-                                          periods=steps, freq="MS")
-                y = pd.concat([y, pd.Series(fc.values, index=new_index)], axis=0)
+        results.append(use_case_results)
 
-    return df
+    return pd.concat(results, ignore_index=True)
 
 
-# Suppose you already have:
-# - model_data with a DateTimeIndex and "Value"
-# - df with ["reportingMonth", "predictedValue"]
-# - order = (1,0,1)
-# - coefficients = """const 30.837505\nar.L1 -0.999993\nma.L1 0.998587\nsigma2 55.926512"""
-
-result = fill_missing_forecasts(df, model_data, order, coefficients)
-
-print(result)
-
+# Example usage:
+# df = pd.DataFrame({
+#     "use_case": ["a","a","a","b","b","b"],
+#     "month": ["2024-01-01","2024-02-01","2024-03-01","2024-01-01","2024-02-01","2024-03-01"],
+#     "open_count": [10, 12, 14, 20, 18, 19],
+#     "closed_count": [5, 6, 7, 8, 7, 9]
+# })
+#
+# forecast_df = forecast_open_counts(df, forecast_horizon=6)
+# print(forecast_df)
