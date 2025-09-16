@@ -1,3 +1,9 @@
+# df uses an explicit date column
+df = df.copy()
+df["reportingMonth"] = pd.to_datetime(df["reportingMonth"])
+df = df.sort_values("reportingMonth").reset_index(drop=True)
+
+# --- 2) Utility: build an ordered parameter vector that matches model.param_names
 def build_param_vector(endog, order, params_dict):
     m = ARIMA(endog, order=order, freq="MS")
     names = m.param_names                      # e.g. ['const','ar.L1','ma.L1','sigma2']
