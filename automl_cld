@@ -1,63 +1,90 @@
-# df uses an explicit date column
-df = df.copy()
-df["reportingMonth"] = pd.to_datetime(df["Month"])
-df = df.sort_values("Month").reset_index(drop=True)
+import pandas as pd
+from statsmodels.tsa.arima.model import ARIMA
 
-# --- 2) Utility: build an ordered parameter vector that matches model.param_names
-def build_param_vector(endog, order, params_dict):
-    m = ARIMA(endog, order=order, freq="MS")
-    names = m.param_names                      # e.g. ['const','ar.L1','ma.L1','sigma2']
-    return [params_dict[name] for name in names], names
+def fill_missing_forecasts(df, model_data, order, coefficients):
+    """
+    Fill forecast_mean values for rows in df where predictedValue is null.
+    
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Must contain columns ['reportingMonth', 'predictedValue'].
+    model_data : pd.DataFrame
+        Must have a datetime index and a column 'Value' with historical data.
+    order : tuple
+        The (p,d,q) order of the ARIMA model.
+    coefficients : str
+        Text string of model parameters, e.g. printed from a statsmodels ARIMA fit.
+    
+    Returns
+    -------
+    df : pd.DataFrame
+        Original df with an added/updated 'forecast_mean' column.
+    """
 
-# --- 3) Rolling / expanding forecasting without fitting
-y = model_data["Value"].copy()                 # start from initial history
-last_obs = y.index.max()
+    # --- Parse coefficient string into dictionary ---
+    param_str = str(coefficients).replace("dtype: float64", "").strip()
+    params_dict = dict(line.split() for line in param_str.splitlines())
+    params_dict = {k: float(v) for k, v in params_dict.items()}
 
-# ensure output column exists
-if "forecast_mean" not in df.columns:
-    df["forecast_mean"] = pd.NA
+    # --- Prep model_data (monthly frequency, sorted) ---
+    y = model_data.copy()
+    y.index = pd.to_datetime(y.index)
+    y = y.asfreq("MS").sort_index()
 
-for i, row in df.iterrows():
-    target = row["reportingMonth"]
+    # --- Prep df (ensure datetime and sort) ---
+    df = df.copy()
+    df["reportingMonth"] = pd.to_datetime(df["reportingMonth"])
+    df = df.sort_values("reportingMonth").reset_index(drop=True)
+    if "forecast_mean" not in df.columns:
+        df["forecast_mean"] = pd.NA
 
-    # Only fill if predictedValue is null
-    if pd.isna(row["predictedValue"]):
+    # --- Helper: build parameter vector aligned with model.param_names ---
+    def build_param_vector(endog):
+        m = ARIMA(endog, order=order, freq="MS")
+        names = m.param_names
+        return [params_dict[name] for name in names], names
 
-        # If target is BEFORE or equal to the end of our current series:
-        # produce an in-sample (or 1-step-ahead) prediction at that date.
-        # If it's AFTER, produce an out-of-sample forecast and append it to y.
-        if target <= y.index.max():
-            # in-sample prediction at specific index
-            param_vec, _ = build_param_vector(y, order, params_dict)
-            fitted = ARIMA(y, order=order, freq="MS").filter(param_vec)
-            # steps ahead from start to this position:
-            # use get_prediction with index 'target' for aligned mean
-            pred = fitted.get_prediction(start=target, end=target)
-            df.at[i, "forecast_mean"] = float(pred.predicted_mean.iloc[0])
-        else:
-            # how many months ahead from the last known point?
-            last = y.index.max()
-            steps = (target.year - last.year) * 12 + (target.month - last.month)
-            if steps <= 0:
-                steps = 1  # safety
+    # --- Walk rows ---
+    for i, row in df.iterrows():
+        target = row["reportingMonth"]
 
-            param_vec, _ = build_param_vector(y, order, params_dict)
-            fitted = ARIMA(y, order=order, freq="MS").filter(param_vec)
+        if pd.isna(row["predictedValue"]):
+            if target <= y.index.max():
+                # In-sample prediction
+                param_vec, _ = build_param_vector(y)
+                fitted = ARIMA(y, order=order, freq="MS").filter(param_vec)
+                pred = fitted.get_prediction(start=target, end=target)
+                df.at[i, "forecast_mean"] = float(pred.predicted_mean.iloc[0])
+            else:
+                # Forecast ahead
+                last = y.index.max()
+                steps = (target.year - last.year) * 12 + (target.month - last.month)
+                if steps <= 0:
+                    steps = 1
 
-            fc = fitted.get_forecast(steps=steps).predicted_mean
-            val = float(fc.iloc[-1])
+                param_vec, _ = build_param_vector(y)
+                fitted = ARIMA(y, order=order, freq="MS").filter(param_vec)
 
-            # write forecast for this row
-            df.at[i, "forecast_mean"] = val
+                fc = fitted.get_forecast(steps=steps).predicted_mean
+                val = float(fc.iloc[-1])
+                df.at[i, "forecast_mean"] = val
 
-            # append this forecast to the series so subsequent rows can build on it
-            # (this is what makes the process “expanding” without refitting)
-            # fill any skipped months in between by taking the intermediate forecasts too
-            new_index = pd.date_range(start=last + pd.offsets.MonthBegin(1),
-                                      end=target, freq="MS")
-            # if steps > 1, fc contains intermediate months leading to target
-            y = pd.concat([y, pd.Series(fc.values, index=new_index)], axis=0)
+                # Append forecasts to y so future rows build on them
+                new_index = pd.date_range(start=last + pd.offsets.MonthBegin(1),
+                                          periods=steps, freq="MS")
+                y = pd.concat([y, pd.Series(fc.values, index=new_index)], axis=0)
 
-# --- Result: df now has forecast_mean for blank predictedValue rows
-# display/return df
-df
+    return df
+
+
+# Suppose you already have:
+# - model_data with a DateTimeIndex and "Value"
+# - df with ["reportingMonth", "predictedValue"]
+# - order = (1,0,1)
+# - coefficients = """const 30.837505\nar.L1 -0.999993\nma.L1 0.998587\nsigma2 55.926512"""
+
+result = fill_missing_forecasts(df, model_data, order, coefficients)
+
+print(result)
+
