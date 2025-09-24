@@ -25,9 +25,9 @@ def moving_average_forecast(series, horizon=6, window=3):
     """Simple moving average fallback forecast."""
     if len(series) < window:
         avg = series.mean() if len(series) > 0 else 0
-        return np.repeat(avg, horizon)
+        return np.repeat(avg, horizon), "Average"
     avg = series.rolling(window).mean().iloc[-1]
-    return np.repeat(avg, horizon)
+    return np.repeat(avg, horizon), "Moving Average"
 
 def forecast_one_category(cat, group, forecast_horizon):
     """Forecast for a single category with strong fallbacks."""
@@ -39,10 +39,13 @@ def forecast_one_category(cat, group, forecast_horizon):
     # Drop NaNs introduced by asfreq
     series = series.dropna()
 
+    method_used = None
+
     # If too few points, bail out early with simple average
     if len(series) < 6:  # require at least ~half a year
         avg = series.mean() if len(series) > 0 else 0
         forecast = np.repeat(avg, forecast_horizon)
+        method_used = "Average"
     else:
         stationary = check_stationarity(series)
 
@@ -57,12 +60,13 @@ def forecast_one_category(cat, group, forecast_horizon):
 
             forecast = model.predict(n_periods=forecast_horizon)
 
-            # Catch case where ARIMA returns NaN
             if np.any(np.isnan(forecast)):
-                forecast = moving_average_forecast(series, forecast_horizon)
+                forecast, method_used = moving_average_forecast(series, forecast_horizon)
+            else:
+                method_used = "ARIMA"
 
         except Exception:
-            forecast = moving_average_forecast(series, forecast_horizon)
+            forecast, method_used = moving_average_forecast(series, forecast_horizon)
 
     forecast_dates = [series.index[-1] + relativedelta(months=i+1)
                       for i in range(forecast_horizon)]
@@ -70,7 +74,8 @@ def forecast_one_category(cat, group, forecast_horizon):
     return pd.DataFrame({
         "Category": cat,
         "Forecast Date": forecast_dates,
-        "Forecast Value": forecast
+        "Forecast Value": forecast,
+        "Forecast Method": method_used
     })
 
 def robust_auto_forecast_parallel(df, forecast_horizon=6, n_jobs=-1):
