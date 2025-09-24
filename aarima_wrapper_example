@@ -4,42 +4,49 @@ from pmdarima.arima import auto_arima
 from statsmodels.tsa.stattools import adfuller, kpss
 from dateutil.relativedelta import relativedelta
 
+# -------------------
+# Helper functions
+# -------------------
+
 def check_stationarity(series):
     """Check stationarity with ADF, fallback to KPSS if needed."""
     try:
         adf_result = adfuller(series.dropna(), autolag="AIC")
-        return adf_result[1] < 0.05  # True if stationary
+        return adf_result[1] < 0.05  # stationary if p < 0.05
     except Exception:
         try:
             kpss_result = kpss(series.dropna(), regression="c", nlags="auto")
-            return kpss_result[1] > 0.05  # True if stationary
+            return kpss_result[1] > 0.05  # stationary if p > 0.05
         except Exception:
             return None  # Inconclusive
 
 def moving_average_forecast(series, horizon=6, window=3):
-    """Simple moving average forecast fallback."""
+    """Simple moving average fallback forecast."""
     avg = series.rolling(window).mean().iloc[-1]
     return np.repeat(avg, horizon)
 
 def robust_auto_forecast(df, forecast_horizon=6):
+    """Run robust AutoARIMA across each Category."""
     results = []
-    df["Month"] = pd.to_datetime(df["Month"])
+    df["Date"] = pd.to_datetime(df["Date"])
 
-    for uc, group in df.groupby("Use Case"):
-        series = group.sort_values("Month").set_index("Month")["Value"]
-        series = series.asfreq("MS")  # enforce monthly
+    for cat, group in df.groupby("Category"):
+        series = group.sort_values("Date").set_index("Date")["Value"]
+
+        # enforce monthly frequency (adjust to 'D' if daily data)
+        series = series.asfreq("MS")
 
         # Step 1: Check stationarity
         stationary = check_stationarity(series)
 
-        # Step 2: Fit ARIMA (with fallback differencing rules)
+        # Step 2: Try AutoARIMA with appropriate settings
         try:
-            if stationary is None:  # Inconclusive
-                # Default to d=1 just to be safe
+            if stationary is None:
+                # Inconclusive → force d=1
                 model = auto_arima(series, d=1, seasonal=True, m=12,
                                    error_action="ignore", suppress_warnings=True)
             else:
-                # Let auto_arima decide with test if stationarity known
+                # Use adf or kpss depending on stationarity outcome
                 model = auto_arima(series, seasonal=True, m=12,
                                    test="adf" if stationary else "kpss",
                                    error_action="ignore", suppress_warnings=True)
@@ -47,17 +54,33 @@ def robust_auto_forecast(df, forecast_horizon=6):
             forecast = model.predict(n_periods=forecast_horizon)
 
         except Exception:
-            # Step 3: Fall back to moving average
+            # Step 3: Fallback → Moving average
             forecast = moving_average_forecast(series, forecast_horizon)
 
-        # Step 4: Build forecast months
+        # Step 4: Build forecast horizon dates
         forecast_months = [series.index[-1] + relativedelta(months=i+1)
                            for i in range(forecast_horizon)]
 
-        results.append(pd.DataFrame({
-            "Use Case": uc,
-            "Forecast Month": forecast_months,
+        forecast_df = pd.DataFrame({
+            "Category": cat,
+            "Forecast Date": forecast_months,
             "Forecast Value": forecast
-        }))
+        })
+        results.append(forecast_df)
 
     return pd.concat(results, ignore_index=True)
+
+# -------------------
+# Example usage
+# -------------------
+# Example df:
+# df = pd.DataFrame({
+#     "Date": ["2022-01-01","2022-02-01","2022-03-01",
+#              "2022-01-01","2022-02-01","2022-03-01"],
+#     "Category": ["A","A","A","B","B","B"],
+#     "Value": [100, 120, 130, 50, 55, 65]
+# })
+
+# Run forecast
+# forecast_df = robust_auto_forecast(df, forecast_horizon=6)
+# print(forecast_df)
