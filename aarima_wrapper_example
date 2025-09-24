@@ -1,0 +1,63 @@
+import pandas as pd
+import numpy as np
+from pmdarima.arima import auto_arima
+from statsmodels.tsa.stattools import adfuller, kpss
+from dateutil.relativedelta import relativedelta
+
+def check_stationarity(series):
+    """Check stationarity with ADF, fallback to KPSS if needed."""
+    try:
+        adf_result = adfuller(series.dropna(), autolag="AIC")
+        return adf_result[1] < 0.05  # True if stationary
+    except Exception:
+        try:
+            kpss_result = kpss(series.dropna(), regression="c", nlags="auto")
+            return kpss_result[1] > 0.05  # True if stationary
+        except Exception:
+            return None  # Inconclusive
+
+def moving_average_forecast(series, horizon=6, window=3):
+    """Simple moving average forecast fallback."""
+    avg = series.rolling(window).mean().iloc[-1]
+    return np.repeat(avg, horizon)
+
+def robust_auto_forecast(df, forecast_horizon=6):
+    results = []
+    df["Month"] = pd.to_datetime(df["Month"])
+
+    for uc, group in df.groupby("Use Case"):
+        series = group.sort_values("Month").set_index("Month")["Value"]
+        series = series.asfreq("MS")  # enforce monthly
+
+        # Step 1: Check stationarity
+        stationary = check_stationarity(series)
+
+        # Step 2: Fit ARIMA (with fallback differencing rules)
+        try:
+            if stationary is None:  # Inconclusive
+                # Default to d=1 just to be safe
+                model = auto_arima(series, d=1, seasonal=True, m=12,
+                                   error_action="ignore", suppress_warnings=True)
+            else:
+                # Let auto_arima decide with test if stationarity known
+                model = auto_arima(series, seasonal=True, m=12,
+                                   test="adf" if stationary else "kpss",
+                                   error_action="ignore", suppress_warnings=True)
+
+            forecast = model.predict(n_periods=forecast_horizon)
+
+        except Exception:
+            # Step 3: Fall back to moving average
+            forecast = moving_average_forecast(series, forecast_horizon)
+
+        # Step 4: Build forecast months
+        forecast_months = [series.index[-1] + relativedelta(months=i+1)
+                           for i in range(forecast_horizon)]
+
+        results.append(pd.DataFrame({
+            "Use Case": uc,
+            "Forecast Month": forecast_months,
+            "Forecast Value": forecast
+        }))
+
+    return pd.concat(results, ignore_index=True)
