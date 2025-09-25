@@ -1,116 +1,139 @@
-import pandas as pd
-import numpy as np
-from sklearn.metrics import mean_squared_error
-from math import sqrt
-import pmdarima as pm
-import warnings
+def forecast_with_reconciliation(df, horizon=6, train_size=0.8, window=3, use_backtest_for_future=True):
+    """
+    Forecast hierarchical time series with ARIMA (SMA fallback) and OLS reconciliation.
+    Uses backtest results on the TOTAL series to choose the best method for future forecasts.
 
-warnings.filterwarnings("ignore")
+    Args:
+        df (pd.DataFrame): Input with columns ['Month','Category','Value']
+        horizon (int): Forecast horizon (future periods beyond dataset)
+        train_size (float): Train/test split ratio
+        window (int): Window size for SMA fallback
+        use_backtest_for_future (bool): If True, picks best method based on total RMSE
 
-# -----------------------
-# Helper: Fit ARIMA or SMA fallback
-# -----------------------
-def fit_forecast(series, horizon, window=3):
-    series = pd.Series(series).astype(float)
+    Returns:
+        historical_fc_df (pd.DataFrame): Forecasts aligned with test set (for RMSE evaluation)
+        future_fc_df (pd.DataFrame): Forecasts beyond the dataset (pure future)
+        rmse_scores (pd.Series): RMSE by Approach + Category (for historical only)
+    """
+    # --- Prep ---
+    df['Month'] = pd.to_datetime(df['Month'])
+    wide_df = df.pivot(index='Month', columns='Category', values='Value').fillna(0)
+    wide_df['Total'] = wide_df.sum(axis=1)
 
-    if (series != 0).sum() < 5:
-        sma_forecast = np.full(horizon, series.rolling(window, min_periods=1).mean().iloc[-1])
-        return sma_forecast, "SMA", None
+    n_train = int(len(wide_df) * train_size)
+    train, test = wide_df.iloc[:n_train], wide_df.iloc[n_train:]
+    h_test = len(test)
+    test_index = test.index
 
-    try:
-        model = pm.auto_arima(series, seasonal=False, suppress_warnings=True, error_action="ignore")
-        forecast = model.predict(n_periods=horizon)
-        return forecast, "ARIMA", model.order
-    except Exception:
-        sma_forecast = np.full(horizon, series.rolling(window, min_periods=1).mean().iloc[-1])
-        return sma_forecast, "SMA", None
+    categories = train.drop(columns="Total").columns.tolist()
+    all_nodes = ["Total"] + categories
 
-
-# -----------------------
-# 1. Prepare data
-# -----------------------
-df['Month'] = pd.to_datetime(df['Month'])
-wide_df = df.pivot(index='Month', columns='Category', values='Value').fillna(0)
-wide_df['Total'] = wide_df.sum(axis=1)
-
-# Train/test split
-train_size = int(len(wide_df) * 0.8)
-train, test = wide_df.iloc[:train_size], wide_df.iloc[train_size:]
-h = len(test)
-forecast_index = test.index
-
-# -----------------------
-# 2. Fit ARIMA/SMA per series
-# -----------------------
-categories = train.drop(columns="Total").columns.tolist()
-all_nodes = ["Total"] + categories
-
-base_forecasts = {}
-metadata = {}
-
-for node in all_nodes:
-    fc, method, order = fit_forecast(train[node], h)
-    base_forecasts[node] = fc
-    metadata[node] = {"Method": method, "Order": order}
-
-# -----------------------
-# 3. Reconciliation (MinT simplified as OLS)
-# -----------------------
-# Build summing matrix S: Total = sum(categories)
-n_cats = len(categories)
-S = np.vstack([np.ones(n_cats), np.eye(n_cats)])  # (n_cats+1) x n_cats
-
-# Reconcile for each horizon step
-reconciled = []
-for t in range(h):
-    y_hat = np.array([base_forecasts["Total"][t]] + [base_forecasts[c][t] for c in categories])
-    # OLS reconciliation: y_tilde = S (S'S)^-1 S' y_hat
-    P = S @ np.linalg.inv(S.T @ S) @ S.T
-    y_rec = P @ y_hat
-    reconciled.append(y_rec)
-
-reconciled = np.array(reconciled)
-
-# -----------------------
-# 4. Build tidy forecast dataframe
-# -----------------------
-rows = []
-for i, date in enumerate(forecast_index):
-    # Baseline forecasts
+    # --- Fit ARIMA/SMA on training ---
+    base_forecasts, metadata = {}, {}
     for node in all_nodes:
-        rows.append({
-            "Category": node,
-            "Date": date,
-            "Forecast": base_forecasts[node][i],
-            "Method": metadata[node]["Method"],
-            "Order": metadata[node]["Order"],
-            "Approach": "Base"
-        })
-    # Reconciled forecasts
-    for j, node in enumerate(all_nodes):
-        rows.append({
-            "Category": node,
-            "Date": date,
-            "Forecast": reconciled[i, j],
-            "Method": metadata[node]["Method"],
-            "Order": metadata[node]["Order"],
-            "Approach": "Reconciled"
-        })
+        fc, method, order = fit_forecast(train[node], max(h_test, horizon), window)
+        base_forecasts[node] = fc
+        metadata[node] = {"Method": method, "Order": order}
 
-forecast_df = pd.DataFrame(rows)
+    # --- Reconciliation on training ---
+    n_cats = len(categories)
+    S = np.vstack([np.ones(n_cats), np.eye(n_cats)])
+    P = S @ np.linalg.inv(S.T @ S) @ S.T
 
-# -----------------------
-# 5. RMSE Evaluation
-# -----------------------
-rmse_scores = forecast_df.groupby(["Approach", "Category"]).apply(
-    lambda g: sqrt(mean_squared_error(
-        test[g.name[1]] if g.name[1] != "Total" else test["Total"],
-        g["Forecast"]
-    ))
-)
+    def reconcile_step(y_hat): return P @ y_hat
 
-print("Sample output:")
-print(forecast_df.head(10))
+    reconciled = {node: [] for node in all_nodes}
+    for t in range(max(h_test, horizon)):
+        y_hat = np.array([base_forecasts["Total"][t]] + [base_forecasts[c][t] for c in categories])
+        y_rec = reconcile_step(y_hat)
+        for j, node in enumerate(all_nodes):
+            reconciled[node].append(y_rec[j])
 
-print("\nRMSE comparison:")
-print(rmse_scores.head(10))
+    # --- Historical forecasts ---
+    hist_rows = []
+    for i, date in enumerate(test_index):
+        for node in all_nodes:
+            hist_rows.append({
+                "Category": node, "Date": date,
+                "Forecast": base_forecasts[node][i],
+                "Method": metadata[node]["Method"],
+                "Order": metadata[node]["Order"],
+                "Approach": "Base"
+            })
+            hist_rows.append({
+                "Category": node, "Date": date,
+                "Forecast": reconciled[node][i],
+                "Method": metadata[node]["Method"],
+                "Order": metadata[node]["Order"],
+                "Approach": "Reconciled"
+            })
+    historical_fc_df = pd.DataFrame(hist_rows)
+
+    # --- RMSE evaluation ---
+    rmse_scores = historical_fc_df.groupby(["Approach", "Category"]).apply(
+        lambda g: sqrt(mean_squared_error(test[g.name[1]], g["Forecast"]))
+    )
+
+    # --- Pick winner (TOTAL only) ---
+    if use_backtest_for_future:
+        total_rmse = rmse_scores.xs("Total", level="Category")
+        best_approach = total_rmse.idxmin()  # "Base" or "Reconciled"
+    else:
+        best_approach = "Reconciled"
+
+    # --- Future forecasts ---
+    freq = pd.infer_freq(df['Month'])
+    future_index = pd.date_range(start=wide_df.index[-1] + pd.tseries.frequencies.to_offset(freq),
+                                 periods=horizon, freq=freq)
+
+    # Refit all nodes on full dataset
+    base_fc, base_meta = {}, {}
+    for n in all_nodes:
+        fc, method, order = fit_forecast(wide_df[n], horizon, window)
+        base_fc[n] = fc
+        base_meta[n] = {"Method": method, "Order": order}
+
+    reconciled_future = {node: [] for node in all_nodes}
+    for t in range(horizon):
+        y_hat = np.array([base_fc["Total"][t]] + [base_fc[c][t] for c in categories])
+        y_rec = reconcile_step(y_hat)
+        for j, node in enumerate(all_nodes):
+            reconciled_future[node].append(y_rec[j])
+
+    future_rows = []
+    for i, date in enumerate(future_index):
+        for node in all_nodes:
+            if best_approach == "Base":
+                future_rows.append({
+                    "Category": node, "Date": date,
+                    "Forecast": base_fc[node][i],
+                    "Method": base_meta[node]["Method"],
+                    "Order": base_meta[node]["Order"],
+                    "Approach": "Base"
+                })
+            else:  # Reconciled
+                future_rows.append({
+                    "Category": node, "Date": date,
+                    "Forecast": reconciled_future[node][i],
+                    "Method": base_meta[node]["Method"],
+                    "Order": base_meta[node]["Order"],
+                    "Approach": "Reconciled"
+                })
+
+    future_fc_df = pd.DataFrame(future_rows)
+
+    return historical_fc_df, future_fc_df, rmse_scores, best_approach
+
+
+hist_fc, fut_fc, rmse, winner = forecast_with_reconciliation(df, horizon=12)
+
+print("Winning approach for TOTAL:", winner)
+print("\nHistorical forecasts sample:")
+print(hist_fc.head())
+
+print("\nFuture forecasts sample:")
+print(fut_fc.head())
+
+print("\nRMSE scores (historical only):")
+print(rmse.head(10))
+
