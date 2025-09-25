@@ -4,6 +4,7 @@ from pmdarima.arima import auto_arima
 from statsmodels.tsa.stattools import adfuller, kpss
 from dateutil.relativedelta import relativedelta
 from joblib import Parallel, delayed
+import sys
 
 # -------------------
 # Helper functions
@@ -30,7 +31,7 @@ def moving_average_forecast(series, horizon=6, window=3):
     return np.repeat(avg, horizon), "Moving Average", None, None
 
 def forecast_one_category(cat, group, forecast_horizon):
-    """Forecast for a single category with strong fallbacks."""
+    """Forecast for a single category with strong fallbacks + logging."""
     series = group.sort_values("Date").set_index("Date")["Value"]
 
     # enforce monthly frequency
@@ -39,14 +40,27 @@ def forecast_one_category(cat, group, forecast_horizon):
     # Drop NaNs introduced by asfreq
     series = series.dropna()
 
+    # Handle empty series
+    if len(series) == 0:
+        print(f"Skipping {cat} – no data after resampling", flush=True)
+        return pd.DataFrame({
+            "Category": [cat] * forecast_horizon,
+            "Forecast Date": [pd.NaT] * forecast_horizon,
+            "Forecast Value": [np.nan] * forecast_horizon,
+            "Forecast Method": ["No Data"] * forecast_horizon,
+            "ARIMA Order": [None] * forecast_horizon,
+            "Seasonal Order": [None] * forecast_horizon
+        })
+
     method_used = None
     order, seasonal_order = None, None
 
     # If too few points, bail out early with simple average
-    if len(series) < 6:  # require at least ~half a year
+    if len(series) < 6:
         avg = series.mean() if len(series) > 0 else 0
         forecast = np.repeat(avg, forecast_horizon)
         method_used = "Average"
+        print(f"{cat}: Not enough data ({len(series)} points) → using Average", flush=True)
     else:
         stationary = check_stationarity(series)
 
@@ -63,13 +77,16 @@ def forecast_one_category(cat, group, forecast_horizon):
 
             if np.any(np.isnan(forecast)):
                 forecast, method_used, order, seasonal_order = moving_average_forecast(series, forecast_horizon)
+                print(f"{cat}: ARIMA returned NaN → fallback to {method_used}", flush=True)
             else:
                 method_used = "ARIMA"
                 order = model.order
                 seasonal_order = model.seasonal_order
+                print(f"{cat}: Using ARIMA {order} seasonal={seasonal_order}", flush=True)
 
-        except Exception:
+        except Exception as e:
             forecast, method_used, order, seasonal_order = moving_average_forecast(series, forecast_horizon)
+            print(f"{cat}: ARIMA failed ({e}) → fallback to {method_used}", flush=True)
 
     forecast_dates = [series.index[-1] + relativedelta(months=i+1)
                       for i in range(forecast_horizon)]
@@ -94,16 +111,3 @@ def robust_auto_forecast_parallel(df, forecast_horizon=6, n_jobs=-1):
     )
 
     return pd.concat(results, ignore_index=True)
-
-# -------------------
-# Example usage
-# -------------------
-# df = pd.DataFrame({
-#     "Date": ["2022-01-01","2022-02-01","2022-03-01",
-#              "2022-01-01","2022-02-01","2022-03-01"],
-#     "Category": ["A","A","A","B","B","B"],
-#     "Value": [100, 120, 130, 50, 55, 65]
-# })
-#
-# forecast_df = robust_auto_forecast_parallel(df, forecast_horizon=6, n_jobs=-1)
-# print(forecast_df)
