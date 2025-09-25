@@ -25,9 +25,9 @@ def moving_average_forecast(series, horizon=6, window=3):
     """Simple moving average fallback forecast."""
     if len(series) < window:
         avg = series.mean() if len(series) > 0 else 0
-        return np.repeat(avg, horizon), "Average"
+        return np.repeat(avg, horizon), "Average", None, None
     avg = series.rolling(window).mean().iloc[-1]
-    return np.repeat(avg, horizon), "Moving Average"
+    return np.repeat(avg, horizon), "Moving Average", None, None
 
 def forecast_one_category(cat, group, forecast_horizon):
     """Forecast for a single category with strong fallbacks."""
@@ -40,6 +40,7 @@ def forecast_one_category(cat, group, forecast_horizon):
     series = series.dropna()
 
     method_used = None
+    order, seasonal_order = None, None
 
     # If too few points, bail out early with simple average
     if len(series) < 6:  # require at least ~half a year
@@ -61,12 +62,14 @@ def forecast_one_category(cat, group, forecast_horizon):
             forecast = model.predict(n_periods=forecast_horizon)
 
             if np.any(np.isnan(forecast)):
-                forecast, method_used = moving_average_forecast(series, forecast_horizon)
+                forecast, method_used, order, seasonal_order = moving_average_forecast(series, forecast_horizon)
             else:
                 method_used = "ARIMA"
+                order = model.order
+                seasonal_order = model.seasonal_order
 
         except Exception:
-            forecast, method_used = moving_average_forecast(series, forecast_horizon)
+            forecast, method_used, order, seasonal_order = moving_average_forecast(series, forecast_horizon)
 
     forecast_dates = [series.index[-1] + relativedelta(months=i+1)
                       for i in range(forecast_horizon)]
@@ -75,7 +78,9 @@ def forecast_one_category(cat, group, forecast_horizon):
         "Category": cat,
         "Forecast Date": forecast_dates,
         "Forecast Value": forecast,
-        "Forecast Method": method_used
+        "Forecast Method": method_used,
+        "ARIMA Order": [order] * forecast_horizon,
+        "Seasonal Order": [seasonal_order] * forecast_horizon
     })
 
 def robust_auto_forecast_parallel(df, forecast_horizon=6, n_jobs=-1):
