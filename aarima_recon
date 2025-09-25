@@ -32,10 +32,10 @@ def fit_forecast(series, horizon, window=3):
 # Main Forecast Function
 # -----------------------
 def forecast_with_reconciliation(df, horizon=6, train_size=0.8, window=3, 
-                                 use_backtest_for_future=True, n_jobs=1):
+                                 use_backtest_for_future=True, n_jobs=1, freq="MS"):
     """
     Forecast hierarchical time series with ARIMA (SMA fallback) and OLS reconciliation.
-    Runs ARIMA fits in parallel.
+    Runs ARIMA fits in parallel and forces future frequency.
 
     Args:
         df (pd.DataFrame): Input with columns ['Month','Category','Value']
@@ -44,6 +44,7 @@ def forecast_with_reconciliation(df, horizon=6, train_size=0.8, window=3,
         window (int): SMA window size for fallback
         use_backtest_for_future (bool): If True, pick winner based on Total RMSE
         n_jobs (int): Number of parallel jobs (-1 = all cores)
+        freq (str): Frequency string for future forecasts (default = "MS" = month start)
 
     Returns:
         historical_fc_df (pd.DataFrame): Backtest forecasts (with RMSE eval)
@@ -118,8 +119,7 @@ def forecast_with_reconciliation(df, horizon=6, train_size=0.8, window=3,
     else:
         best_approach = "Reconciled"
 
-    # --- Step 6: Future forecasts ---
-    freq = pd.infer_freq(df['Month'])
+    # --- Step 6: Future forecasts (forced frequency) ---
     future_index = pd.date_range(start=wide_df.index[-1] + pd.tseries.frequencies.to_offset(freq),
                                  periods=horizon, freq=freq)
 
@@ -164,9 +164,6 @@ def forecast_with_reconciliation(df, horizon=6, train_size=0.8, window=3,
 
 
 
-# Run with all cores
-hist_fc, fut_fc, rmse, winner = forecast_with_reconciliation(df, horizon=12, n_jobs=-1)
 
-print("Winning approach for TOTAL:", winner)
-print("\nRMSE scores (historical):")
-print(rmse.loc[(slice(None), "Total")])
+# Monthly (default)
+hist_fc, fut_fc, rmse, winner = forecast_with_reconciliation(df, horizon=12, n_jobs=-1)
