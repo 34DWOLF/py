@@ -2,20 +2,17 @@ import pandas as pd
 import numpy as np
 from sklearn.metrics import mean_squared_error
 from math import sqrt
-import warnings
 import pmdarima as pm
-from hts import HTSRegressor
-from hts.utilities.load_data import to_ts
+import warnings
 
 warnings.filterwarnings("ignore")
 
 # -----------------------
-# Helper: Fit ARIMA or fallback to SMA
+# Helper: Fit ARIMA or SMA fallback
 # -----------------------
 def fit_forecast(series, horizon, window=3):
     series = pd.Series(series).astype(float)
 
-    # If too few nonzeros, skip ARIMA
     if (series != 0).sum() < 5:
         sma_forecast = np.full(horizon, series.rolling(window, min_periods=1).mean().iloc[-1])
         return sma_forecast, "SMA", None
@@ -28,6 +25,7 @@ def fit_forecast(series, horizon, window=3):
         sma_forecast = np.full(horizon, series.rolling(window, min_periods=1).mean().iloc[-1])
         return sma_forecast, "SMA", None
 
+
 # -----------------------
 # 1. Prepare data
 # -----------------------
@@ -39,73 +37,70 @@ wide_df['Total'] = wide_df.sum(axis=1)
 train_size = int(len(wide_df) * 0.8)
 train, test = wide_df.iloc[:train_size], wide_df.iloc[train_size:]
 h = len(test)
-forecast_index = test.index  # dates of forecast horizon
+forecast_index = test.index
 
 # -----------------------
-# 2. Aggregate-only forecast
+# 2. Fit ARIMA/SMA per series
 # -----------------------
-agg_forecast, agg_method, agg_order = fit_forecast(train['Total'], h)
+categories = train.drop(columns="Total").columns.tolist()
+all_nodes = ["Total"] + categories
 
-agg_df = pd.DataFrame({
-    "Category": "Total",
-    "Date": forecast_index,
-    "Forecast": agg_forecast,
-    "Method": agg_method,
-    "Order": [agg_order] * h,
-    "Approach": "Aggregate"
-})
+base_forecasts = {}
+metadata = {}
 
-# -----------------------
-# 3. Bottom-up forecasts
-# -----------------------
-all_fc_dfs = [agg_df]
-for col in train.drop(columns="Total").columns:
-    fc, method, order = fit_forecast(train[col], h)
-    fc_df = pd.DataFrame({
-        "Category": col,
-        "Date": forecast_index,
-        "Forecast": fc,
-        "Method": method,
-        "Order": [order] * h,
-        "Approach": "Bottom-up"
-    })
-    all_fc_dfs.append(fc_df)
+for node in all_nodes:
+    fc, method, order = fit_forecast(train[node], h)
+    base_forecasts[node] = fc
+    metadata[node] = {"Method": method, "Order": order}
 
 # -----------------------
-# 4. Reconciled forecasts (HTS)
+# 3. Reconciliation (MinT simplified as OLS)
 # -----------------------
-hierarchy = {"Total": list(wide_df.drop(columns="Total").columns)}
-ts = to_ts(train)
+# Build summing matrix S: Total = sum(categories)
+n_cats = len(categories)
+S = np.vstack([np.ones(n_cats), np.eye(n_cats)])  # (n_cats+1) x n_cats
 
-hts_model = HTSRegressor(
-    model="ARIMA",
-    revision_method="MinT",
-    n_jobs=1,
-    low_memory=True,
-    hierarchy=hierarchy
-)
-hts_model.fit(ts)
-hts_forecast = hts_model.predict(h=h)
+# Reconcile for each horizon step
+reconciled = []
+for t in range(h):
+    y_hat = np.array([base_forecasts["Total"][t]] + [base_forecasts[c][t] for c in categories])
+    # OLS reconciliation: y_tilde = S (S'S)^-1 S' y_hat
+    P = S @ np.linalg.inv(S.T @ S) @ S.T
+    y_rec = P @ y_hat
+    reconciled.append(y_rec)
 
-# Convert reconciled results to same format
-for col in hts_forecast.columns:
-    fc_df = pd.DataFrame({
-        "Category": col,
-        "Date": forecast_index,
-        "Forecast": hts_forecast[col].values,
-        "Method": "ARIMA",
-        "Order": [None] * h,   # scikit-hts doesn’t expose per-node orders
-        "Approach": "Reconciled"
-    })
-    all_fc_dfs.append(fc_df)
+reconciled = np.array(reconciled)
 
 # -----------------------
-# 5. Combine into final tidy df
+# 4. Build tidy forecast dataframe
 # -----------------------
-forecast_df = pd.concat(all_fc_dfs, ignore_index=True)
+rows = []
+for i, date in enumerate(forecast_index):
+    # Baseline forecasts
+    for node in all_nodes:
+        rows.append({
+            "Category": node,
+            "Date": date,
+            "Forecast": base_forecasts[node][i],
+            "Method": metadata[node]["Method"],
+            "Order": metadata[node]["Order"],
+            "Approach": "Base"
+        })
+    # Reconciled forecasts
+    for j, node in enumerate(all_nodes):
+        rows.append({
+            "Category": node,
+            "Date": date,
+            "Forecast": reconciled[i, j],
+            "Method": metadata[node]["Method"],
+            "Order": metadata[node]["Order"],
+            "Approach": "Reconciled"
+        })
+
+forecast_df = pd.DataFrame(rows)
 
 # -----------------------
-# 6. Optional: RMSE evaluation
+# 5. RMSE Evaluation
 # -----------------------
 rmse_scores = forecast_df.groupby(["Approach", "Category"]).apply(
     lambda g: sqrt(mean_squared_error(
@@ -114,8 +109,8 @@ rmse_scores = forecast_df.groupby(["Approach", "Category"]).apply(
     ))
 )
 
-print("Sample forecast dataframe:")
-print(forecast_df.head())
+print("Sample output:")
+print(forecast_df.head(10))
 
-print("\nRMSE by Approach + Category:")
+print("\nRMSE comparison:")
 print(rmse_scores.head(10))
