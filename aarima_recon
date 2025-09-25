@@ -1,3 +1,38 @@
+import pandas as pd
+import numpy as np
+from sklearn.metrics import mean_squared_error
+from math import sqrt
+import pmdarima as pm
+import warnings
+
+warnings.filterwarnings("ignore")
+
+# -----------------------
+# Helper: Fit ARIMA or SMA fallback
+# -----------------------
+def fit_forecast(series, horizon, window=3):
+    """
+    Try to fit ARIMA. If fails or series too sparse, use SMA fallback.
+    Returns forecast, method used, and ARIMA order (if applicable).
+    """
+    series = pd.Series(series).astype(float)
+
+    if (series != 0).sum() < 5:  # too sparse
+        sma_forecast = np.full(horizon, series.rolling(window, min_periods=1).mean().iloc[-1])
+        return sma_forecast, "SMA", None
+
+    try:
+        model = pm.auto_arima(series, seasonal=False, suppress_warnings=True, error_action="ignore")
+        forecast = model.predict(n_periods=horizon)
+        return forecast, "ARIMA", model.order
+    except Exception:
+        sma_forecast = np.full(horizon, series.rolling(window, min_periods=1).mean().iloc[-1])
+        return sma_forecast, "SMA", None
+
+
+# -----------------------
+# Main Forecast Function
+# -----------------------
 def forecast_with_reconciliation(df, horizon=6, train_size=0.8, window=3, use_backtest_for_future=True):
     """
     Forecast hierarchical time series with ARIMA (SMA fallback) and OLS reconciliation.
@@ -14,6 +49,7 @@ def forecast_with_reconciliation(df, horizon=6, train_size=0.8, window=3, use_ba
         historical_fc_df (pd.DataFrame): Forecasts aligned with test set (for RMSE evaluation)
         future_fc_df (pd.DataFrame): Forecasts beyond the dataset (pure future)
         rmse_scores (pd.Series): RMSE by Approach + Category (for historical only)
+        best_approach (str): "Base" or "Reconciled" (winner based on Total RMSE)
     """
     # --- Prep ---
     df['Month'] = pd.to_datetime(df['Month'])
@@ -37,7 +73,7 @@ def forecast_with_reconciliation(df, horizon=6, train_size=0.8, window=3, use_ba
 
     # --- Reconciliation on training ---
     n_cats = len(categories)
-    S = np.vstack([np.ones(n_cats), np.eye(n_cats)])
+    S = np.vstack([np.ones(n_cats), np.eye(n_cats)])  # Total row + identity for cats
     P = S @ np.linalg.inv(S.T @ S) @ S.T
 
     def reconcile_step(y_hat): return P @ y_hat
@@ -125,9 +161,11 @@ def forecast_with_reconciliation(df, horizon=6, train_size=0.8, window=3, use_ba
     return historical_fc_df, future_fc_df, rmse_scores, best_approach
 
 
+
 hist_fc, fut_fc, rmse, winner = forecast_with_reconciliation(df, horizon=12)
 
 print("Winning approach for TOTAL:", winner)
+
 print("\nHistorical forecasts sample:")
 print(hist_fc.head())
 
@@ -136,4 +174,3 @@ print(fut_fc.head())
 
 print("\nRMSE scores (historical only):")
 print(rmse.head(10))
-
