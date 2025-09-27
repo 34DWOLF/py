@@ -197,13 +197,29 @@ def forecast_with_reconciliation(df, horizon=6, train_size=0.8, window=3,
             })
     historical_fc_df = pd.DataFrame(hist_rows)
 
-    # --- Step 4: Metrics ---
-    rmse_scores = historical_fc_df.groupby(["Approach", "Category"]).apply(
-        lambda g: sqrt(mean_squared_error(test[g.name[1]], g["Forecast"]))
-    )
-    bias_scores = historical_fc_df.groupby(["Approach", "Category"]).apply(
-        lambda g: np.mean(test[g.name[1]] - g["Forecast"])
-    )
+    # --- Step 4: Safe RMSE & Bias ---
+    def safe_rmse(g):
+        cat = g.name[1]
+        if cat not in test.columns:
+            return np.nan
+        y_true = test[cat].dropna()
+        y_pred = g.set_index("Date").loc[y_true.index, "Forecast"]
+        if y_true.empty or y_pred.empty:
+            return np.nan
+        return sqrt(mean_squared_error(y_true, y_pred))
+
+    def safe_bias(g):
+        cat = g.name[1]
+        if cat not in test.columns:
+            return np.nan
+        y_true = test[cat].dropna()
+        y_pred = g.set_index("Date").loc[y_true.index, "Forecast"]
+        if y_true.empty or y_pred.empty:
+            return np.nan
+        return np.mean(y_true - y_pred)
+
+    rmse_scores = historical_fc_df.groupby(["Approach", "Category"]).apply(safe_rmse)
+    bias_scores = historical_fc_df.groupby(["Approach", "Category"]).apply(safe_bias)
 
     # --- Step 5: Pick winner ---
     if use_backtest_for_future:
@@ -215,9 +231,8 @@ def forecast_with_reconciliation(df, horizon=6, train_size=0.8, window=3,
             if rmse_diff > 0.05 * min(total_rmse):  # >5% difference → RMSE dominates
                 best_approach = total_rmse.idxmin()
             else:
-                # tie → use average category bias
                 avg_bias = bias_scores.groupby("Approach").apply(
-                    lambda x: np.mean(np.abs(x.drop("Total", errors="ignore")))
+                    lambda x: np.nanmean(np.abs(x.drop("Total", errors="ignore")))
                 )
                 best_approach = avg_bias.idxmin()
         else:
@@ -268,23 +283,3 @@ def forecast_with_reconciliation(df, horizon=6, train_size=0.8, window=3,
     future_fc_df = pd.DataFrame(future_rows)
 
     return historical_fc_df, future_fc_df, rmse_scores, bias_scores, best_approach
-
-
-
-
-
-hist_fc, fut_fc, rmse, bias, winner = forecast_with_reconciliation(
-    df,
-    horizon=12,
-    n_jobs=-1,
-    freq="MS",
-    m_grid=[1, 6, 12],     # non-seasonal, semi-annual, annual
-    selection_mode="multi" # use RMSE + bias
-)
-
-print("Winning approach (TOTAL):", winner)
-print("\nRMSE scores (TOTAL):")
-print(rmse.loc[(slice(None), "Total")])
-print("\nBias scores (categories):")
-print(bias.head())
-
