@@ -41,7 +41,7 @@ exp.setup(
 )
 
 # Compare models and add nRMSE
-best_models = exp.compare_models(sort='RMSE', n_select=10, include=['naive', 'grand_means', 'snaive', 'polytrend', 'arima', 'ets', 'theta', 'tbats', 'prophet', 'lr_cds_dt', 'en_cds_dt', 'ridge_cds_dt', 'llar_cds_dt', 'par_cds_dt', 'br_cds_dt', 'catboost_cds_dt', 'gbr_cds_dt', 'rf_cds_dt', 'et_cds_dt', 'lightgbm_cds_dt', 'xgboost_cds_dt', 'dt_cds_dt'])
+best_models = exp.compare_models(sort='RMSE', n_select=10)
 leaderboard = exp.pull()
 
 # Calculate nRMSE
@@ -100,7 +100,7 @@ exp_baseline.setup(
     session_id=42,
     verbose=False
 )
-baseline_models = exp_baseline.compare_models(sort='RMSE', n_select=1, include=['naive', 'grand_means', 'snaive', 'polytrend', 'arima', 'ets', 'theta', 'tbats', 'prophet', 'lr_cds_dt', 'en_cds_dt', 'ridge_cds_dt', 'llar_cds_dt', 'par_cds_dt', 'br_cds_dt', 'catboost_cds_dt', 'gbr_cds_dt', 'rf_cds_dt', 'et_cds_dt', 'lightgbm_cds_dt', 'xgboost_cds_dt', 'dt_cds_dt'])
+baseline_models = exp_baseline.compare_models(sort='RMSE', n_select=1)
 baseline_results = exp_baseline.pull()
 baseline_rmse = float(pd.to_numeric(baseline_results.iloc[0]['RMSE'], errors='coerce'))
 baseline_nrmse = baseline_rmse / y_range
@@ -129,7 +129,7 @@ def evaluate_without_regressor(regressor, df, target, all_regressors, fh, y_rang
             verbose=False
         )
         
-        model_temp = exp_temp.compare_models(sort='RMSE', n_select=1, include=['naive', 'grand_means', 'snaive', 'polytrend', 'arima', 'ets', 'theta', 'tbats', 'prophet', 'lr_cds_dt', 'en_cds_dt', 'ridge_cds_dt', 'llar_cds_dt', 'par_cds_dt', 'br_cds_dt', 'catboost_cds_dt', 'gbr_cds_dt', 'rf_cds_dt', 'et_cds_dt', 'lightgbm_cds_dt', 'xgboost_cds_dt', 'dt_cds_dt'])
+        model_temp = exp_temp.compare_models(sort='RMSE', n_select=1)
         results_temp = exp_temp.pull()
         rmse_temp = float(pd.to_numeric(results_temp.iloc[0]['RMSE'], errors='coerce'))
         nrmse_temp = rmse_temp / y_range
