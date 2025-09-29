@@ -1,0 +1,87 @@
+# Step 1: Import libraries
+import pandas as pd
+import numpy as np
+from sklearn.preprocessing import StandardScaler
+from sklearn.neighbors import KNeighborsRegressor
+from sklearn.model_selection import train_test_split
+
+# Step 2: Example DataFrame structure
+# df = pd.DataFrame({
+#     'Date': ['2023-01-31', '2023-02-28', ...],
+#     'Value': [...],
+#     'R1': [...],
+#     'R2': [...]
+# })
+
+# Step 3: Preprocess data
+def preprocess_data(df):
+    df = df.copy()
+    df['Date'] = pd.to_datetime(df['Date'])
+    df = df.sort_values('Date').reset_index(drop=True)
+    return df
+
+# Step 4: Create lag features (optional but improves time forecasts)
+def add_lag_features(df, lags=[1, 2, 3]):
+    for lag in lags:
+        df[f'lag_{lag}'] = df['Value'].shift(lag)
+    return df.dropna()
+
+# Step 5: Train KNN model
+def train_knn(df, n_neighbors=5):
+    features = ['R1', 'R2'] + [col for col in df.columns if col.startswith('lag_')]
+    X = df[features]
+    y = df['Value']
+
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X)
+
+    X_train, X_test, y_train, y_test = train_test_split(X_scaled, y, test_size=0.2, shuffle=False)
+
+    model = KNeighborsRegressor(n_neighbors=n_neighbors)
+    model.fit(X_train, y_train)
+
+    return model, scaler, features
+
+# Step 6: Forecast next N months
+def forecast_next_months(df, model, scaler, features, months_ahead=3):
+    df_forecast = df.copy()
+
+    last_date = df_forecast['Date'].max()
+
+    for step in range(1, months_ahead + 1):
+        next_date = (last_date + pd.offsets.MonthEnd(step))
+
+        # Prepare next row features using last known values
+        new_row = {
+            'Date': next_date,
+            'R1': df_forecast['R1'].iloc[-1],  # You can replace with actual future regressors if available
+            'R2': df_forecast['R2'].iloc[-1],
+        }
+
+        # Add lag values from the most recent data
+        for lag in [1, 2, 3]:
+            new_row[f'lag_{lag}'] = df_forecast['Value'].iloc[-lag]
+
+        # Convert to DataFrame for prediction
+        X_new = pd.DataFrame([new_row])[features]
+        X_new_scaled = scaler.transform(X_new)
+
+        pred = model.predict(X_new_scaled)[0]
+        new_row['Value'] = pred
+
+        # Append prediction to forecast dataframe
+        df_forecast = pd.concat([df_forecast, pd.DataFrame([new_row])], ignore_index=True)
+
+    return df_forecast.tail(months_ahead)[['Date', 'Value']]
+
+# Step 7: Run the pipeline
+def knn_forecast_pipeline(df, months_ahead=3):
+    df = preprocess_data(df)
+    df = add_lag_features(df)
+    model, scaler, features = train_knn(df)
+    forecast = forecast_next_months(df, model, scaler, features, months_ahead=months_ahead)
+    return forecast
+
+# Example usage
+# forecast_df = knn_forecast_pipeline(df, months_ahead=3)
+# print(forecast_df)
