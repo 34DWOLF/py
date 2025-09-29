@@ -12,7 +12,7 @@ warnings.filterwarnings("ignore")
 # =======================================
 # STEP 2: Load & Prepare Data
 # =======================================
-# Example structure — replace with your dataset
+# Example data — replace with your actual dataset
 df = pd.DataFrame({
     'Date': pd.date_range(start='2015-01-01', periods=100, freq='MS'),
     'A': np.linspace(0, 100, 100) + np.random.normal(0, 5, 100),
@@ -25,17 +25,17 @@ df = pd.DataFrame({
 
 df['Date'] = pd.to_datetime(df['Date'])
 df = df.sort_values('Date').set_index('Date')
-df = df.asfreq('MS')  # Monthly frequency
+df = df.asfreq('MS')
 
-# =======================================
-# STEP 3: Define Target & Regressors
-# =======================================
 target_col = 'A'
 regressors = ['B', 'C', 'D', 'E', 'F']
 forecast_horizon = 12
 
+# For normalization
+target_mean = df[target_col].mean()
+
 # =======================================
-# STEP 4: PyCaret Setup & AutoML
+# STEP 3: PyCaret Setup & AutoML
 # =======================================
 exp = TSForecastingExperiment()
 exp.setup(
@@ -53,23 +53,24 @@ exp.setup(
 
 best_model = exp.compare_models(sort='RMSE')
 leaderboard = exp.pull()
-print("\n=== MODEL LEADERBOARD ===")
-print(leaderboard)
 
+# =======================================
+# STEP 4: Add nRMSE to Leaderboard
+# =======================================
+leaderboard['nRMSE'] = leaderboard['RMSE'] / target_mean
+print("\n=== MODEL LEADERBOARD WITH nRMSE ===")
+print(leaderboard[['Model', 'RMSE', 'nRMSE', 'MAE', 'MAPE', 'R2']])
+
+# =======================================
+# STEP 5: Finalize Model & Forecast
+# =======================================
 final_model = exp.finalize_model(best_model)
-
-# =======================================
-# STEP 5: Forecast & Diagnostics
-# =======================================
 forecast = exp.predict_model(final_model, fh=forecast_horizon)
 print("\n=== FORECAST RESULTS ===")
 print(forecast)
 
-exp.plot_model(final_model, plot='forecast')
-exp.plot_model(final_model, plot='diagnostics')
-
 # =======================================
-# STEP 6: Model-based Feature Importance
+# STEP 6: Feature Importance (Model-Based)
 # =======================================
 print("\n=== MODEL-BASED FEATURE IMPORTANCE ===")
 try:
@@ -84,7 +85,6 @@ print("\n=== PERMUTATION FEATURE IMPORTANCE ===")
 try:
     X_test = exp.get_config('X_test')
     y_test = exp.get_config('y_test')
-
     r = permutation_importance(
         final_model,
         X_test,
@@ -93,7 +93,6 @@ try:
         random_state=42,
         n_jobs=-1
     )
-
     sorted_idx = r.importances_mean.argsort()[::-1]
     for idx in sorted_idx:
         print(f"{X_test.columns[idx]}: {r.importances_mean[idx]:.4f}")
@@ -101,13 +100,13 @@ except Exception as e:
     print("Permutation importance failed:", e)
 
 # =======================================
-# STEP 8: Parallel Leave-One-Regressor-Out Analysis
+# STEP 8: Parallel Leave-One-Regressor-Out Analysis with nRMSE
 # =======================================
-print("\n=== PARALLEL LEAVE-ONE-REGRESSOR-OUT IMPACT ANALYSIS ===")
+print("\n=== PARALLEL LEAVE-ONE-REGRESSOR-OUT IMPACT ANALYSIS (with nRMSE) ===")
 base_rmse = leaderboard.iloc[0]['RMSE']
+base_nrmse = base_rmse / target_mean
 
 def evaluate_without_regressor(reg):
-    """Train and evaluate model without a specific regressor."""
     reduced_regs = [r for r in regressors if r != reg]
     exp_tmp = TSForecastingExperiment()
     exp_tmp.setup(
@@ -125,14 +124,17 @@ def evaluate_without_regressor(reg):
     m = exp_tmp.create_model(best_model)
     exp_tmp.finalize_model(m)
     rmse = exp_tmp.pull().iloc[0]['RMSE']
-    return (reg, rmse, rmse - base_rmse)
+    nrmse = rmse / target_mean
+    return (reg, rmse, rmse - base_rmse, nrmse, nrmse - base_nrmse)
 
-# Run in parallel across all regressors
 impact_results = Parallel(n_jobs=-1, backend="loky")(
     delayed(evaluate_without_regressor)(reg) for reg in regressors
 )
 
-impact_df = pd.DataFrame(impact_results, columns=['Regressor', 'RMSE_without', 'ΔRMSE'])
-impact_df = impact_df.sort_values('ΔRMSE', ascending=False)
-print("\n=== REGRESSOR IMPACT SUMMARY ===")
+impact_df = pd.DataFrame(
+    impact_results,
+    columns=['Regressor', 'RMSE_without', 'ΔRMSE', 'nRMSE_without', 'ΔnRMSE']
+).sort_values('ΔnRMSE', ascending=False)
+
+print("\n=== REGRESSOR IMPACT SUMMARY (with nRMSE) ===")
 print(impact_df)
