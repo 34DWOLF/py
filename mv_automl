@@ -14,18 +14,18 @@ warnings.filterwarnings('ignore')
 # Example: df with columns ['Date', 'A', 'B', 'C', 'D', 'E', 'F']
 
 # Ensure Date is datetime
-df['Date'] = pd.read_datetime(df['Date'])
+df['Date'] = pd.to_datetime(df['Date'])
 df = df.sort_values('Date').reset_index(drop=True)
 
 # Initialize experiment
 exp = TSForecastingExperiment()
 
-# Setup with exogenous regressors
+# Setup with exogenous regressors (correct syntax for PyCaret 3.3.2)
 exp.setup(
     data=df,
     target='A',
     fh=12,  # Forecast horizon
-    exogenous_variables=['B', 'C', 'D', 'E', 'F'],
+    numeric_imputation_exogenous='ffill',
     fold=3,
     session_id=42,
     verbose=False
@@ -93,10 +93,10 @@ print("\n=== Permutation Feature Importance ===")
 from sklearn.inspection import permutation_importance
 
 # Get validation data
-y_val = exp.get_config('y_val')
-X_val = exp.get_config('X_val')
-
 try:
+    y_val = exp.get_config('y_val')
+    X_val = exp.get_config('X_val')
+    
     perm_importance = permutation_importance(
         final_model, X_val, y_val, n_repeats=10, random_state=42, scoring='neg_mean_squared_error'
     )
@@ -128,7 +128,6 @@ exp_baseline.setup(
     data=df,
     target='A',
     fh=12,
-    exogenous_variables=regressors,
     fold=3,
     session_id=42,
     verbose=False
@@ -148,12 +147,14 @@ def evaluate_without_regressor(regressor, df, target, all_regressors, y_range):
     if len(remaining_regressors) == 0:
         return None, None
     
+    # Create df without the excluded regressor
+    df_temp = df[['Date', target] + remaining_regressors].copy()
+    
     exp_temp = TSForecastingExperiment()
     exp_temp.setup(
-        data=df,
+        data=df_temp,
         target=target,
         fh=12,
-        exogenous_variables=remaining_regressors,
         fold=3,
         session_id=42,
         verbose=False
