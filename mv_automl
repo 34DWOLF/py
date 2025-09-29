@@ -3,7 +3,6 @@ import pandas as pd
 import numpy as np
 from pycaret.time_series import TSForecastingExperiment
 from sklearn.metrics import mean_squared_error
-from joblib import Parallel, delayed
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -51,7 +50,7 @@ leaderboard['nRMSE'] = pd.to_numeric(leaderboard['RMSE'], errors='coerce') / y_r
 print("\n=== Model Leaderboard with nRMSE ===")
 print(leaderboard[['Model', 'RMSE', 'nRMSE', 'MAE', 'MAPE']].to_string())
 
-# Get best model - use compare_models result instead of automl
+# Get best model
 best_model = best_models[0] if isinstance(best_models, list) else best_models
 print(f"\n=== Best Model: {type(best_model).__name__} ===")
 
@@ -87,7 +86,7 @@ try:
 except Exception as e:
     print(f"Could not extract model-based importance: {e}")
 
-# Leave-One-Regressor-Out Analysis
+# Leave-One-Regressor-Out Analysis (Sequential to avoid pickling issues)
 print("\n=== Leave-One-Regressor-Out Analysis ===")
 
 # Baseline (all regressors)
@@ -108,22 +107,24 @@ baseline_nrmse = baseline_rmse / y_range
 print(f"Baseline RMSE (all regressors): {baseline_rmse:.4f}")
 print(f"Baseline nRMSE (all regressors): {baseline_nrmse:.4f}")
 
-def evaluate_without_regressor(regressor, df, target, all_regressors, fh, y_range):
-    """Train model without one regressor and return RMSE"""
+# Sequential evaluation (no parallel processing)
+impact_results = []
+for regressor in REGRESSORS:
+    print(f"\nEvaluating without regressor: {regressor}")
     try:
-        remaining_regressors = [r for r in all_regressors if r != regressor]
+        remaining_regressors = [r for r in REGRESSORS if r != regressor]
         
         if len(remaining_regressors) == 0:
-            return None, None
+            continue
         
         # Create df without the excluded regressor
-        df_temp = df[[target] + remaining_regressors].copy()
+        df_temp = df[[TARGET_COLUMN] + remaining_regressors].copy()
         
         exp_temp = TSForecastingExperiment()
         exp_temp.setup(
             data=df_temp,
-            target=target,
-            fh=fh,
+            target=TARGET_COLUMN,
+            fh=FORECAST_HORIZON,
             fold=3,
             session_id=42,
             verbose=False
@@ -134,35 +135,23 @@ def evaluate_without_regressor(regressor, df, target, all_regressors, fh, y_rang
         rmse_temp = float(pd.to_numeric(results_temp.iloc[0]['RMSE'], errors='coerce'))
         nrmse_temp = rmse_temp / y_range
         
-        return rmse_temp, nrmse_temp
-    except Exception as e:
-        print(f"Error evaluating without {regressor}: {e}")
-        return None, None
-
-# Parallel evaluation
-results_parallel = Parallel(n_jobs=-1, verbose=10)(
-    delayed(evaluate_without_regressor)(reg, df, TARGET_COLUMN, REGRESSORS, FORECAST_HORIZON, y_range)
-    for reg in REGRESSORS
-)
-
-# Compile results
-impact_results = []
-for i, regressor in enumerate(REGRESSORS):
-    rmse_without, nrmse_without = results_parallel[i]
-    
-    if rmse_without is not None and nrmse_without is not None:
-        delta_rmse = float(rmse_without - baseline_rmse)
-        delta_nrmse = float(nrmse_without - baseline_nrmse)
+        delta_rmse = float(rmse_temp - baseline_rmse)
+        delta_nrmse = float(nrmse_temp - baseline_nrmse)
         
         impact_results.append({
             'Regressor': regressor,
-            'RMSE_without': float(rmse_without),
+            'RMSE_without': float(rmse_temp),
             'RMSE_baseline': float(baseline_rmse),
             'ΔRMSE': delta_rmse,
-            'nRMSE_without': float(nrmse_without),
+            'nRMSE_without': float(nrmse_temp),
             'nRMSE_baseline': float(baseline_nrmse),
             'ΔnRMSE': delta_nrmse
         })
+        
+        print(f"  RMSE without {regressor}: {rmse_temp:.4f}, ΔRMSE: {delta_rmse:.4f}")
+        
+    except Exception as e:
+        print(f"  Error evaluating without {regressor}: {e}")
 
 if len(impact_results) > 0:
     impact_df = pd.DataFrame(impact_results).sort_values('ΔnRMSE', ascending=False)
