@@ -10,19 +10,19 @@ import multiprocessing
 
 # ---------- STEP 1: Helper functions ----------
 
-def preprocess(df):
+def preprocess(df, value_col, reg1_col, reg2_col):
     df = df.copy()
     df['Date'] = pd.to_datetime(df['Date'])
     df = df.sort_values('Date').reset_index(drop=True)
     df['Month'] = df['Date'].dt.month
     return df
 
-def deseasonalize_and_detrend(df, period=12):
+def deseasonalize_and_detrend(df, value_col, period=12):
     df = df.copy()
-    decomposition = seasonal_decompose(df['Value'], period=period, model='additive', extrapolate_trend='freq')
+    decomposition = seasonal_decompose(df[value_col], period=period, model='additive', extrapolate_trend='freq')
     df['trend'] = decomposition.trend
     df['seasonal'] = decomposition.seasonal
-    df['resid'] = df['Value'] - df['trend'] - df['seasonal']
+    df['resid'] = df[value_col] - df['trend'] - df['seasonal']
     df['trend'].fillna(method='bfill', inplace=True)
     df['trend'].fillna(method='ffill', inplace=True)
     df['resid'].fillna(0, inplace=True)
@@ -34,8 +34,8 @@ def add_lag_features(df, target_col='resid', lags=[1,2,3]):
         df[f'lag_{lag}'] = df[target_col].shift(lag)
     return df.dropna()
 
-def train_knn_on_resid(df, regressors=['R1','R2'], lags=[1,2,3], n_neighbors=5):
-    features = regressors + [f'lag_{l}' for l in lags]
+def train_knn_on_resid(df, reg1_col, reg2_col, lags=[1,2,3], n_neighbors=5):
+    features = [reg1_col, reg2_col] + [f'lag_{l}' for l in lags]
     X = df[features]
     y = df['resid']
     scaler = StandardScaler()
@@ -44,15 +44,15 @@ def train_knn_on_resid(df, regressors=['R1','R2'], lags=[1,2,3], n_neighbors=5):
     model.fit(X_scaled, y)
     return model, scaler, features
 
-def forecast_one_month(df, model, scaler, features, lags=[1,2,3]):
+def forecast_one_month(df, model, scaler, features, reg1_col, reg2_col, value_col, lags=[1,2,3]):
     last_date = df['Date'].max()
     next_date = (last_date + pd.offsets.MonthEnd(1))
 
     new_row = {
         'Date': next_date,
         'Month': next_date.month,
-        'R1': df['R1'].iloc[-1],
-        'R2': df['R2'].iloc[-1],
+        reg1_col: df[reg1_col].iloc[-1],
+        reg2_col: df[reg2_col].iloc[-1],
     }
     for lag in lags:
         new_row[f'lag_{lag}'] = df['resid'].iloc[-lag]
@@ -72,9 +72,9 @@ def forecast_one_month(df, model, scaler, features, lags=[1,2,3]):
     forecast_value = pred_resid + month_seasonal + future_trend
     return next_date, forecast_value
 
-# ---------- STEP 2: Backtest worker (per neighbor candidate) ----------
+# ---------- STEP 2: Backtest worker ----------
 
-def backtest_for_k(df, k, backtest_horizon=3, lags=[1,2,3]):
+def backtest_for_k(df, k, backtest_horizon, reg1_col, reg2_col, value_col, lags):
     max_index = len(df) - 1
     preds, actuals, dates = [], [], []
     backtest_records = []
@@ -86,14 +86,16 @@ def backtest_for_k(df, k, backtest_horizon=3, lags=[1,2,3]):
         if len(df_train) < max(lags)+1:
             continue
 
-        model, scaler, features = train_knn_on_resid(df_train, n_neighbors=k, lags=lags)
-        forecast_date, forecast_value = forecast_one_month(df_train, model, scaler, features, lags=lags)
+        model, scaler, features = train_knn_on_resid(df_train, reg1_col, reg2_col, lags=lags, n_neighbors=k)
+        forecast_date, forecast_value = forecast_one_month(
+            df_train, model, scaler, features, reg1_col, reg2_col, value_col, lags
+        )
 
         actual_row = df[df['Date'] == forecast_date]
         if actual_row.empty:
             continue
 
-        actual_value = actual_row['Value'].values[0]
+        actual_value = actual_row[value_col].values[0]
         preds.append(forecast_value)
         actuals.append(actual_value)
         dates.append(forecast_date)
@@ -110,15 +112,17 @@ def backtest_for_k(df, k, backtest_horizon=3, lags=[1,2,3]):
 
 # ---------- STEP 3: Parallelized backtest & final model ----------
 
-def knn_csd_backtest_parallel(df, backtest_horizon=3, neighbor_candidates=range(2,16), lags=[1,2,3]):
-    df = preprocess(df)
-    df = deseasonalize_and_detrend(df)
+def knn_csd_backtest_parallel(df, value_col='Value', reg1_col='R1', reg2_col='R2',
+                              backtest_horizon=3, neighbor_candidates=range(2,16), lags=[1,2,3]):
+    df = preprocess(df, value_col, reg1_col, reg2_col)
+    df = deseasonalize_and_detrend(df, value_col)
     df = add_lag_features(df, 'resid', lags=lags)
 
     n_jobs = min(len(neighbor_candidates), multiprocessing.cpu_count())
 
     results = Parallel(n_jobs=n_jobs)(
-        delayed(backtest_for_k)(df, k, backtest_horizon, lags) for k in neighbor_candidates
+        delayed(backtest_for_k)(df, k, backtest_horizon, reg1_col, reg2_col, value_col, lags) 
+        for k in neighbor_candidates
     )
 
     backtest_dfs = []
@@ -132,7 +136,9 @@ def knn_csd_backtest_parallel(df, backtest_horizon=3, neighbor_candidates=range(
 
     best_k = rmse_summary.iloc[0]['n_neighbors'] if not rmse_summary.empty else None
 
-    final_model, final_scaler, final_features = train_knn_on_resid(df, n_neighbors=best_k, lags=lags)
+    final_model, final_scaler, final_features = train_knn_on_resid(
+        df, reg1_col, reg2_col, lags=lags, n_neighbors=best_k
+    )
 
     final_artifacts = {
         'model': final_model,
@@ -140,7 +146,10 @@ def knn_csd_backtest_parallel(df, backtest_horizon=3, neighbor_candidates=range(
         'features': final_features,
         'lags': lags,
         'best_k': best_k,
-        'deseasonalized_df': df
+        'deseasonalized_df': df,
+        'value_col': value_col,
+        'reg1_col': reg1_col,
+        'reg2_col': reg2_col
     }
 
     return backtest_df, rmse_summary, final_artifacts
@@ -152,8 +161,11 @@ def forecast_future_months(final_artifacts, n_periods=3, future_regressors=None)
     scaler = final_artifacts['scaler']
     features = final_artifacts['features']
     lags = final_artifacts['lags']
-    df_forecast = final_artifacts['deseasonalized_df'].copy()
+    value_col = final_artifacts['value_col']
+    reg1_col = final_artifacts['reg1_col']
+    reg2_col = final_artifacts['reg2_col']
 
+    df_forecast = final_artifacts['deseasonalized_df'].copy()
     forecast_records = []
 
     for step in range(1, n_periods + 1):
@@ -163,20 +175,20 @@ def forecast_future_months(final_artifacts, n_periods=3, future_regressors=None)
         if future_regressors is not None:
             match = future_regressors[future_regressors['Date'] == next_date]
             if not match.empty:
-                r1_val = match['R1'].values[0]
-                r2_val = match['R2'].values[0]
+                r1_val = match[reg1_col].values[0]
+                r2_val = match[reg2_col].values[0]
             else:
-                r1_val = df_forecast['R1'].iloc[-1]
-                r2_val = df_forecast['R2'].iloc[-1]
+                r1_val = df_forecast[reg1_col].iloc[-1]
+                r2_val = df_forecast[reg2_col].iloc[-1]
         else:
-            r1_val = df_forecast['R1'].iloc[-1]
-            r2_val = df_forecast['R2'].iloc[-1]
+            r1_val = df_forecast[reg1_col].iloc[-1]
+            r2_val = df_forecast[reg2_col].iloc[-1]
 
         new_row = {
             'Date': next_date,
             'Month': next_date.month,
-            'R1': r1_val,
-            'R2': r2_val,
+            reg1_col: r1_val,
+            reg2_col: r2_val,
         }
         for lag in lags:
             new_row[f'lag_{lag}'] = df_forecast['resid'].iloc[-lag]
@@ -205,9 +217,9 @@ def forecast_future_months(final_artifacts, n_periods=3, future_regressors=None)
 
         new_append = {
             'Date': next_date,
-            'Value': forecast_value,
-            'R1': r1_val,
-            'R2': r2_val,
+            value_col: forecast_value,
+            reg1_col: r1_val,
+            reg2_col: r2_val,
             'resid': pred_resid,
             'seasonal': month_seasonal,
             'trend': future_trend,
@@ -222,6 +234,9 @@ def forecast_future_months(final_artifacts, n_periods=3, future_regressors=None)
 # df = pd.read_csv("your_timeseries.csv")
 # backtest_df, rmse_summary, final_artifacts = knn_csd_backtest_parallel(
 #     df,
+#     value_col='Value',
+#     reg1_col='R1',
+#     reg2_col='R2',
 #     backtest_horizon=6,
 #     neighbor_candidates=range(2,21),
 #     lags=[1,2,3]
