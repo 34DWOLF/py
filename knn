@@ -170,14 +170,21 @@ class KNNTimeSeriesForecaster:
         for h in range(self.forecast_horizon):
             # Create features for current step
             features_df = self._create_features(current_df, include_lags=True)
-            X_pred = features_df.iloc[[-1]][self.feature_cols]
+            
+            # Get the last valid row (most recent with all features)
+            valid_features = features_df.dropna()
+            if len(valid_features) == 0:
+                raise ValueError("Not enough historical data to create features for prediction")
+            
+            X_pred = valid_features.iloc[[-1]][self.feature_cols].copy()
             
             # Get future regressor values from the full dataset
             future_idx = last_historical_idx + h + 1
             if future_idx < len(df_full):
                 for reg_col in self.regressor_cols:
-                    if f'reg_{reg_col}' in X_pred.columns and reg_col in df_full.columns:
-                        X_pred[f'reg_{reg_col}'] = df_full.iloc[future_idx][reg_col]
+                    reg_feature_col = f'reg_{reg_col}'
+                    if reg_feature_col in X_pred.columns and reg_col in df_full.columns:
+                        X_pred.loc[:, reg_feature_col] = df_full.iloc[future_idx][reg_col]
             
             # Scale and predict residual
             X_pred_scaled = self.scaler.transform(X_pred)
@@ -192,14 +199,14 @@ class KNNTimeSeriesForecaster:
             predictions.append(final_pred)
             
             # Update dataframe with prediction for next iteration
-            future_idx = last_historical_idx + h + 1
+            new_date = pd.to_datetime(current_df[self.date_col].iloc[-1]) + pd.DateOffset(months=1)
+            new_row = {self.date_col: new_date, self.target_col: final_pred}
+            
+            # Add regressor values from future dataset if available
             if future_idx < len(df_full):
-                new_row = df_full.iloc[future_idx].copy()
-                new_row[self.target_col] = final_pred
-            else:
-                # If no future data available, create new row
-                new_date = pd.to_datetime(current_df[self.date_col].iloc[-1]) + pd.DateOffset(months=1)
-                new_row = {self.date_col: new_date, self.target_col: final_pred}
+                for reg_col in self.regressor_cols:
+                    if reg_col in df_full.columns:
+                        new_row[reg_col] = df_full.iloc[future_idx][reg_col]
             
             current_df = pd.concat([current_df, pd.DataFrame([new_row])], ignore_index=True)
         
