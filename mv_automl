@@ -59,12 +59,31 @@ print(f"\n=== Best Model: {type(best_model).__name__} ===")
 # Finalize model on full data
 final_model = exp.finalize_model(best_model)
 
-# Make predictions
-predictions_holdout = exp.predict_model(final_model)
-predictions_future = exp.predict_model(final_model, fh=FORECAST_HORIZON)
+# Create future exogenous data (you need to provide future values for regressors)
+# Option 1: Use last known values (forward fill)
+last_values = df[REGRESSORS].iloc[-1:]
+future_exog = pd.concat([last_values] * FORECAST_HORIZON, ignore_index=True)
+future_index = pd.date_range(start=df.index[-1] + pd.Timedelta(days=1), periods=FORECAST_HORIZON, freq='D')
+future_exog.index = future_index
 
-print("\n=== Future Predictions ===")
-print(predictions_future)
+# Option 2: If you have actual future regressor values, load them here
+# future_exog = pd.read_csv('future_regressors.csv', index_col='Date', parse_dates=True)
+
+# Make predictions
+try:
+    predictions_holdout = exp.predict_model(final_model)
+    print("\n=== Holdout Predictions ===")
+    print(predictions_holdout)
+except Exception as e:
+    print(f"Holdout prediction skipped: {e}")
+
+try:
+    predictions_future = exp.predict_model(final_model, fh=FORECAST_HORIZON, X=future_exog)
+    print("\n=== Future Predictions ===")
+    print(predictions_future)
+except Exception as e:
+    print(f"Future prediction error: {e}")
+    print("Note: You need to provide future values for exogenous regressors")
 
 # Feature Importance - Model-based
 print("\n=== Model-Based Feature Importance ===")
