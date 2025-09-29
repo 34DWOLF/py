@@ -11,6 +11,7 @@ warnings.filterwarnings('ignore')
 class KNNTimeSeriesForecaster:
     """
     K-Nearest Neighbors forecaster with conditional deseasonalization and detrending.
+    Automatically tunes n_neighbors and seasonal_period based on backtest performance.
     """
     
     def __init__(
@@ -18,10 +19,11 @@ class KNNTimeSeriesForecaster:
         date_col: str = 'date',
         target_col: str = 'value',
         regressor_cols: List[str] = None,
-        n_neighbors: int = 5,
-        seasonal_period: int = 12,
+        n_neighbors: int = None,
+        seasonal_period: int = None,
         forecast_horizon: int = 1,
-        backtest_months: int = 6
+        backtest_months: int = 6,
+        auto_tune: bool = True
     ):
         """
         Initialize the KNN Time Series Forecaster.
@@ -35,13 +37,15 @@ class KNNTimeSeriesForecaster:
         regressor_cols : List[str]
             List of regressor column names
         n_neighbors : int
-            Number of neighbors for KNN
+            Number of neighbors for KNN. If None and auto_tune=True, will be optimized
         seasonal_period : int
-            Seasonal period for decomposition (12 for monthly data)
+            Seasonal period for decomposition. If None and auto_tune=True, will be optimized
         forecast_horizon : int
             Number of periods to forecast
         backtest_months : int
             Number of months to use for backtesting
+        auto_tune : bool
+            If True, automatically tune n_neighbors and seasonal_period
         """
         self.date_col = date_col
         self.target_col = target_col
@@ -50,13 +54,15 @@ class KNNTimeSeriesForecaster:
         self.seasonal_period = seasonal_period
         self.forecast_horizon = forecast_horizon
         self.backtest_months = backtest_months
+        self.auto_tune = auto_tune
         
         self.scaler = StandardScaler()
         self.trend = None
         self.seasonal = None
         self.model = None
+        self.best_params = None
         
-    def _detrend_deseasonalize(self, series: pd.Series) -> Tuple[pd.Series, pd.Series, pd.Series]:
+    def _detrend_deseasonalize(self, series: pd.Series, seasonal_period: int) -> Tuple[pd.Series, pd.Series, pd.Series]:
         """
         Decompose time series into trend, seasonal, and residual components.
         
@@ -64,7 +70,7 @@ class KNNTimeSeriesForecaster:
         --------
         trend, seasonal, residual
         """
-        if len(series) < 2 * self.seasonal_period:
+        if len(series) < 2 * seasonal_period:
             # If not enough data for decomposition, return original series
             trend = pd.Series(np.linspace(series.iloc[0], series.iloc[-1], len(series)), index=series.index)
             seasonal = pd.Series(0, index=series.index)
@@ -74,7 +80,7 @@ class KNNTimeSeriesForecaster:
         decomposition = seasonal_decompose(
             series, 
             model='additive', 
-            period=self.seasonal_period,
+            period=seasonal_period,
             extrapolate_trend='freq'
         )
         
@@ -102,18 +108,20 @@ class KNNTimeSeriesForecaster:
         
         return features
     
-    def fit(self, df: pd.DataFrame) -> 'KNNTimeSeriesForecaster':
+    def _fit_model(self, df: pd.DataFrame, n_neighbors: int, seasonal_period: int) -> None:
         """
-        Fit the KNN model with detrending and deseasonalization.
+        Internal method to fit the model with specific parameters.
         """
         df = df.sort_values(self.date_col).reset_index(drop=True)
         
         # Decompose the time series
-        self.trend, self.seasonal, residual = self._detrend_deseasonalize(df[self.target_col])
+        self.trend, self.seasonal, residual = self._detrend_deseasonalize(
+            df[self.target_col], seasonal_period
+        )
         
         # Store the last values for forecasting
         self.last_trend_value = self.trend.iloc[-1]
-        self.last_seasonal_pattern = self.seasonal.tail(self.seasonal_period).values
+        self.last_seasonal_pattern = self.seasonal.tail(seasonal_period).values
         
         # Create features
         features_df = self._create_features(df, include_lags=True)
@@ -136,38 +144,154 @@ class KNNTimeSeriesForecaster:
         X_train_scaled = self.scaler.fit_transform(X_train)
         
         # Fit KNN model on residuals
-        self.model = KNeighborsRegressor(n_neighbors=self.n_neighbors)
+        self.model = KNeighborsRegressor(n_neighbors=n_neighbors)
         self.model.fit(X_train_scaled, y_train)
         
         self.feature_cols = feature_cols
         self.fitted_df = df.copy()
+        self.current_n_neighbors = n_neighbors
+        self.current_seasonal_period = seasonal_period
+    
+    def fit(self, df: pd.DataFrame) -> 'KNNTimeSeriesForecaster':
+        """
+        Fit the KNN model with detrending and deseasonalization.
+        If auto_tune=True and parameters not specified, finds optimal parameters.
+        """
+        df = df.sort_values(self.date_col).reset_index(drop=True)
+        
+        # Determine parameters to use
+        if self.auto_tune and (self.n_neighbors is None or self.seasonal_period is None):
+            print("Auto-tuning parameters...")
+            self.best_params = self._tune_parameters(df)
+            n_neighbors = self.best_params['n_neighbors']
+            seasonal_period = self.best_params['seasonal_period']
+            print(f"Best parameters: n_neighbors={n_neighbors}, seasonal_period={seasonal_period}")
+            print(f"Best MAE: {self.best_params['mae']:.2f}")
+        else:
+            n_neighbors = self.n_neighbors or 5
+            seasonal_period = self.seasonal_period or 12
+        
+        # Fit with optimal or specified parameters
+        self._fit_model(df, n_neighbors, seasonal_period)
         
         return self
     
-    def predict(self, df_full: pd.DataFrame) -> np.ndarray:
+    def _tune_parameters(self, df: pd.DataFrame) -> Dict:
         """
-        Make predictions for the forecast horizon.
+        Find optimal n_neighbors and seasonal_period through grid search on backtest.
+        """
+        # Define parameter grid
+        if self.n_neighbors is None:
+            n_neighbors_grid = [3, 5, 7, 10, 15]
+        else:
+            n_neighbors_grid = [self.n_neighbors]
+        
+        if self.seasonal_period is None:
+            seasonal_period_grid = [4, 6, 12]  # Quarterly, semi-annual, annual
+        else:
+            seasonal_period_grid = [self.seasonal_period]
+        
+        best_mae = float('inf')
+        best_params = {'n_neighbors': 5, 'seasonal_period': 12, 'mae': best_mae}
+        
+        # Grid search
+        for n_neighbors in n_neighbors_grid:
+            for seasonal_period in seasonal_period_grid:
+                try:
+                    # Run backtest with these parameters
+                    results = self._backtest_with_params(df, n_neighbors, seasonal_period)
+                    mae = results['mae']
+                    
+                    if mae < best_mae:
+                        best_mae = mae
+                        best_params = {
+                            'n_neighbors': n_neighbors,
+                            'seasonal_period': seasonal_period,
+                            'mae': mae,
+                            'rmse': results['rmse'],
+                            'mape': results['mape']
+                        }
+                except Exception as e:
+                    # Skip parameter combinations that fail
+                    continue
+        
+        return best_params
+    
+    def _backtest_with_params(self, df: pd.DataFrame, n_neighbors: int, seasonal_period: int) -> Dict:
+        """
+        Perform backtest with specific parameters.
+        """
+        df = df.sort_values(self.date_col).reset_index(drop=True)
+        
+        backtest_results = []
+        
+        # Start backtest from (total_length - backtest_months)
+        train_end_idx = len(df) - self.backtest_months
+        
+        if train_end_idx < 2 * seasonal_period:
+            raise ValueError("Not enough data for backtest with this seasonal period")
+        
+        for i in range(self.backtest_months):
+            # Split data
+            train_df = df.iloc[:train_end_idx + i]
+            test_idx = train_end_idx + i
+            
+            if test_idx >= len(df):
+                break
+            
+            actual_value = df.iloc[test_idx][self.target_col]
+            
+            # Fit model on training data
+            self._fit_model(train_df, n_neighbors, seasonal_period)
+            
+            # Predict (only need 1-step ahead for backtest)
+            # Create future regressor data if needed
+            future_regressors = {}
+            for reg_col in self.regressor_cols:
+                if reg_col in df.columns:
+                    future_regressors[reg_col] = [df.iloc[test_idx][reg_col]]
+            
+            prediction = self._predict_internal(train_df, future_regressors, horizon=1)[0]
+            
+            backtest_results.append({
+                'actual': actual_value,
+                'predicted': prediction,
+                'error': actual_value - prediction,
+                'abs_error': abs(actual_value - prediction),
+                'pct_error': 100 * (actual_value - prediction) / actual_value if actual_value != 0 else np.nan
+            })
+        
+        results_df = pd.DataFrame(backtest_results)
+        
+        # Calculate metrics
+        mae = results_df['abs_error'].mean()
+        rmse = np.sqrt((results_df['error'] ** 2).mean())
+        mape = results_df['pct_error'].abs().mean()
+        
+        return {
+            'results_df': results_df,
+            'mae': mae,
+            'rmse': rmse,
+            'mape': mape
+        }
+    
+    def _predict_internal(self, df_historical: pd.DataFrame, future_regressors: Dict, horizon: int) -> np.ndarray:
+        """
+        Internal prediction method.
         
         Parameters:
         -----------
-        df_full : pd.DataFrame
-            Full dataset including historical data AND future periods with regressor values.
-            The last `forecast_horizon` rows should contain the future regressor values.
-        
-        Returns:
-        --------
-        predictions : np.ndarray
-            Forecasted values
+        df_historical : pd.DataFrame
+            Historical data only (no future rows)
+        future_regressors : Dict
+            Dictionary with regressor names as keys and lists of future values
+        horizon : int
+            Number of periods to forecast
         """
-        df_full = df_full.copy()
-        
-        # Identify where historical data ends (last row with target value)
-        last_historical_idx = df_full[self.target_col].last_valid_index()
-        
         predictions = []
-        current_df = df_full.iloc[:last_historical_idx + 1].copy()
+        current_df = df_historical.copy()
         
-        for h in range(self.forecast_horizon):
+        for h in range(horizon):
             # Create features for current step
             features_df = self._create_features(current_df, include_lags=True)
             
@@ -178,13 +302,12 @@ class KNNTimeSeriesForecaster:
             
             X_pred = valid_features.iloc[[-1]][self.feature_cols].copy()
             
-            # Get future regressor values from the full dataset
-            future_idx = last_historical_idx + h + 1
-            if future_idx < len(df_full):
-                for reg_col in self.regressor_cols:
-                    reg_feature_col = f'reg_{reg_col}'
-                    if reg_feature_col in X_pred.columns and reg_col in df_full.columns:
-                        X_pred.loc[:, reg_feature_col] = df_full.iloc[future_idx][reg_col]
+            # Update with future regressor values
+            for reg_col in self.regressor_cols:
+                reg_feature_col = f'reg_{reg_col}'
+                if reg_feature_col in X_pred.columns and reg_col in future_regressors:
+                    if h < len(future_regressors[reg_col]):
+                        X_pred.loc[:, reg_feature_col] = future_regressors[reg_col][h]
             
             # Scale and predict residual
             X_pred_scaled = self.scaler.transform(X_pred)
@@ -192,7 +315,7 @@ class KNNTimeSeriesForecaster:
             
             # Reconstruct: add trend and seasonal components
             trend_pred = self.last_trend_value + (h + 1) * (self.trend.iloc[-1] - self.trend.iloc[-2])
-            seasonal_idx = (len(self.seasonal) + h) % self.seasonal_period
+            seasonal_idx = (len(self.seasonal) + h) % self.current_seasonal_period
             seasonal_pred = self.last_seasonal_pattern[seasonal_idx]
             
             final_pred = trend_pred + seasonal_pred + residual_pred
@@ -202,19 +325,41 @@ class KNNTimeSeriesForecaster:
             new_date = pd.to_datetime(current_df[self.date_col].iloc[-1]) + pd.DateOffset(months=1)
             new_row = {self.date_col: new_date, self.target_col: final_pred}
             
-            # Add regressor values from future dataset if available
-            if future_idx < len(df_full):
-                for reg_col in self.regressor_cols:
-                    if reg_col in df_full.columns:
-                        new_row[reg_col] = df_full.iloc[future_idx][reg_col]
+            # Add regressor values
+            for reg_col in self.regressor_cols:
+                if reg_col in future_regressors and h < len(future_regressors[reg_col]):
+                    new_row[reg_col] = future_regressors[reg_col][h]
             
             current_df = pd.concat([current_df, pd.DataFrame([new_row])], ignore_index=True)
         
         return np.array(predictions)
     
+    def predict(self, df: pd.DataFrame, future_regressors: Dict = None) -> np.ndarray:
+        """
+        Make predictions for the forecast horizon.
+        
+        Parameters:
+        -----------
+        df : pd.DataFrame
+            Historical data only (no future rows with NaN values)
+        future_regressors : Dict, optional
+            Dictionary with regressor names as keys and lists of future values
+            Example: {'economic_indicator': [52.3, 53.1, 54.2], 'market_index': [215.7, 220.5, 225.3]}
+        
+        Returns:
+        --------
+        predictions : np.ndarray
+            Forecasted values
+        """
+        if future_regressors is None:
+            future_regressors = {}
+        
+        return self._predict_internal(df, future_regressors, self.forecast_horizon)
+    
     def backtest(self, df: pd.DataFrame) -> Dict:
         """
         Perform iterative backtest over the specified number of months.
+        Uses the fitted model's parameters (or tunes if not yet fitted).
         
         Returns:
         --------
@@ -222,6 +367,10 @@ class KNNTimeSeriesForecaster:
             Dictionary containing backtest results and metrics
         """
         df = df.sort_values(self.date_col).reset_index(drop=True)
+        
+        # Use current parameters or defaults
+        n_neighbors = self.current_n_neighbors if hasattr(self, 'current_n_neighbors') else (self.n_neighbors or 5)
+        seasonal_period = self.current_seasonal_period if hasattr(self, 'current_seasonal_period') else (self.seasonal_period or 12)
         
         backtest_results = []
         
@@ -240,16 +389,16 @@ class KNNTimeSeriesForecaster:
             actual_date = df.iloc[test_idx][self.date_col]
             
             # Fit model on training data
-            self.fit(train_df)
+            self._fit_model(train_df, n_neighbors, seasonal_period)
             
-            # Create extended dataframe with future regressors for prediction
-            test_df_with_regressors = pd.concat([
-                train_df,
-                df.iloc[test_idx:test_idx + self.forecast_horizon][[self.date_col] + self.regressor_cols]
-            ], ignore_index=True)
+            # Create future regressor data
+            future_regressors = {}
+            for reg_col in self.regressor_cols:
+                if reg_col in df.columns:
+                    future_regressors[reg_col] = [df.iloc[test_idx][reg_col]]
             
             # Predict
-            prediction = self.predict(test_df_with_regressors)[0]
+            prediction = self._predict_internal(train_df, future_regressors, horizon=1)[0]
             
             backtest_results.append({
                 'date': actual_date,
@@ -277,9 +426,9 @@ class KNNTimeSeriesForecaster:
 
 # Example usage
 if __name__ == "__main__":
-    # Create sample data
+    # Create sample data - ONLY HISTORICAL DATA (no future rows)
     np.random.seed(42)
-    dates = pd.date_range(start='2020-01-31', periods=51, freq='ME')  # 48 historical + 3 future
+    dates = pd.date_range(start='2020-01-31', periods=48, freq='ME')
     
     # Generate synthetic time series with trend, seasonality, and noise
     trend = np.linspace(100, 150, 48)
@@ -287,33 +436,39 @@ if __name__ == "__main__":
     noise = np.random.normal(0, 5, 48)
     values = trend + seasonal + noise
     
-    # Generate synthetic regressors for ALL periods (including future)
-    regressor1 = np.random.normal(50, 10, 51)
-    regressor2 = np.random.normal(200, 30, 51)
+    # Generate synthetic regressors (historical only)
+    regressor1 = np.random.normal(50, 10, 48)
+    regressor2 = np.random.normal(200, 30, 48)
     
-    # Create dataframe with historical values and future regressors
     df = pd.DataFrame({
         'date': dates,
-        'value': list(values) + [np.nan] * 3,  # Last 3 are unknown (to be forecasted)
+        'value': values,
         'economic_indicator': regressor1,
         'market_index': regressor2
     })
     
-    # Initialize forecaster
+    print("Dataset shape:", df.shape)
+    print("Last few rows:")
+    print(df.tail())
+    
+    # Initialize forecaster with auto-tuning
     forecaster = KNNTimeSeriesForecaster(
         date_col='date',
         target_col='value',
         regressor_cols=['economic_indicator', 'market_index'],
-        n_neighbors=5,
-        seasonal_period=12,
         forecast_horizon=3,
-        backtest_months=6
+        backtest_months=6,
+        auto_tune=True  # Will automatically find best n_neighbors and seasonal_period
     )
     
-    # Run backtest (only on historical data)
-    print("Running backtest...")
-    df_historical = df[df['value'].notna()].copy()
-    backtest_results = forecaster.backtest(df_historical)
+    # Fit the model (will auto-tune parameters)
+    print("\n" + "="*60)
+    forecaster.fit(df)
+    
+    # Run backtest with the tuned parameters
+    print("\n" + "="*60)
+    print("Running backtest with optimal parameters...")
+    backtest_results = forecaster.backtest(df)
     
     print("\n=== BACKTEST RESULTS ===")
     print(f"MAE: {backtest_results['mae']:.2f}")
@@ -322,15 +477,20 @@ if __name__ == "__main__":
     print("\nDetailed Results:")
     print(backtest_results['results_df'].to_string(index=False))
     
-    # Fit on full historical data and forecast
-    print("\n=== FINAL FORECAST ===")
-    forecaster.fit(df_historical)
+    # Make future predictions
+    print("\n" + "="*60)
+    print("=== FINAL FORECAST ===")
     
-    # The future regressor values are already in the full dataset
-    # Just pass the complete dataset (historical + future rows with regressors)
-    predictions = forecaster.predict(df)
+    # Provide future regressor values (you need to know or estimate these)
+    future_regressors = {
+        'economic_indicator': [52.5, 53.2, 54.1],  # Your forecasted/planned values
+        'market_index': [218.0, 222.5, 225.0]
+    }
+    
+    predictions = forecaster.predict(df, future_regressors)
     
     print(f"Next {forecaster.forecast_horizon} period forecasts:")
+    last_date = pd.to_datetime(df[forecaster.date_col].iloc[-1])
     for i, pred in enumerate(predictions, 1):
-        forecast_date = df[df['value'].isna()].iloc[i-1]['date']
+        forecast_date = last_date + pd.DateOffset(months=i)
         print(f"  Period {i} ({forecast_date.strftime('%Y-%m-%d')}): {pred:.2f}")
