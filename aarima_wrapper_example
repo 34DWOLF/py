@@ -1,113 +1,311 @@
 import pandas as pd
 import numpy as np
-from pmdarima.arima import auto_arima
-from statsmodels.tsa.stattools import adfuller, kpss
-from dateutil.relativedelta import relativedelta
+from sklearn.metrics import mean_squared_error
+from sklearn.linear_model import LinearRegression
+from math import sqrt
+import pmdarima as pm
 from joblib import Parallel, delayed
-import sys
+import warnings
+warnings.filterwarnings("ignore")
 
-# -------------------
-# Helper functions
-# -------------------
 
-def check_stationarity(series):
-    """Check stationarity with ADF, fallback to KPSS if needed."""
-    try:
-        adf_result = adfuller(series.dropna(), autolag="AIC")
-        return adf_result[1] < 0.05  # stationary if p < 0.05
-    except Exception:
+# -----------------------
+# Helpers: rolling CV splits + RMSE
+# -----------------------
+def _cv_splits(n, folds=3, min_train=24, step=1):
+    ends = []
+    train_end = min_train
+    while len(ends) < folds and (train_end + step) <= n:
+        ends.append((train_end, train_end + step))
+        train_end += step
+    return ends
+
+def _rmse(y_true, y_pred):
+    return float(np.sqrt(mean_squared_error(y_true, y_pred)))
+
+
+# -----------------------
+# Linear Regression Forecast
+# -----------------------
+def _linear_regression_forecast(series, horizon):
+    """
+    Fit a simple linear regression on time index and extrapolate.
+    """
+    y = np.asarray(series, dtype=float)
+    n = len(y)
+    if n < 3:  # not enough points
+        return np.full(horizon, np.nan)
+
+    t = np.arange(n).reshape(-1, 1)
+    model = LinearRegression()
+    model.fit(t, y)
+    t_future = np.arange(n, n + horizon).reshape(-1, 1)
+    y_future = model.predict(t_future)
+    return y_future
+
+
+# -----------------------
+# Score one seasonal period m (ARIMA)
+# -----------------------
+def _score_one_m(series, m, folds=3, min_train=24, step=1, arima_kwargs=None):
+    y = pd.Series(series).astype(float).values
+    n = len(y)
+    if n < max(min_train, 10):
+        return np.inf, None, None
+
+    splits = _cv_splits(n, folds=folds, min_train=min_train, step=step)
+    if not splits:
+        return np.inf, None, None
+
+    rmses = []
+    orders_for_last = (None, None)
+
+    for i, (tr_end, te_end) in enumerate(splits):
+        y_tr, y_te = y[:tr_end], y[tr_end:te_end]
         try:
-            kpss_result = kpss(series.dropna(), regression="c", nlags="auto")
-            return kpss_result[1] > 0.05  # stationary if p > 0.05
+            model = pm.auto_arima(
+                y_tr,
+                seasonal=(m > 1),
+                m=m,
+                suppress_warnings=True,
+                error_action="ignore",
+                **(arima_kwargs or {})
+            )
+            fc = model.predict(n_periods=len(y_te))
+            rmses.append(_rmse(y_te, fc))
+            if i == len(splits) - 1:
+                orders_for_last = (model.order, getattr(model, "seasonal_order_", (0,0,0,0)))
         except Exception:
-            return None  # Inconclusive
+            return np.inf, None, None
 
-def moving_average_forecast(series, horizon=6, window=3):
-    """Simple moving average fallback forecast."""
-    if len(series) < window:
-        avg = series.mean() if len(series) > 0 else 0
-        return np.repeat(avg, horizon), "Average", None, None
-    avg = series.rolling(window).mean().iloc[-1]
-    return np.repeat(avg, horizon), "Moving Average", None, None
+    return float(np.mean(rmses)), orders_for_last[0], orders_for_last[1]
 
-def forecast_one_category(cat, group, forecast_horizon):
-    """Forecast for a single category with strong fallbacks + logging."""
-    series = group.sort_values("Date").set_index("Date")["Value"]
 
-    # enforce monthly frequency
-    series = series.asfreq("MS")
+# -----------------------
+# Fit with model comparison (ARIMA, SMA, LR)
+# -----------------------
+def fit_forecast_selecting_model(series,
+                                 horizon,
+                                 window=3,
+                                 m_grid=range(1, 25),
+                                 cv_folds=3,
+                                 min_train=24,
+                                 step=1,
+                                 n_jobs_m=1,
+                                 arima_kwargs=None):
+    """
+    Compare ARIMA (best m), SMA, and Linear Regression.
+    Pick the model with lowest CV RMSE.
+    """
+    s = pd.Series(series).astype(float)
+    n = len(s)
 
-    # Drop NaNs introduced by asfreq
-    series = series.dropna()
+    if (s != 0).sum() < 3 or n < 5:
+        # too sparse, just SMA fallback
+        sma = np.full(horizon, s.rolling(window, min_periods=1).mean().iloc[-1])
+        return sma, "SMA", None, None, None
 
-    # Handle empty series
-    if len(series) == 0:
-        print(f"Skipping {cat} – no data after resampling", flush=True)
-        return pd.DataFrame({
-            "Category": [cat] * forecast_horizon,
-            "Forecast Date": [pd.NaT] * forecast_horizon,
-            "Forecast Value": [np.nan] * forecast_horizon,
-            "Forecast Method": ["No Data"] * forecast_horizon,
-            "ARIMA Order": [None] * forecast_horizon,
-            "Seasonal Order": [None] * forecast_horizon
-        })
+    # --- 1. SMA ---
+    sma_fc = np.full(horizon, s.rolling(window, min_periods=1).mean().iloc[-1])
+    sma_rmse = _rmse(s[-min(12, n):], np.repeat(sma_fc[0], min(12, n)))  # simple trailing comparison
 
-    method_used = None
-    order, seasonal_order = None, None
+    # --- 2. Linear Regression ---
+    lr_fc = _linear_regression_forecast(s, horizon)
+    # backtest LR with simple CV
+    lr_rmse_vals = []
+    for tr_end, te_end in _cv_splits(n, folds=cv_folds, min_train=min_train, step=step):
+        y_tr, y_te = s[:tr_end], s[tr_end:te_end]
+        if len(y_te) == 0:
+            continue
+        fc = _linear_regression_forecast(y_tr, len(y_te))
+        if np.isnan(fc).any():
+            continue
+        lr_rmse_vals.append(_rmse(y_te, fc))
+    lr_rmse = np.mean(lr_rmse_vals) if lr_rmse_vals else np.inf
 
-    # If too few points, bail out early with simple average
-    if len(series) < 6:
-        avg = series.mean() if len(series) > 0 else 0
-        forecast = np.repeat(avg, forecast_horizon)
-        method_used = "Average"
-        print(f"{cat}: Not enough data ({len(series)} points) → using Average", flush=True)
-    else:
-        stationary = check_stationarity(series)
-
-        try:
-            if stationary is None:
-                model = auto_arima(series, d=1, seasonal=True, m=12,
-                                   error_action="ignore", suppress_warnings=True)
-            else:
-                model = auto_arima(series, seasonal=True, m=12,
-                                   test="adf" if stationary else "kpss",
-                                   error_action="ignore", suppress_warnings=True)
-
-            forecast = model.predict(n_periods=forecast_horizon)
-
-            if np.any(np.isnan(forecast)):
-                forecast, method_used, order, seasonal_order = moving_average_forecast(series, forecast_horizon)
-                print(f"{cat}: ARIMA returned NaN → fallback to {method_used}", flush=True)
-            else:
-                method_used = "ARIMA"
-                order = model.order
-                seasonal_order = model.seasonal_order
-                print(f"{cat}: Using ARIMA {order} seasonal={seasonal_order}", flush=True)
-
-        except Exception as e:
-            forecast, method_used, order, seasonal_order = moving_average_forecast(series, forecast_horizon)
-            print(f"{cat}: ARIMA failed ({e}) → fallback to {method_used}", flush=True)
-
-    forecast_dates = [series.index[-1] + relativedelta(months=i+1)
-                      for i in range(forecast_horizon)]
-
-    return pd.DataFrame({
-        "Category": cat,
-        "Forecast Date": forecast_dates,
-        "Forecast Value": forecast,
-        "Forecast Method": method_used,
-        "ARIMA Order": [order] * forecast_horizon,
-        "Seasonal Order": [seasonal_order] * forecast_horizon
-    })
-
-def robust_auto_forecast_parallel(df, forecast_horizon=6, n_jobs=-1):
-    """Run robust AutoARIMA across categories in parallel."""
-    df["Date"] = pd.to_datetime(df["Date"])
-    groups = [(cat, group) for cat, group in df.groupby("Category")]
-
-    results = Parallel(n_jobs=n_jobs)(
-        delayed(forecast_one_category)(cat, group, forecast_horizon)
-        for cat, group in groups
+    # --- 3. ARIMA best m ---
+    arima_results = Parallel(n_jobs=n_jobs_m)(
+        delayed(_score_one_m)(
+            s.values, m, folds=cv_folds, min_train=min_train, step=step, arima_kwargs=arima_kwargs
+        )
+        for m in m_grid
     )
+    best_idx = int(np.argmin([r[0] for r in arima_results]))
+    best_m = list(m_grid)[best_idx]
+    arima_rmse, order, seasonal_order = arima_results[best_idx]
 
-    return pd.concat(results, ignore_index=True)
+    # Pick winner
+    model_rmse = {"SMA": sma_rmse, "LR": lr_rmse, "ARIMA": arima_rmse}
+    best_method = min(model_rmse, key=model_rmse.get)
+
+    if best_method == "SMA":
+        return sma_fc, "SMA", None, None, None
+    elif best_method == "LR":
+        return lr_fc, "LR", None, None, None
+    else:
+        # refit ARIMA best m on full series
+        model = pm.auto_arima(
+            s.values,
+            seasonal=(best_m > 1),
+            m=best_m,
+            suppress_warnings=True,
+            error_action="ignore",
+            **(arima_kwargs or {})
+        )
+        fc = model.predict(n_periods=horizon)
+        return fc, "ARIMA", model.order, getattr(model, "seasonal_order_", (0,0,0,0)), best_m
+
+
+# -----------------------
+# Historical + Future Forecast with Reconciliation
+# -----------------------
+def forecast_with_reconciliation(df, horizon=6, train_size=0.8, window=3,
+                                 use_backtest_for_future=True, n_jobs=1,
+                                 freq="MS", m_grid=range(1,25),
+                                 selection_mode="multi"):
+    """
+    Hierarchical forecasts with ARIMA, SMA, LR and reconciliation.
+    """
+    # --- Prep ---
+    df['Month'] = pd.to_datetime(df['Month'])
+    wide_df = df.pivot(index='Month', columns='Category', values='Value').fillna(0)
+    wide_df['Total'] = wide_df.sum(axis=1)
+
+    n_train = int(len(wide_df) * train_size)
+    train, test = wide_df.iloc[:n_train], wide_df.iloc[n_train:]
+    h_test = len(test)
+    test_index = test.index
+
+    categories = train.drop(columns="Total").columns.tolist()
+    all_nodes = ["Total"] + categories
+
+    # --- Step 1: Fit base forecasts ---
+    results = Parallel(n_jobs=n_jobs)(
+        delayed(fit_forecast_selecting_model)(
+            train[node], max(h_test, horizon),
+            window=window, m_grid=m_grid,
+            cv_folds=3, min_train=24, step=1,
+            n_jobs_m=1,
+            arima_kwargs={"max_p":3, "max_q":3, "max_P":1, "max_Q":1}
+        )
+        for node in all_nodes
+    )
+    base_forecasts = {node: r[0] for node, r in zip(all_nodes, results)}
+    metadata = {node: {"Method": r[1], "Order": r[2], "SeasonalOrder": r[3], "m": r[4]} for node, r in zip(all_nodes, results)}
+
+    # --- Step 2: Reconciliation ---
+    n_cats = len(categories)
+    S = np.vstack([np.ones(n_cats), np.eye(n_cats)])
+    P = S @ np.linalg.inv(S.T @ S) @ S.T
+
+    def reconcile_step(y_hat): return P @ y_hat
+
+    reconciled = {node: [] for node in all_nodes}
+    for t in range(max(h_test, horizon)):
+        y_hat = np.array([base_forecasts["Total"][t]] + [base_forecasts[c][t] for c in categories])
+        y_rec = reconcile_step(y_hat)
+        for j, node in enumerate(all_nodes):
+            reconciled[node].append(y_rec[j])
+
+    # --- Step 3: Historical forecasts ---
+    hist_rows = []
+    for i, date in enumerate(test_index):
+        for node in all_nodes:
+            hist_rows.append({
+                "Category": node, "Date": date,
+                "Forecast": base_forecasts[node][i],
+                **metadata[node], "Approach": "Base"
+            })
+            hist_rows.append({
+                "Category": node, "Date": date,
+                "Forecast": reconciled[node][i],
+                **metadata[node], "Approach": "Reconciled"
+            })
+    historical_fc_df = pd.DataFrame(hist_rows)
+
+    # --- Step 4: Safe RMSE & Bias ---
+    def safe_rmse(g):
+        cat = g.name[1]
+        if cat not in test.columns:
+            return np.nan
+        y_true = test[cat].dropna()
+        y_pred = g.set_index("Date").loc[y_true.index, "Forecast"]
+        if y_true.empty or y_pred.empty:
+            return np.nan
+        return sqrt(mean_squared_error(y_true, y_pred))
+
+    def safe_bias(g):
+        cat = g.name[1]
+        if cat not in test.columns:
+            return np.nan
+        y_true = test[cat].dropna()
+        y_pred = g.set_index("Date").loc[y_true.index, "Forecast"]
+        if y_true.empty or y_pred.empty:
+            return np.nan
+        return np.mean(y_true - y_pred)
+
+    rmse_scores = historical_fc_df.groupby(["Approach", "Category"]).apply(safe_rmse)
+    bias_scores = historical_fc_df.groupby(["Approach", "Category"]).apply(safe_bias)
+
+    # --- Step 5: Pick winner ---
+    if use_backtest_for_future:
+        total_rmse = rmse_scores.xs("Total", level="Category")
+        if selection_mode == "rmse":
+            best_approach = total_rmse.idxmin()
+        elif selection_mode == "multi":
+            rmse_diff = abs(total_rmse["Base"] - total_rmse["Reconciled"])
+            if rmse_diff > 0.05 * min(total_rmse):
+                best_approach = total_rmse.idxmin()
+            else:
+                avg_bias = bias_scores.groupby("Approach").apply(
+                    lambda x: np.nanmean(np.abs(x.drop("Total", errors="ignore")))
+                )
+                best_approach = avg_bias.idxmin()
+        else:
+            raise ValueError("selection_mode must be 'rmse' or 'multi'")
+    else:
+        best_approach = "Reconciled"
+
+    # --- Step 6: Future forecasts ---
+    future_index = pd.date_range(start=wide_df.index[-1] + pd.tseries.frequencies.to_offset(freq),
+                                 periods=horizon, freq=freq)
+
+    results_full = Parallel(n_jobs=n_jobs)(
+        delayed(fit_forecast_selecting_model)(
+            wide_df[node], horizon,
+            window=window, m_grid=m_grid,
+            cv_folds=3, min_train=24, step=1,
+            n_jobs_m=1,
+            arima_kwargs={"max_p":3, "max_q":3, "max_P":1, "max_Q":1}
+        )
+        for node in all_nodes
+    )
+    base_fc = {node: r[0] for node, r in zip(all_nodes, results_full)}
+    base_meta = {node: {"Method": r[1], "Order": r[2], "SeasonalOrder": r[3], "m": r[4]} for node, r in zip(all_nodes, results_full)}
+
+    reconciled_future = {node: [] for node in all_nodes}
+    for t in range(horizon):
+        y_hat = np.array([base_fc["Total"][t]] + [base_fc[c][t] for c in categories])
+        y_rec = reconcile_step(y_hat)
+        for j, node in enumerate(all_nodes):
+            reconciled_future[node].append(y_rec[j])
+
+    future_rows = []
+    for i, date in enumerate(future_index):
+        for node in all_nodes:
+            if best_approach == "Base":
+                future_rows.append({
+                    "Category": node, "Date": date,
+                    "Forecast": base_fc[node][i],
+                    **base_meta[node], "Approach": "Base"
+                })
+            else:
+                future_rows.append({
+                    "Category": node, "Date": date,
+                    "Forecast": reconciled_future[node][i],
+                    **base_meta[node], "Approach": "Reconciled"
+                })
+
+    future_fc_df = pd.DataFrame(future_rows)
+
+    return historical_fc_df, future_fc_df, rmse_scores, bias_scores, best_approach
