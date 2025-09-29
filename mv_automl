@@ -42,8 +42,8 @@ leaderboard = exp.pull()
 
 # Calculate nRMSE
 y_train = exp.get_config('y_train')
-y_range = y_train.max() - y_train.min()
-leaderboard['nRMSE'] = leaderboard['RMSE'] / y_range
+y_range = float(y_train.max() - y_train.min())
+leaderboard['nRMSE'] = leaderboard['RMSE'].astype(float) / y_range
 print("\n=== Model Leaderboard with nRMSE ===")
 print(leaderboard[['Model', 'RMSE', 'nRMSE', 'MAE', 'MAPE']].to_string())
 
@@ -110,7 +110,7 @@ exp_baseline.setup(
 )
 baseline_model = exp_baseline.automl(optimize='RMSE')
 baseline_results = exp_baseline.pull()
-baseline_rmse = baseline_results.iloc[0]['RMSE']
+baseline_rmse = float(baseline_results.iloc[0]['RMSE'])
 baseline_nrmse = baseline_rmse / y_range
 
 print(f"Baseline RMSE (all regressors): {baseline_rmse:.4f}")
@@ -138,7 +138,7 @@ def evaluate_without_regressor(regressor, df, target, all_regressors, fh, y_rang
     
     model_temp = exp_temp.automl(optimize='RMSE')
     results_temp = exp_temp.pull()
-    rmse_temp = results_temp.iloc[0]['RMSE']
+    rmse_temp = float(results_temp.iloc[0]['RMSE'])
     nrmse_temp = rmse_temp / y_range
     
     return rmse_temp, nrmse_temp
@@ -155,16 +155,16 @@ for i, regressor in enumerate(REGRESSORS):
     rmse_without, nrmse_without = results_parallel[i]
     
     if rmse_without is not None:
-        delta_rmse = rmse_without - baseline_rmse
-        delta_nrmse = nrmse_without - baseline_nrmse
+        delta_rmse = float(rmse_without - baseline_rmse)
+        delta_nrmse = float(nrmse_without - baseline_nrmse)
         
         impact_results.append({
             'Regressor': regressor,
-            'RMSE_without': rmse_without,
-            'RMSE_baseline': baseline_rmse,
+            'RMSE_without': float(rmse_without),
+            'RMSE_baseline': float(baseline_rmse),
             'ΔRMSE': delta_rmse,
-            'nRMSE_without': nrmse_without,
-            'nRMSE_baseline': baseline_nrmse,
+            'nRMSE_without': float(nrmse_without),
+            'nRMSE_baseline': float(baseline_nrmse),
             'ΔnRMSE': delta_nrmse
         })
 
