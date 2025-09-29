@@ -5,6 +5,8 @@ from sklearn.neighbors import KNeighborsRegressor
 from sklearn.linear_model import LinearRegression
 from statsmodels.tsa.seasonal import seasonal_decompose
 from sklearn.metrics import mean_squared_error
+from joblib import Parallel, delayed
+import multiprocessing
 
 # ---------- STEP 1: Helper functions ----------
 
@@ -43,17 +45,15 @@ def train_knn_on_resid(df, regressors=['R1','R2'], lags=[1,2,3], n_neighbors=5):
     return model, scaler, features
 
 def forecast_one_month(df, model, scaler, features, lags=[1,2,3]):
-    """Forecast the next single month after df's last date."""
     last_date = df['Date'].max()
     next_date = (last_date + pd.offsets.MonthEnd(1))
 
     new_row = {
         'Date': next_date,
         'Month': next_date.month,
-        'R1': df['R1'].iloc[-1],  # substitute future regressors if available
+        'R1': df['R1'].iloc[-1],
         'R2': df['R2'].iloc[-1],
     }
-
     for lag in lags:
         new_row[f'lag_{lag}'] = df['resid'].iloc[-lag]
 
@@ -61,10 +61,8 @@ def forecast_one_month(df, model, scaler, features, lags=[1,2,3]):
     X_new_scaled = scaler.transform(X_new)
     pred_resid = model.predict(X_new_scaled)[0]
 
-    # Seasonal adjustment
     month_seasonal = df.groupby('Month')['seasonal'].mean().get(next_date.month, 0)
 
-    # Linear trend extrapolation
     trend_model = LinearRegression()
     X_trend = np.arange(len(df)).reshape(-1,1)
     y_trend = df['trend'].values
@@ -72,87 +70,99 @@ def forecast_one_month(df, model, scaler, features, lags=[1,2,3]):
     future_trend = trend_model.predict([[len(df)+1]])[0]
 
     forecast_value = pred_resid + month_seasonal + future_trend
-
     return next_date, forecast_value
 
-# ---------- STEP 2: Walk-forward backtest & tuning ----------
+# ---------- STEP 2: Backtest worker (per neighbor candidate) ----------
 
-def knn_csd_backtest(df, backtest_horizon=3, neighbor_candidates=range(2,16), lags=[1,2,3]):
+def backtest_for_k(df, k, backtest_horizon=3, lags=[1,2,3]):
+    max_index = len(df) - 1
+    preds, actuals, dates = [], [], []
+    backtest_records = []
+
+    for i in range(backtest_horizon, 0, -1):
+        train_end_idx = max_index - i
+        df_train = df.iloc[:train_end_idx+1].copy()
+
+        if len(df_train) < max(lags)+1:
+            continue
+
+        model, scaler, features = train_knn_on_resid(df_train, n_neighbors=k, lags=lags)
+        forecast_date, forecast_value = forecast_one_month(df_train, model, scaler, features, lags=lags)
+
+        actual_row = df[df['Date'] == forecast_date]
+        if actual_row.empty:
+            continue
+
+        actual_value = actual_row['Value'].values[0]
+        preds.append(forecast_value)
+        actuals.append(actual_value)
+        dates.append(forecast_date)
+
+        backtest_records.append({
+            'Date': forecast_date,
+            'Actual': actual_value,
+            'Forecast': forecast_value,
+            'n_neighbors': k
+        })
+
+    rmse = mean_squared_error(actuals, preds, squared=False) if len(actuals) > 0 else np.nan
+    return k, rmse, backtest_records
+
+# ---------- STEP 3: Parallelized backtest & final model ----------
+
+def knn_csd_backtest_parallel(df, backtest_horizon=3, neighbor_candidates=range(2,16), lags=[1,2,3]):
     df = preprocess(df)
     df = deseasonalize_and_detrend(df)
     df = add_lag_features(df, 'resid', lags=lags)
 
-    max_index = len(df) - 1
-    backtest_results = []
+    n_jobs = min(len(neighbor_candidates), multiprocessing.cpu_count())
 
-    for k in neighbor_candidates:
-        preds = []
-        actuals = []
-        dates = []
-
-        for i in range(backtest_horizon, 0, -1):
-            train_end_idx = max_index - i
-            df_train = df.iloc[:train_end_idx+1].copy()
-
-            if len(df_train) < max(lags)+1:
-                continue  # not enough data
-
-            model, scaler, features = train_knn_on_resid(df_train, n_neighbors=k, lags=lags)
-            forecast_date, forecast_value = forecast_one_month(df_train, model, scaler, features, lags=lags)
-
-            actual_row = df[df['Date'] == forecast_date]
-            if actual_row.empty:
-                continue
-
-            actual_value = actual_row['Value'].values[0]
-            preds.append(forecast_value)
-            actuals.append(actual_value)
-            dates.append(forecast_date)
-
-            backtest_results.append({
-                'Date': forecast_date,
-                'Actual': actual_value,
-                'Forecast': forecast_value,
-                'n_neighbors': k
-            })
-
-        # Compute RMSE for this k
-        if len(actuals) > 0:
-            rmse = mean_squared_error(actuals, preds, squared=False)
-        else:
-            rmse = np.nan
-
-        backtest_results.append({
-            'Date': None,
-            'Actual': None,
-            'Forecast': None,
-            'n_neighbors': k,
-            'RMSE': rmse
-        })
-
-    results_df = pd.DataFrame(backtest_results)
-
-    # Separate summary RMSE table
-    rmse_summary = (
-        results_df.dropna(subset=['RMSE'])
-        .groupby('n_neighbors', as_index=False)['RMSE']
-        .mean()
-        .sort_values('RMSE')
+    results = Parallel(n_jobs=n_jobs)(
+        delayed(backtest_for_k)(df, k, backtest_horizon, lags) for k in neighbor_candidates
     )
+
+    # Unpack results
+    backtest_dfs = []
+    summary_records = []
+    for k, rmse, records in results:
+        summary_records.append({'n_neighbors': k, 'RMSE': rmse})
+        backtest_dfs.extend(records)
+
+    backtest_df = pd.DataFrame(backtest_dfs)
+    rmse_summary = pd.DataFrame(summary_records).sort_values('RMSE')
 
     best_k = rmse_summary.iloc[0]['n_neighbors'] if not rmse_summary.empty else None
 
-    return results_df.dropna(subset=['Date']), rmse_summary, best_k
+    # Train final model on full dataset with best_k
+    final_model, final_scaler, final_features = train_knn_on_resid(df, n_neighbors=best_k, lags=lags)
 
-# ---------- STEP 3: Example usage ----------
+    final_artifacts = {
+        'model': final_model,
+        'scaler': final_scaler,
+        'features': final_features,
+        'lags': lags,
+        'best_k': best_k,
+        'deseasonalized_df': df
+    }
+
+    return backtest_df, rmse_summary, final_artifacts
+
+# ---------- STEP 4: Example usage ----------
 
 # df = pd.read_csv("your_timeseries.csv")
-# backtest_df, rmse_summary, best_k = knn_csd_backtest(df, backtest_horizon=3, neighbor_candidates=range(2,16))
+# backtest_df, rmse_summary, final_artifacts = knn_csd_backtest_parallel(
+#     df,
+#     backtest_horizon=6,
+#     neighbor_candidates=range(2,21),
+#     lags=[1,2,3]
+# )
 
-# print("\nBacktest Predictions:")
+# print("\n📊 Backtest Predictions:")
 # print(backtest_df)
 
-# print("\nRMSE Summary:")
+# print("\n📝 RMSE Summary:")
 # print(rmse_summary)
 
-# print(f"\n🏆 Best n_neighbors = {best_k}")
+# print(f"\n🏆 Best n_neighbors = {final_artifacts['best_k']}")
+
+# You can now use `final_artifacts`['model'] to generate future forecasts.
