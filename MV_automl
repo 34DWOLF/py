@@ -1,0 +1,140 @@
+# =======================================
+# STEP 1: Import Libraries
+# =======================================
+import pandas as pd
+from pycaret.time_series import *
+import numpy as np
+
+# =======================================
+# STEP 2: Load & Prepare Data
+# =======================================
+# Example data structure — replace with your actual dataset
+df = pd.DataFrame({
+    'Date': pd.date_range(start='2015-01-01', periods=100, freq='MS'),
+    'A': np.linspace(0, 100, 100),
+    'B': np.linspace(10, 110, 100),
+    'C': np.linspace(5, 105, 100),
+    'D': np.linspace(2, 102, 100),
+    'E': np.linspace(50, 150, 100),
+    'F': np.linspace(80, 180, 100),
+})
+
+# Convert Date to datetime and set as index
+df['Date'] = pd.to_datetime(df['Date'])
+df = df.sort_values('Date').set_index('Date')
+df = df.asfreq('MS')   # Monthly start frequency
+
+# =======================================
+# STEP 3: Define Target & Regressors
+# =======================================
+target_col = 'A'
+regressors = ['B', 'C', 'D', 'E', 'F']
+
+# =======================================
+# STEP 4: Initialize PyCaret Time Series
+# =======================================
+forecast_horizon = 12
+
+exp = TSForecastingExperiment()
+exp.setup(
+    data=df,
+    target=target_col,
+    fh=forecast_horizon,
+    session_id=42,
+    fold_strategy='sliding',
+    numeric_imputation_target='ffill',
+    numeric_imputation_exogenous='ffill',
+    enforce_exogenous=True,
+    exogenous_variables=regressors,
+    verbose=True
+)
+
+# =======================================
+# STEP 5: AutoML Model Comparison
+# =======================================
+best_model = exp.compare_models(sort='RMSE')
+print("\n=== MODEL LEADERBOARD ===")
+print(exp.pull())
+
+# Finalize model for forecasting
+final_model = exp.finalize_model(best_model)
+
+# =======================================
+# STEP 6: Forecast & Plot
+# =======================================
+future_forecast = exp.predict_model(final_model, fh=forecast_horizon)
+print("\n=== FORECAST ===")
+print(future_forecast)
+
+exp.plot_model(final_model, plot='forecast')
+exp.plot_model(final_model, plot='diagnostics')
+
+# =======================================
+# STEP 7: Feature Importance (Model-Based)
+# =======================================
+print("\n=== MODEL-BASED FEATURE IMPORTANCE (if supported) ===")
+try:
+    exp.plot_model(final_model, plot='feature_importances')
+except Exception as e:
+    print("Feature importance plot not supported for this model:", e)
+
+# =======================================
+# STEP 8: Permutation Feature Importance
+# =======================================
+from sklearn.inspection import permutation_importance
+
+# Build training and validation sets
+y_train = exp.get_config('y_train')
+y_test = exp.get_config('y_test')
+X_train = exp.get_config('X_train')
+X_test = exp.get_config('X_test')
+
+model = final_model
+
+print("\n=== PERMUTATION FEATURE IMPORTANCE ===")
+try:
+    r = permutation_importance(
+        model, 
+        X_test, 
+        y_test,
+        n_repeats=20,
+        random_state=42,
+        n_jobs=-1
+    )
+    perm_sorted_idx = r.importances_mean.argsort()[::-1]
+    for idx in perm_sorted_idx:
+        print(f"{X_test.columns[idx]}: {r.importances_mean[idx]:.4f}")
+except Exception as e:
+    print("Permutation importance failed:", e)
+
+# =======================================
+# STEP 9: Leave-One-Regressor-Out Backtesting
+# =======================================
+print("\n=== LEAVE-ONE-REGRESSOR-OUT IMPACT ANALYSIS ===")
+base_rmse = exp.pull().iloc[0]['RMSE']
+impact_summary = []
+
+for reg in regressors:
+    reduced_regs = [r for r in regressors if r != reg]
+    exp2 = TSForecastingExperiment()
+    exp2.setup(
+        data=df,
+        target=target_col,
+        fh=forecast_horizon,
+        session_id=42,
+        fold_strategy='sliding',
+        numeric_imputation_target='ffill',
+        numeric_imputation_exogenous='ffill',
+        enforce_exogenous=True,
+        exogenous_variables=reduced_regs,
+        verbose=False
+    )
+    model2 = exp2.create_model(best_model)
+    tuned2 = exp2.finalize_model(model2)
+    results = exp2.pull().iloc[0]['RMSE']
+    impact = results - base_rmse
+    impact_summary.append((reg, results, impact))
+
+impact_df = pd.DataFrame(impact_summary, columns=['Regressor','RMSE_without','ΔRMSE'])
+impact_df = impact_df.sort_values('ΔRMSE', ascending=False)
+print(impact_df)
