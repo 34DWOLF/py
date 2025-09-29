@@ -309,3 +309,26 @@ def forecast_with_reconciliation(df, horizon=6, train_size=0.8, window=3,
     future_fc_df = pd.DataFrame(future_rows)
 
     return historical_fc_df, future_fc_df, rmse_scores, bias_scores, best_approach
+
+
+
+
+
+
+
+
+hist_fc, fut_fc, rmse, bias, winner = forecast_with_reconciliation(
+    df,
+    horizon=12,
+    n_jobs=-1,
+    freq="MS",
+    m_grid=[1, 6, 12],
+    selection_mode="multi"
+)
+
+print("Winning approach:", winner)
+print("\nSample future forecasts:")
+print(fut_fc.head())
+
+print("\nModel methods used:")
+print(hist_fc[['Category', 'Method']].drop_duplicates().head())
