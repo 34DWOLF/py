@@ -3,7 +3,7 @@
 # =======================================
 import pandas as pd
 import numpy as np
-from pycaret.time_series import *
+from pycaret.time_series import TSForecastingExperiment
 from sklearn.inspection import permutation_importance
 from joblib import Parallel, delayed
 import warnings
@@ -12,7 +12,7 @@ warnings.filterwarnings("ignore")
 # =======================================
 # STEP 2: Load & Prepare Data
 # =======================================
-# Example data — replace with your actual dataset
+# Example dataset — replace with your actual data
 df = pd.DataFrame({
     'Date': pd.date_range(start='2015-01-01', periods=100, freq='MS'),
     'A': np.linspace(0, 100, 100) + np.random.normal(0, 5, 100),
@@ -27,114 +27,41 @@ df['Date'] = pd.to_datetime(df['Date'])
 df = df.sort_values('Date').set_index('Date')
 df = df.asfreq('MS')
 
+# Define target and regressors
 target_col = 'A'
 regressors = ['B', 'C', 'D', 'E', 'F']
 forecast_horizon = 12
-
-# For normalization
 target_mean = df[target_col].mean()
 
+# Separate target and regressor DataFrames
+y_df = df[[target_col]]
+X_df = df[regressors]
+
 # =======================================
-# STEP 3: PyCaret Setup & AutoML
+# STEP 3: Setup PyCaret Time Series
 # =======================================
 exp = TSForecastingExperiment()
 exp.setup(
-    data=df,
-    target=target_col,
+    data=y_df,
+    X=X_df,
     fh=forecast_horizon,
     session_id=42,
     fold_strategy='sliding',
     numeric_imputation_target='ffill',
     numeric_imputation_exogenous='ffill',
     enforce_exogenous=True,
-    exogenous_variables=regressors,
     verbose=True
 )
 
+# =======================================
+# STEP 4: AutoML Model Comparison + nRMSE
+# =======================================
 best_model = exp.compare_models(sort='RMSE')
 leaderboard = exp.pull()
-
-# =======================================
-# STEP 4: Add nRMSE to Leaderboard
-# =======================================
 leaderboard['nRMSE'] = leaderboard['RMSE'] / target_mean
+
 print("\n=== MODEL LEADERBOARD WITH nRMSE ===")
 print(leaderboard[['Model', 'RMSE', 'nRMSE', 'MAE', 'MAPE', 'R2']])
 
-# =======================================
-# STEP 5: Finalize Model & Forecast
-# =======================================
+# Finalize the best model
 final_model = exp.finalize_model(best_model)
-forecast = exp.predict_model(final_model, fh=forecast_horizon)
-print("\n=== FORECAST RESULTS ===")
-print(forecast)
-
-# =======================================
-# STEP 6: Feature Importance (Model-Based)
-# =======================================
-print("\n=== MODEL-BASED FEATURE IMPORTANCE ===")
-try:
-    exp.plot_model(final_model, plot='feature_importances')
-except Exception as e:
-    print("Model-based feature importance not supported:", e)
-
-# =======================================
-# STEP 7: Permutation Importance
-# =======================================
-print("\n=== PERMUTATION FEATURE IMPORTANCE ===")
-try:
-    X_test = exp.get_config('X_test')
-    y_test = exp.get_config('y_test')
-    r = permutation_importance(
-        final_model,
-        X_test,
-        y_test,
-        n_repeats=20,
-        random_state=42,
-        n_jobs=-1
-    )
-    sorted_idx = r.importances_mean.argsort()[::-1]
-    for idx in sorted_idx:
-        print(f"{X_test.columns[idx]}: {r.importances_mean[idx]:.4f}")
-except Exception as e:
-    print("Permutation importance failed:", e)
-
-# =======================================
-# STEP 8: Parallel Leave-One-Regressor-Out Analysis with nRMSE
-# =======================================
-print("\n=== PARALLEL LEAVE-ONE-REGRESSOR-OUT IMPACT ANALYSIS (with nRMSE) ===")
-base_rmse = leaderboard.iloc[0]['RMSE']
-base_nrmse = base_rmse / target_mean
-
-def evaluate_without_regressor(reg):
-    reduced_regs = [r for r in regressors if r != reg]
-    exp_tmp = TSForecastingExperiment()
-    exp_tmp.setup(
-        data=df,
-        target=target_col,
-        fh=forecast_horizon,
-        session_id=42,
-        fold_strategy='sliding',
-        numeric_imputation_target='ffill',
-        numeric_imputation_exogenous='ffill',
-        enforce_exogenous=True,
-        exogenous_variables=reduced_regs,
-        verbose=False
-    )
-    m = exp_tmp.create_model(best_model)
-    exp_tmp.finalize_model(m)
-    rmse = exp_tmp.pull().iloc[0]['RMSE']
-    nrmse = rmse / target_mean
-    return (reg, rmse, rmse - base_rmse, nrmse, nrmse - base_nrmse)
-
-impact_results = Parallel(n_jobs=-1, backend="loky")(
-    delayed(evaluate_without_regressor)(reg) for reg in regressors
-)
-
-impact_df = pd.DataFrame(
-    impact_results,
-    columns=['Regressor', 'RMSE_without', 'ΔRMSE', 'nRMSE_without', 'ΔnRMSE']
-).sort_values('ΔnRMSE', ascending=False)
-
-print("\n=== REGRESSOR IMPACT SUMMARY (with nRMSE) ===")
-print(impact_df)
