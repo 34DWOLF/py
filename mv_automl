@@ -18,9 +18,14 @@ FORECAST_HORIZON = 12
 # df = pd.read_csv('your_data.csv')
 # Example: df with columns ['Date', 'A', 'B', 'C', 'D', 'E', 'F']
 
-# Ensure Date is datetime
+# Ensure Date is datetime and set as index
 df['Date'] = pd.to_datetime(df['Date'])
 df = df.sort_values('Date').reset_index(drop=True)
+df = df.set_index('Date')
+
+# Ensure all columns are numeric
+for col in df.columns:
+    df[col] = pd.to_numeric(df[col], errors='coerce')
 
 # Initialize experiment
 exp = TSForecastingExperiment()
@@ -43,7 +48,7 @@ leaderboard = exp.pull()
 # Calculate nRMSE
 y_train = exp.get_config('y_train')
 y_range = float(y_train.max() - y_train.min())
-leaderboard['nRMSE'] = leaderboard['RMSE'].astype(float) / y_range
+leaderboard['nRMSE'] = pd.to_numeric(leaderboard['RMSE'], errors='coerce') / y_range
 print("\n=== Model Leaderboard with nRMSE ===")
 print(leaderboard[['Model', 'RMSE', 'nRMSE', 'MAE', 'MAPE']].to_string())
 
@@ -110,7 +115,7 @@ exp_baseline.setup(
 )
 baseline_model = exp_baseline.automl(optimize='RMSE')
 baseline_results = exp_baseline.pull()
-baseline_rmse = float(baseline_results.iloc[0]['RMSE'])
+baseline_rmse = float(pd.to_numeric(baseline_results.iloc[0]['RMSE'], errors='coerce'))
 baseline_nrmse = baseline_rmse / y_range
 
 print(f"Baseline RMSE (all regressors): {baseline_rmse:.4f}")
@@ -124,7 +129,7 @@ def evaluate_without_regressor(regressor, df, target, all_regressors, fh, y_rang
         return None, None
     
     # Create df without the excluded regressor
-    df_temp = df[['Date', target] + remaining_regressors].copy()
+    df_temp = df[[target] + remaining_regressors].copy()
     
     exp_temp = TSForecastingExperiment()
     exp_temp.setup(
@@ -138,7 +143,7 @@ def evaluate_without_regressor(regressor, df, target, all_regressors, fh, y_rang
     
     model_temp = exp_temp.automl(optimize='RMSE')
     results_temp = exp_temp.pull()
-    rmse_temp = float(results_temp.iloc[0]['RMSE'])
+    rmse_temp = float(pd.to_numeric(results_temp.iloc[0]['RMSE'], errors='coerce'))
     nrmse_temp = rmse_temp / y_range
     
     return rmse_temp, nrmse_temp
