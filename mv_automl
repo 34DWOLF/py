@@ -1,13 +1,37 @@
-# Separate target and regressor DataFrames
-y_df = df[[target_col]]
-X_df = df[regressors]
+# STEP 1: Imports
+import pandas as pd
+import numpy as np
+from pycaret.time_series import TSForecastingExperiment
+from sklearn.inspection import permutation_importance
+from joblib import Parallel, delayed
+import warnings
+warnings.filterwarnings("ignore")
 
-# STEP 3: Setup PyCaret Time Series
+# STEP 2: Load & Prepare Data
+df = pd.DataFrame({
+    'Date': pd.date_range(start='2015-01-01', periods=100, freq='MS'),
+    'A': np.linspace(0, 100, 100) + np.random.normal(0, 5, 100),
+    'B': np.linspace(10, 110, 100) + np.random.normal(0, 2, 100),
+    'C': np.linspace(5, 105, 100),
+    'D': np.linspace(2, 102, 100),
+    'E': np.linspace(50, 150, 100),
+    'F': np.linspace(80, 180, 100),
+})
 
+df['Date'] = pd.to_datetime(df['Date'])
+df = df.sort_values('Date').set_index('Date')
+df = df.asfreq('MS')
+
+target_col = 'A'
+regressors = ['B', 'C', 'D', 'E', 'F']
+forecast_horizon = 12
+target_mean = df[target_col].mean()
+
+# STEP 3: Setup PyCaret (v3.3.2 syntax)
 exp = TSForecastingExperiment()
 exp.setup(
-    data=y_df,
-    X=X_df,
+    data=df,               # target + regressors together
+    target=target_col,     # specify which column to forecast
     fh=forecast_horizon,
     session_id=42,
     fold_strategy='sliding',
@@ -17,9 +41,7 @@ exp.setup(
     verbose=True
 )
 
-
-# STEP 4: AutoML Model Comparison + nRMSE
-
+# STEP 4: Model Comparison & nRMSE
 best_model = exp.compare_models(sort='RMSE')
 leaderboard = exp.pull()
 leaderboard['nRMSE'] = leaderboard['RMSE'] / target_mean
@@ -27,12 +49,9 @@ leaderboard['nRMSE'] = leaderboard['RMSE'] / target_mean
 print("\nMODEL LEADERBOARD WITH nRMSE")
 print(leaderboard[['Model', 'RMSE', 'nRMSE', 'MAE', 'MAPE', 'R2']])
 
-# Finalize the best model
 final_model = exp.finalize_model(best_model)
 
-
 # STEP 5: Forecast
-
 forecast = exp.predict_model(final_model, fh=forecast_horizon)
 print("\nFORECAST RESULTS")
 print(forecast)
@@ -40,18 +59,14 @@ print(forecast)
 exp.plot_model(final_model, plot='forecast')
 exp.plot_model(final_model, plot='diagnostics')
 
-
 # STEP 6: Feature Importance (Model-Based)
-
 print("\nMODEL-BASED FEATURE IMPORTANCE")
 try:
     exp.plot_model(final_model, plot='feature_importances')
 except Exception as e:
     print("Model-based feature importance not supported:", e)
 
-
 # STEP 7: Permutation Importance
-
 print("\nPERMUTATION FEATURE IMPORTANCE")
 try:
     X_test = exp.get_config('X_test')
@@ -70,22 +85,17 @@ try:
 except Exception as e:
     print("Permutation importance failed:", e)
 
-
 # STEP 8: Parallel Leave-One-Regressor-Out Impact (with nRMSE)
-
 print("\nPARALLEL LEAVE-ONE-REGRESSOR-OUT IMPACT ANALYSIS (with nRMSE)")
 base_rmse = leaderboard.iloc[0]['RMSE']
 base_nrmse = base_rmse / target_mean
 
 def evaluate_without_regressor(reg):
-    reduced_regs = [r for r in regressors if r != reg]
-    y_tmp = df[[target_col]]
-    X_tmp = df[reduced_regs]
-
+    df_reduced = df.drop(columns=[reg])
     exp_tmp = TSForecastingExperiment()
     exp_tmp.setup(
-        data=y_tmp,
-        X=X_tmp,
+        data=df_reduced,
+        target=target_col,
         fh=forecast_horizon,
         session_id=42,
         fold_strategy='sliding',
