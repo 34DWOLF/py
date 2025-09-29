@@ -65,3 +65,85 @@ print(leaderboard[['Model', 'RMSE', 'nRMSE', 'MAE', 'MAPE', 'R2']])
 
 # Finalize the best model
 final_model = exp.finalize_model(best_model)
+
+# =======================================
+# STEP 5: Forecast
+# =======================================
+forecast = exp.predict_model(final_model, fh=forecast_horizon)
+print("\n=== FORECAST RESULTS ===")
+print(forecast)
+
+exp.plot_model(final_model, plot='forecast')
+exp.plot_model(final_model, plot='diagnostics')
+
+# =======================================
+# STEP 6: Feature Importance (Model-Based)
+# =======================================
+print("\n=== MODEL-BASED FEATURE IMPORTANCE ===")
+try:
+    exp.plot_model(final_model, plot='feature_importances')
+except Exception as e:
+    print("Model-based feature importance not supported:", e)
+
+# =======================================
+# STEP 7: Permutation Importance
+# =======================================
+print("\n=== PERMUTATION FEATURE IMPORTANCE ===")
+try:
+    X_test = exp.get_config('X_test')
+    y_test = exp.get_config('y_test')
+    r = permutation_importance(
+        final_model,
+        X_test,
+        y_test,
+        n_repeats=20,
+        random_state=42,
+        n_jobs=-1
+    )
+    sorted_idx = r.importances_mean.argsort()[::-1]
+    for idx in sorted_idx:
+        print(f"{X_test.columns[idx]}: {r.importances_mean[idx]:.4f}")
+except Exception as e:
+    print("Permutation importance failed:", e)
+
+# =======================================
+# STEP 8: Parallel Leave-One-Regressor-Out Impact (with nRMSE)
+# =======================================
+print("\n=== PARALLEL LEAVE-ONE-REGRESSOR-OUT IMPACT ANALYSIS (with nRMSE) ===")
+base_rmse = leaderboard.iloc[0]['RMSE']
+base_nrmse = base_rmse / target_mean
+
+def evaluate_without_regressor(reg):
+    reduced_regs = [r for r in regressors if r != reg]
+    y_tmp = df[[target_col]]
+    X_tmp = df[reduced_regs]
+
+    exp_tmp = TSForecastingExperiment()
+    exp_tmp.setup(
+        data=y_tmp,
+        X=X_tmp,
+        fh=forecast_horizon,
+        session_id=42,
+        fold_strategy='sliding',
+        numeric_imputation_target='ffill',
+        numeric_imputation_exogenous='ffill',
+        enforce_exogenous=True,
+        verbose=False
+    )
+    m = exp_tmp.create_model(best_model)
+    exp_tmp.finalize_model(m)
+    rmse = exp_tmp.pull().iloc[0]['RMSE']
+    nrmse = rmse / target_mean
+    return (reg, rmse, rmse - base_rmse, nrmse, nrmse - base_nrmse)
+
+impact_results = Parallel(n_jobs=-1, backend="loky")(
+    delayed(evaluate_without_regressor)(reg) for reg in regressors
+)
+
+impact_df = pd.DataFrame(
+    impact_results,
+    columns=['Regressor', 'RMSE_without', 'ΔRMSE', 'nRMSE_without', 'ΔnRMSE']
+).sort_values('ΔnRMSE', ascending=False)
+
+print("\n=== REGRESSOR IMPACT SUMMARY (with nRMSE) ===")
+print(impact_df)
