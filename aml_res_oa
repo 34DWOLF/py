@@ -1,0 +1,160 @@
+# ============================================================
+# INSTALL REQUIRED PACKAGES
+# ============================================================
+# Run these once if not installed:
+# !pip install pandas numpy joblib sktime[all_extras] timefms --quiet
+
+# ============================================================
+# IMPORTS
+# ============================================================
+import pandas as pd
+import numpy as np
+from datetime import datetime
+from math import sqrt
+from joblib import Parallel, delayed
+
+# Forecasting models
+from sktime.forecasting.naive import NaiveForecaster
+from sktime.forecasting.croston import Croston
+from sktime.forecasting.statsforecast import StatsForecastAutoARIMA
+from sktime.forecasting.trend import GrandMeanForecaster
+from sktime.forecasting.timefm import TimeFMForecaster
+from sktime.forecasting.base import ForecastingHorizon
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+FORECAST_START = pd.Timestamp("2025-01-31")
+FORECAST_END   = pd.Timestamp("2025-12-31")
+N_JOBS = -1  # number of parallel workers (-1 = use all available CPU cores)
+
+# ============================================================
+# LOAD YOUR DATA
+# ============================================================
+# Replace this demo dataset with your actual one (must have date, value, status)
+dates = pd.date_range("2020-01-31", "2024-12-31", freq="M")
+df = pd.DataFrame({
+    "date": np.tile(dates, 2),
+    "value": np.concatenate([
+        np.random.randint(100, 200, len(dates)),
+        np.random.randint(50, 100, len(dates))
+    ]),
+    "status": ["open"] * len(dates) + ["closed"] * len(dates)
+})
+df = df.sort_values(["status", "date"]).reset_index(drop=True)
+
+# ============================================================
+# DEFINE FORECASTERS
+# ============================================================
+def get_forecasters():
+    return {
+        "NaiveForecaster": NaiveForecaster(strategy="last"),
+        "Croston": Croston(),
+        "GrandMeanForecaster": GrandMeanForecaster(),
+        "AutoARIMA": StatsForecastAutoARIMA(sp=12),
+        "TimeFM": TimeFMForecaster()
+    }
+
+# ============================================================
+# FORECAST FUNCTION (FOR PARALLEL USE)
+# ============================================================
+def forecast_one_model(forecaster, y_train, fh, name, status, current_date):
+    """Fit and predict a single model safely."""
+    try:
+        forecaster.fit(y_train)
+        y_pred = forecaster.predict(fh)
+        forecast_value = float(y_pred.iloc[0])
+    except Exception as e:
+        forecast_value = np.nan
+        print(f"⚠️ {name} failed for {status} at {current_date.date()}: {e}")
+
+    return {
+        "forecast_date": current_date,
+        "status": status,
+        "model": name,
+        "predicted_value": forecast_value
+    }
+
+# ============================================================
+# ITERATIVE FORECAST LOOP (WITH PARALLELIZATION)
+# ============================================================
+results = []
+
+for status, group in df.groupby("status"):
+    group = group.sort_values("date").set_index("date")
+    y = group["value"]
+
+    current_date = FORECAST_START
+
+    while current_date <= FORECAST_END:
+        cutoff = current_date - pd.offsets.MonthEnd(1)
+        y_train = y[y.index <= cutoff]
+        fh = ForecastingHorizon([1], is_relative=True)
+
+        # Skip if insufficient history
+        if len(y_train) < 3:
+            current_date += pd.offsets.MonthEnd(1)
+            continue
+
+        models = get_forecasters()
+
+        # Run all models for this month in parallel
+        month_results = Parallel(n_jobs=N_JOBS)(
+            delayed(forecast_one_model)(m, y_train, fh, name, status, current_date)
+            for name, m in models.items()
+        )
+
+        results.extend(month_results)
+        current_date += pd.offsets.MonthEnd(1)
+
+# ============================================================
+# COMBINE FORECASTS AND ACTUALS
+# ============================================================
+forecast_df = pd.DataFrame(results)
+forecast_df = forecast_df.sort_values(["status", "model", "forecast_date"]).reset_index(drop=True)
+
+# Add actuals from df for 2025
+actuals = df[df["date"].between(FORECAST_START, FORECAST_END)][["date", "status", "value"]]
+actuals.rename(columns={"date": "forecast_date", "value": "actual_value"}, inplace=True)
+
+merged = pd.merge(forecast_df, actuals, on=["forecast_date", "status"], how="left")
+
+# ============================================================
+# METRIC CALCULATIONS
+# ============================================================
+def mean_absolute_error(y_true, y_pred):
+    return np.mean(np.abs(y_true - y_pred))
+
+def rmse(y_true, y_pred):
+    return sqrt(np.mean((y_true - y_pred)**2))
+
+def mean_absolute_percentage_error(y_true, y_pred):
+    y_true, y_pred = np.array(y_true), np.array(y_pred)
+    return np.mean(np.abs((y_true - y_pred) / y_true)) * 100
+
+metrics = []
+for (status, model), g in merged.groupby(["status", "model"]):
+    g = g.dropna(subset=["actual_value", "predicted_value"])
+    if g.empty:
+        continue
+    mae = mean_absolute_error(g["actual_value"], g["predicted_value"])
+    rms = rmse(g["actual_value"], g["predicted_value"])
+    mape = mean_absolute_percentage_error(g["actual_value"], g["predicted_value"])
+    metrics.append({
+        "status": status,
+        "model": model,
+        "MAE": round(mae, 2),
+        "RMSE": round(rms, 2),
+        "MAPE (%)": round(mape, 2)
+    })
+
+metrics_df = pd.DataFrame(metrics).sort_values(["status", "RMSE"]).reset_index(drop=True)
+
+# ============================================================
+# DISPLAY RESULTS
+# ============================================================
+print("\n=== ITERATIVE FORECAST RESULTS (2025) ===\n")
+display(forecast_df.head(20))
+
+print("\n=== MODEL PERFORMANCE (MAE, RMSE, MAPE) ===\n")
+display(metrics_df)
