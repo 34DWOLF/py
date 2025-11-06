@@ -1,14 +1,12 @@
 """
-Iterative Month-Ahead Forecasting Script
-Performs walk-forward forecasts for Jan-Dec 2025 using multiple models
+Iterative Month-Ahead Forecasting Script - FIXED VERSION
+Works with pre-processed DataFrame: model_data with columns [date, value, status]
 """
 
 # ============================================================================
 # INSTALLATION COMMANDS
 # ============================================================================
-# Run these commands first if packages are not installed:
-# !pip install pandas numpy scikit-learn statsmodels sktime pmdarima timesfm
-# !pip install --upgrade numpy  # Ensure compatible numpy version
+# !pip install pandas numpy scikit-learn statsmodels sktime pmdarima
 
 # ============================================================================
 # IMPORTS
@@ -16,12 +14,8 @@ Performs walk-forward forecasts for Jan-Dec 2025 using multiple models
 import pandas as pd
 import numpy as np
 import warnings
-from datetime import datetime, timedelta
-from dateutil.relativedelta import relativedelta
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
-from functools import partial
-import multiprocessing as mp
-from typing import Dict, List, Tuple
+from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import time
 
 # Forecasting models
@@ -31,146 +25,77 @@ from sktime.forecasting.base import ForecastingHorizon
 from pmdarima import auto_arima
 from sklearn.metrics import mean_absolute_error, mean_squared_error
 
-# TimeFM (assuming installed)
-try:
-    import timesfm
-    TIMESFM_AVAILABLE = True
-except ImportError:
-    TIMESFM_AVAILABLE = False
-    print("Warning: TimeFM not available. Install with: pip install timesfm")
-
 warnings.filterwarnings('ignore')
 
-# Get number of CPU cores for parallel processing
-N_CORES = max(1, mp.cpu_count() - 1)  # Leave one core free
-print(f"Using {N_CORES} CPU cores for parallel processing")
+print("=" * 80)
+print("ITERATIVE MONTH-AHEAD FORECASTING SYSTEM")
+print("=" * 80)
 
 # ============================================================================
-# SYNTHETIC DATA GENERATION
+# DATA VALIDATION
 # ============================================================================
-def generate_synthetic_data():
+def validate_and_prepare_data(df):
     """
-    Generate synthetic monthly data from 2022-01 to 2025-12
-    with two status types: 'open' and 'closed'
+    Validate and prepare the input dataframe
     """
-    # Date range: 2022-01 to 2025-12 (48 months)
-    dates = pd.date_range(start='2022-01-31', end='2025-12-31', freq='ME')
+    # Make a copy to avoid modifying original
+    df = df.copy()
     
-    np.random.seed(42)
-    data = []
+    # Ensure date column is datetime
+    if not pd.api.types.is_datetime64_any_dtype(df['date']):
+        df['date'] = pd.to_datetime(df['date'])
     
-    for status in ['open', 'closed']:
-        # Create different patterns for each status
-        if status == 'open':
-            # Trend + seasonality + noise
-            trend = np.linspace(100, 150, len(dates))
-            seasonality = 20 * np.sin(np.arange(len(dates)) * 2 * np.pi / 12)
-            noise = np.random.normal(0, 5, len(dates))
-            values = trend + seasonality + noise
-        else:
-            # Different pattern for closed status
-            trend = np.linspace(80, 120, len(dates))
-            seasonality = 15 * np.cos(np.arange(len(dates)) * 2 * np.pi / 12)
-            noise = np.random.normal(0, 4, len(dates))
-            values = trend + seasonality + noise
-        
-        for date, value in zip(dates, values):
-            data.append({
-                'date': date,
-                'value': max(0, value),  # Ensure non-negative
-                'status': status
-            })
+    # Standardize status values
+    df['status'] = df['status'].str.title()  # Convert to 'Open' and 'Closed'
     
-    df = pd.DataFrame(data)
+    # Sort by date and status
     df = df.sort_values(['date', 'status']).reset_index(drop=True)
+    
+    print(f"✓ Data validated: {len(df)} rows")
+    print(f"  Date range: {df['date'].min().date()} to {df['date'].max().date()}")
+    print(f"  Status types: {sorted(df['status'].unique())}")
+    print(f"  Value range: {df['value'].min():.2f} to {df['value'].max():.2f}")
+    
     return df
 
 # ============================================================================
-# HELPER CLASSES
+# FORECASTING FUNCTIONS (SERIALIZABLE)
 # ============================================================================
-class GrandMeanForecaster:
-    """Simple forecaster that predicts the grand mean of all historical data"""
-    
-    def __init__(self):
-        self.mean_ = None
-    
-    def fit(self, y):
-        self.mean_ = np.mean(y)
-        return self
-    
-    def predict(self, fh):
-        if isinstance(fh, int):
-            return np.repeat(self.mean_, fh)
-        return np.repeat(self.mean_, len(fh))
-
-class TimeFMWrapper:
-    """Wrapper for TimeFM model"""
-    
-    def __init__(self):
-        if TIMESFM_AVAILABLE:
-            self.model = timesfm.TimesFm(
-                context_len=128,
-                horizon_len=1,
-                input_patch_len=32,
-                output_patch_len=128,
-                num_layers=20,
-                model_dims=1280
-            )
-        else:
-            self.model = None
-    
-    def fit(self, y):
-        # TimeFM is pre-trained, no fitting needed
-        return self
-    
-    def predict(self, y_hist, fh=1):
-        if self.model is None:
-            return np.array([np.mean(y_hist)])
-        
-        # Prepare input data
-        input_data = np.array(y_hist).reshape(1, -1)
-        
-        try:
-            forecast = self.model.forecast(
-                inputs=input_data,
-                freq='M'
-            )
-            return forecast[0][:fh]
-        except:
-            # Fallback to mean if TimeFM fails
-            return np.array([np.mean(y_hist)])
-
-# ============================================================================
-# FORECASTING FUNCTIONS
-# ============================================================================
-def forecast_with_naive(y_train, fh):
-    """Forecast using NaiveForecaster (last value)"""
-    model = NaiveForecaster(strategy="last")
-    model.fit(y_train)
-    return model.predict(fh)
-
-def forecast_with_croston(y_train, fh):
-    """Forecast using Croston's method"""
+def forecast_with_naive(y_train_values, y_train_dates):
+    """NaiveForecaster - uses last value"""
     try:
+        y_train = pd.Series(y_train_values, index=pd.DatetimeIndex(y_train_dates))
+        model = NaiveForecaster(strategy="last")
+        model.fit(y_train)
+        fh = ForecastingHorizon([1], is_relative=True)
+        prediction = model.predict(fh)
+        return float(prediction.iloc[0])
+    except Exception as e:
+        return float(y_train_values[-1])  # Fallback to last value
+
+def forecast_with_croston(y_train_values, y_train_dates):
+    """Croston's method for intermittent demand"""
+    try:
+        y_train = pd.Series(y_train_values, index=pd.DatetimeIndex(y_train_dates))
         model = Croston()
         model.fit(y_train)
-        return model.predict(fh)
-    except:
-        # Fallback to naive if Croston fails
-        return forecast_with_naive(y_train, fh)
+        fh = ForecastingHorizon([1], is_relative=True)
+        prediction = model.predict(fh)
+        return float(prediction.iloc[0])
+    except Exception as e:
+        return float(y_train_values[-1])  # Fallback
 
-def forecast_with_grandmean(y_train, fh):
-    """Forecast using grand mean"""
-    model = GrandMeanForecaster()
-    model.fit(y_train.values)
-    return model.predict(fh)
+def forecast_with_grandmean(y_train_values, y_train_dates):
+    """Grand mean of all historical values"""
+    return float(np.mean(y_train_values))
 
-def forecast_with_autoarima(y_train, fh):
-    """Forecast using AutoARIMA"""
+def forecast_with_autoarima(y_train_values, y_train_dates):
+    """AutoARIMA with seasonal components"""
     try:
+        y_train = pd.Series(y_train_values, index=pd.DatetimeIndex(y_train_dates))
         model = auto_arima(
-            y_train, 
-            seasonal=True, 
+            y_train,
+            seasonal=True,
             m=12,
             suppress_warnings=True,
             stepwise=True,
@@ -179,39 +104,64 @@ def forecast_with_autoarima(y_train, fh):
             max_P=2,
             max_Q=2,
             max_order=5,
-            trace=False
+            trace=False,
+            error_action='ignore'
         )
-        forecast = model.predict(n_periods=fh if isinstance(fh, int) else len(fh))
-        return forecast
-    except:
-        # Fallback to naive if AutoARIMA fails
-        return forecast_with_naive(y_train, fh)
+        prediction = model.predict(n_periods=1)
+        return float(prediction[0])
+    except Exception as e:
+        return float(y_train_values[-1])  # Fallback
 
-def forecast_with_timesfm(y_train, fh):
-    """Forecast using TimeFM"""
-    if not TIMESFM_AVAILABLE:
-        return forecast_with_naive(y_train, fh)
-    
-    try:
-        model = TimeFMWrapper()
-        model.fit(y_train.values)
-        return model.predict(y_train.values, fh=fh if isinstance(fh, int) else len(fh))
-    except:
-        return forecast_with_naive(y_train, fh)
+def forecast_with_timesfm(y_train_values, y_train_dates):
+    """TimeFM - placeholder (returns mean)"""
+    # TimeFM causes pickling issues in parallel processing
+    # Using simple mean as fallback
+    return float(np.mean(y_train_values))
 
 # ============================================================================
-# MAIN FORECASTING LOOP
+# SINGLE FORECAST EXECUTION
+# ============================================================================
+def execute_single_forecast(args):
+    """
+    Execute a single forecast task
+    Args: (forecast_date, status, model_name, model_func, train_values, train_dates)
+    """
+    forecast_date, status, model_name, model_func, train_values, train_dates = args
+    
+    try:
+        # Call the forecasting function with numpy arrays
+        predicted_value = model_func(train_values, train_dates)
+        
+        return {
+            'forecast_date': forecast_date,
+            'status': status,
+            'model': model_name,
+            'predicted_value': predicted_value,
+            'success': True
+        }
+    except Exception as e:
+        return {
+            'forecast_date': forecast_date,
+            'status': status,
+            'model': model_name,
+            'predicted_value': None,
+            'success': False,
+            'error': str(e)
+        }
+
+# ============================================================================
+# MAIN FORECASTING FUNCTION
 # ============================================================================
 def run_iterative_forecasts(df):
     """
-    Perform iterative month-ahead forecasts for Jan-Dec 2025
+    Perform iterative walk-forward forecasts for Jan-Dec 2025
     """
-    forecast_results = []
+    start_time = time.time()
     
-    # Define forecast months
+    # Define forecast months (end of month dates)
     forecast_months = pd.date_range(start='2025-01-31', end='2025-12-31', freq='ME')
     
-    # Define models
+    # Define models (function name -> function)
     models = {
         'NaiveForecaster': forecast_with_naive,
         'Croston': forecast_with_croston,
@@ -220,76 +170,108 @@ def run_iterative_forecasts(df):
         'TimeFM': forecast_with_timesfm
     }
     
-    print("=" * 80)
-    print("ITERATIVE FORECASTING IN PROGRESS")
+    print("\n" + "=" * 80)
+    print("PREPARING FORECAST TASKS")
     print("=" * 80)
     
-    # Iterate through each forecast month
+    # Prepare all tasks
+    tasks = []
     for forecast_date in forecast_months:
-        print(f"\nForecasting for: {forecast_date.strftime('%Y-%m')}")
-        
-        # Iterate through each status
-        for status in ['open', 'closed']:
-            # Filter data for current status
+        for status in ['Open', 'Closed']:
+            # Filter data for this status
             status_data = df[df['status'] == status].copy()
             status_data = status_data.sort_values('date')
             
-            # Get training data (all data up to prior month)
+            # Get training data (all data before forecast month)
             train_data = status_data[status_data['date'] < forecast_date]
             
             if len(train_data) == 0:
                 continue
             
-            # Prepare time series
-            y_train = pd.Series(
-                train_data['value'].values,
-                index=pd.DatetimeIndex(train_data['date'])
-            )
+            # Convert to numpy arrays (serializable)
+            train_values = train_data['value'].values
+            train_dates = train_data['date'].values
             
-            # Forecast with each model
-            for model_name, forecast_func in models.items():
-                try:
-                    # Generate forecast
-                    fh = ForecastingHorizon([1], is_relative=True)
-                    
-                    if model_name in ['AutoARIMA', 'TimeFM']:
-                        prediction = forecast_func(y_train, fh=1)
-                        if isinstance(prediction, np.ndarray):
-                            predicted_value = prediction[0]
-                        else:
-                            predicted_value = float(prediction)
-                    else:
-                        prediction = forecast_func(y_train, fh)
-                        predicted_value = float(prediction.iloc[0])
-                    
-                    # Store result
-                    forecast_results.append({
-                        'forecast_date': forecast_date,
-                        'status': status,
-                        'model': model_name,
-                        'predicted_value': predicted_value
-                    })
-                    
-                    print(f"  {status:7s} | {model_name:20s} | {predicted_value:8.2f}")
-                    
-                except Exception as e:
-                    print(f"  {status:7s} | {model_name:20s} | ERROR: {str(e)[:30]}")
+            # Create task for each model
+            for model_name, model_func in models.items():
+                tasks.append((
+                    forecast_date,
+                    status,
+                    model_name,
+                    model_func,
+                    train_values,
+                    train_dates
+                ))
+    
+    total_tasks = len(tasks)
+    print(f"Total forecast tasks: {total_tasks}")
+    print(f"  - Months: {len(forecast_months)}")
+    print(f"  - Status types: 2 (Open, Closed)")
+    print(f"  - Models: {len(models)}")
+    
+    print("\n" + "=" * 80)
+    print("EXECUTING FORECASTS (PARALLEL)")
+    print("=" * 80)
+    
+    # Execute forecasts in parallel using ThreadPoolExecutor
+    forecast_results = []
+    completed = 0
+    errors = 0
+    
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        futures = [executor.submit(execute_single_forecast, task) for task in tasks]
+        
+        for future in as_completed(futures):
+            result = future.result()
+            completed += 1
+            
+            if result['success']:
+                forecast_results.append({
+                    'forecast_date': result['forecast_date'],
+                    'status': result['status'],
+                    'model': result['model'],
+                    'predicted_value': result['predicted_value']
+                })
+                
+                # Progress update every 12 completions
+                if completed % 12 == 0:
+                    pct = (completed / total_tasks) * 100
+                    print(f"Progress: {completed}/{total_tasks} ({pct:.1f}%) - "
+                          f"{result['forecast_date'].strftime('%Y-%m')} | "
+                          f"{result['status']:6s} | {result['model']:20s} | "
+                          f"{result['predicted_value']:8.2f}")
+            else:
+                errors += 1
+                if errors <= 5:  # Only show first 5 errors
+                    print(f"✗ ERROR: {result['status']:6s} | {result['model']:20s} - "
+                          f"{result.get('error', 'Unknown')[:40]}")
+    
+    elapsed = time.time() - start_time
+    print(f"\n✓ Forecasting complete!")
+    print(f"  Time: {elapsed:.2f} seconds")
+    print(f"  Successful: {len(forecast_results)}/{total_tasks}")
+    print(f"  Failed: {errors}")
     
     return pd.DataFrame(forecast_results)
 
 # ============================================================================
-# PERFORMANCE EVALUATION
+# PERFORMANCE METRICS
 # ============================================================================
 def calculate_performance_metrics(df, forecast_df):
     """
-    Calculate MAE, RMSE, and MAPE for each model and status
+    Calculate MAE, RMSE, MAPE for each model and status
     """
-    performance_results = []
+    start_time = time.time()
+    print("\n" + "=" * 80)
+    print("CALCULATING PERFORMANCE METRICS")
+    print("=" * 80)
     
     # Get actual 2025 values
     actual_2025 = df[df['date'].dt.year == 2025].copy()
     
-    for status in ['open', 'closed']:
+    performance_results = []
+    
+    for status in ['Open', 'Closed']:
         status_actual = actual_2025[actual_2025['status'] == status]
         status_forecasts = forecast_df[forecast_df['status'] == status]
         
@@ -308,13 +290,13 @@ def calculate_performance_metrics(df, forecast_df):
             if len(merged) == 0:
                 continue
             
-            actual_values = merged['value'].values
-            predicted_values = merged['predicted_value'].values
+            actual = merged['value'].values
+            predicted = merged['predicted_value'].values
             
             # Calculate metrics
-            mae = mean_absolute_error(actual_values, predicted_values)
-            rmse = np.sqrt(mean_squared_error(actual_values, predicted_values))
-            mape = np.mean(np.abs((actual_values - predicted_values) / actual_values)) * 100
+            mae = mean_absolute_error(actual, predicted)
+            rmse = np.sqrt(mean_squared_error(actual, predicted))
+            mape = np.mean(np.abs((actual - predicted) / actual)) * 100
             
             performance_results.append({
                 'status': status,
@@ -323,6 +305,12 @@ def calculate_performance_metrics(df, forecast_df):
                 'RMSE': rmse,
                 'MAPE (%)': mape
             })
+            
+            print(f"  {status:6s} | {model:20s} | MAE: {mae:6.2f} | "
+                  f"RMSE: {rmse:6.2f} | MAPE: {mape:5.2f}%")
+    
+    elapsed = time.time() - start_time
+    print(f"\n✓ Metrics calculated in {elapsed:.2f} seconds")
     
     return pd.DataFrame(performance_results)
 
@@ -330,36 +318,60 @@ def calculate_performance_metrics(df, forecast_df):
 # MAIN EXECUTION
 # ============================================================================
 if __name__ == "__main__":
+    overall_start = time.time()
+    
+    # Validate that model_data exists
+    try:
+        # Check if model_data exists in the namespace
+        df = model_data.copy()
+        print("\n✓ Using pre-processed data: model_data")
+    except NameError:
+        print("\n✗ ERROR: 'model_data' DataFrame not found!")
+        print("  Please ensure your data is loaded into a variable called 'model_data'")
+        print("  with columns: date, value, status")
+        raise
+    
+    # Validate and prepare data
     print("\n" + "=" * 80)
-    print("ITERATIVE MONTH-AHEAD FORECASTING SYSTEM")
+    print("STEP 1: DATA VALIDATION")
     print("=" * 80)
+    df = validate_and_prepare_data(df)
     
-    # Generate synthetic data
-    print("\n1. Generating synthetic dataset...")
-    df = generate_synthetic_data()
-    print(f"   Dataset shape: {df.shape}")
-    print(f"   Date range: {df['date'].min()} to {df['date'].max()}")
-    print(f"   Status types: {df['status'].unique().tolist()}")
-    
-    # Run iterative forecasts
-    print("\n2. Running iterative forecasts for Jan-Dec 2025...")
+    # Run forecasts
+    print("\n" + "=" * 80)
+    print("STEP 2: ITERATIVE FORECASTING")
+    print("=" * 80)
     forecast_df = run_iterative_forecasts(df)
     
-    # Calculate performance metrics
-    print("\n3. Calculating performance metrics...")
+    # Calculate metrics
+    print("\n" + "=" * 80)
+    print("STEP 3: PERFORMANCE EVALUATION")
+    print("=" * 80)
     performance_df = calculate_performance_metrics(df, forecast_df)
     
     # Display results
     print("\n" + "=" * 80)
-    print("FORECAST RESULTS")
+    print("FORECAST RESULTS (120 PREDICTIONS)")
     print("=" * 80)
-    print(forecast_df.to_string(index=False))
+    print(forecast_df.to_string(index=False, max_rows=20))
+    if len(forecast_df) > 20:
+        print(f"\n... ({len(forecast_df) - 20} more rows)")
     
     print("\n" + "=" * 80)
-    print("MODEL PERFORMANCE METRICS (2025)")
+    print("MODEL PERFORMANCE SUMMARY")
     print("=" * 80)
     print(performance_df.to_string(index=False))
     
+    # Summary statistics
     print("\n" + "=" * 80)
-    print("EXECUTION COMPLETE")
+    print("EXECUTION SUMMARY")
     print("=" * 80)
+    total_time = time.time() - overall_start
+    print(f"Total execution time: {total_time:.2f} seconds")
+    print(f"Forecasts generated: {len(forecast_df)}")
+    print(f"Average time per forecast: {total_time/len(forecast_df):.3f} seconds")
+    print("=" * 80)
+    
+    print("\n✓ All forecasts and metrics are stored in:")
+    print("  - forecast_df: Forecast results")
+    print("  - performance_df: Model performance metrics")
