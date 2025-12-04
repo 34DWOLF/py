@@ -11,7 +11,11 @@ Features:
 - Running total calculation (open issues over time)
 - Per-use-case forecasting
 
-Required packages: pandas, numpy, statsmodels, scikit-learn, joblib, python-dateutil
+Input DataFrame format:
+- Use Case: Category/group name
+- Month: Month-end date (YYYY-MM-DD)
+- Open Count: Number of new issues opened that month
+- Closed Count: Number of issues closed that month
 """
 
 import pandas as pd
@@ -53,7 +57,7 @@ MIN_DATA_POINTS = 12
 # NOTE: Outlier capping is applied ONLY for model training to prevent spikes/drops
 # from overly influencing predictions. All outputs display ORIGINAL values.
 OUTLIER_METHOD = 'iqr'            # 'iqr', 'zscore', or None
-IQR_MULTIPLIER = 1.5              # For IQR method: values outside Q1/Q3 +/- multiplier*IQR
+IQR_MULTIPLIER = 5.0             # For IQR method: values outside Q1/Q3 +/- multiplier*IQR
 ZSCORE_THRESHOLD = 3.0            # For zscore method: values with |z| > threshold
 
 # =============================================================================
@@ -134,7 +138,7 @@ def preprocess_data(df, outlier_method=OUTLIER_METHOD):
     Parameters:
     -----------
     df : pd.DataFrame
-        Input dataframe with columns: ID, Use Case, Reported On, Date Closed-Accepted
+        Input dataframe with columns: Use Case, Month, Open Count, Closed Count
     outlier_method : str or None
         Method for outlier handling: 'iqr', 'zscore', or None
     
@@ -144,9 +148,8 @@ def preprocess_data(df, outlier_method=OUTLIER_METHOD):
     """
     df = df.copy()
     
-    # Ensure date columns are datetime
-    df['Reported On'] = pd.to_datetime(df['Reported On'])
-    df['Date Closed-Accepted'] = pd.to_datetime(df['Date Closed-Accepted'])
+    # Ensure Month column is datetime
+    df['Month'] = pd.to_datetime(df['Month'])
     
     use_cases = df['Use Case'].unique()
     use_case_data = {}
@@ -155,27 +158,12 @@ def preprocess_data(df, outlier_method=OUTLIER_METHOD):
     
     for use_case in use_cases:
         uc_df = df[df['Use Case'] == use_case].copy()
+        uc_df = uc_df.sort_values('Month')
         
-        # Count new issues per month
-        new_issues = uc_df.groupby(pd.Grouper(key='Reported On', freq='M')).size()
-        new_issues.name = 'new_issues'
-        
-        # Count closed issues per month (exclude NaT values)
-        closed_df = uc_df[uc_df['Date Closed-Accepted'].notna()]
-        closed_issues = closed_df.groupby(pd.Grouper(key='Date Closed-Accepted', freq='M')).size()
-        closed_issues.name = 'closed_issues'
-        
-        # Create a complete date range
-        all_dates = pd.date_range(
-            start=min(new_issues.index.min(), closed_issues.index.min() if len(closed_issues) > 0 else new_issues.index.min()),
-            end=max(new_issues.index.max(), closed_issues.index.max() if len(closed_issues) > 0 else new_issues.index.max()),
-            freq='M'
-        )
-        
-        # Create monthly dataframe
-        monthly_df = pd.DataFrame(index=all_dates)
-        monthly_df['new_issues'] = new_issues.reindex(all_dates, fill_value=0)
-        monthly_df['closed_issues'] = closed_issues.reindex(all_dates, fill_value=0)
+        # Create monthly dataframe using the pre-aggregated data
+        monthly_df = pd.DataFrame(index=uc_df['Month'])
+        monthly_df['new_issues'] = uc_df['Open Count'].values
+        monthly_df['closed_issues'] = uc_df['Closed Count'].values
         
         # Store ORIGINAL values before any capping (for display)
         monthly_df['new_issues_original'] = monthly_df['new_issues'].copy()
@@ -383,7 +371,7 @@ def iterative_backtest(series, backtest_months=BACKTEST_DURATION_MONTHS,
     
     # Prepare backtest steps
     backtest_steps = []
-    for i in range(backtest_start_idx, len(series) - 1):
+    for i in range(backtest_start_idx, len(series)):
         backtest_steps.append((series, i, forecast_steps, best_order))
     
     # Run backtests in parallel
@@ -707,7 +695,7 @@ def run_forecast_pipeline(df, forecast_horizon=FORECAST_HORIZON_MONTHS,
     Parameters:
     -----------
     df : pd.DataFrame
-        Input dataframe with columns: ID, Use Case, Reported On, Date Closed-Accepted
+        Input dataframe with columns: Use Case, Month, Open Count, Closed Count
     forecast_horizon : int
         Number of months to forecast
     backtest_months : int
@@ -760,7 +748,7 @@ def run_forecast_pipeline(df, forecast_horizon=FORECAST_HORIZON_MONTHS,
 # EXECUTION
 # =============================================================================
 
-# Assumes df already exists with columns: ID, Use Case, Reported On, Date Closed-Accepted
+# Assumes df already exists with columns: Use Case, Month, Open Count, Closed Count
 
 # Run the forecast pipeline
 forecast_summary, backtest_summary, backtest_predictions, detailed_results = run_forecast_pipeline(
