@@ -1,377 +1,932 @@
 """
-Iterative Month-Ahead Forecasting Script - FIXED VERSION
-Works with pre-processed DataFrame: model_data with columns [date, value, status]
+ARIMA Forecasting Model for Use Case Issues
+============================================
+This script forecasts new issues, closed issues, and running totals
+for each use case using ARIMA models with iterative backtesting.
+
+Features:
+- Configurable forecast horizon and backtest duration
+- Parallel processing for improved performance
+- Iterative backtesting to optimize model parameters
+- Running total calculation (open issues over time)
+- Per-use-case forecasting
+
+Required packages: pandas, numpy, statsmodels, scikit-learn, joblib, python-dateutil
 """
 
-# ============================================================================
-# INSTALLATION COMMANDS
-# ============================================================================
-# !pip install pandas numpy scikit-learn statsmodels sktime pmdarima
-
-# ============================================================================
-# IMPORTS
-# ============================================================================
 import pandas as pd
 import numpy as np
-import warnings
 from datetime import datetime
-from concurrent.futures import ThreadPoolExecutor, as_completed
-import time
-
-# Forecasting models
-from sktime.forecasting.naive import NaiveForecaster
-from sktime.forecasting.croston import Croston
-from sktime.forecasting.base import ForecastingHorizon
-from pmdarima import auto_arima
+from dateutil.relativedelta import relativedelta
+import warnings
+from statsmodels.tsa.arima.model import ARIMA
+from statsmodels.tsa.stattools import adfuller
 from sklearn.metrics import mean_absolute_error, mean_squared_error
+from joblib import Parallel, delayed
+from itertools import product
+import multiprocessing
 
 warnings.filterwarnings('ignore')
 
-print("=" * 80)
-print("ITERATIVE MONTH-AHEAD FORECASTING SYSTEM")
-print("=" * 80)
+# =============================================================================
+# CONFIGURABLE PARAMETERS
+# =============================================================================
 
-# ============================================================================
-# DATA VALIDATION
-# ============================================================================
-def validate_and_prepare_data(df):
+# Forecast horizon in months
+FORECAST_HORIZON_MONTHS = 6
+
+# Backtest duration in months (rolling window)
+BACKTEST_DURATION_MONTHS = 12
+
+# Number of parallel jobs (-1 uses all available cores)
+N_JOBS = -1
+
+# ARIMA parameter search space
+ARIMA_P_RANGE = range(0, 4)  # AR terms
+ARIMA_D_RANGE = range(0, 3)  # Differencing
+ARIMA_Q_RANGE = range(0, 4)  # MA terms
+
+# Minimum data points required for modeling
+MIN_DATA_POINTS = 12
+
+# Outlier handling parameters
+# NOTE: Outlier capping is applied ONLY for model training to prevent spikes/drops
+# from overly influencing predictions. All outputs display ORIGINAL values.
+OUTLIER_METHOD = 'iqr'            # 'iqr', 'zscore', or None
+IQR_MULTIPLIER = 1.5              # For IQR method: values outside Q1/Q3 +/- multiplier*IQR
+ZSCORE_THRESHOLD = 3.0            # For zscore method: values with |z| > threshold
+
+# =============================================================================
+# OUTLIER HANDLING FUNCTIONS
+# =============================================================================
+
+def detect_outliers_iqr(series, multiplier=IQR_MULTIPLIER):
     """
-    Validate and prepare the input dataframe
+    Detect outliers using IQR method.
+    Returns boolean mask where True = outlier.
     """
-    # Make a copy to avoid modifying original
+    q1 = series.quantile(0.25)
+    q3 = series.quantile(0.75)
+    iqr = q3 - q1
+    lower_bound = q1 - multiplier * iqr
+    upper_bound = q3 + multiplier * iqr
+    return (series < lower_bound) | (series > upper_bound), lower_bound, upper_bound
+
+
+def detect_outliers_zscore(series, threshold=ZSCORE_THRESHOLD):
+    """
+    Detect outliers using z-score method.
+    Returns boolean mask where True = outlier.
+    """
+    mean = series.mean()
+    std = series.std()
+    if std == 0:
+        return pd.Series([False] * len(series), index=series.index), mean - threshold, mean + threshold
+    z_scores = (series - mean) / std
+    lower_bound = mean - threshold * std
+    upper_bound = mean + threshold * std
+    return abs(z_scores) > threshold, lower_bound, upper_bound
+
+
+def cap_outliers(series, method=OUTLIER_METHOD, iqr_multiplier=IQR_MULTIPLIER, 
+                 zscore_threshold=ZSCORE_THRESHOLD):
+    """
+    Cap outliers to boundary values.
+    Returns the capped series and a record of adjustments made.
+    """
+    if method is None:
+        return series, []
+    
+    original = series.copy()
+    adjustments = []
+    
+    if method == 'iqr':
+        outlier_mask, lower_bound, upper_bound = detect_outliers_iqr(series, iqr_multiplier)
+    elif method == 'zscore':
+        outlier_mask, lower_bound, upper_bound = detect_outliers_zscore(series, zscore_threshold)
+    else:
+        return series, []
+    
+    # Cap values
+    capped = series.copy()
+    capped = capped.clip(lower=lower_bound, upper=upper_bound)
+    
+    # Record adjustments
+    for idx in series[outlier_mask].index:
+        adjustments.append({
+            'date': idx,
+            'original': original[idx],
+            'capped': capped[idx],
+            'bound': 'lower' if original[idx] < lower_bound else 'upper'
+        })
+    
+    return capped, adjustments
+
+
+# =============================================================================
+# DATA PREPROCESSING FUNCTIONS
+# =============================================================================
+
+def preprocess_data(df, outlier_method=OUTLIER_METHOD):
+    """
+    Preprocess the dataframe to create monthly time series for each use case.
+    
+    Parameters:
+    -----------
+    df : pd.DataFrame
+        Input dataframe with columns: ID, Use Case, Reported On, Date Closed-Accepted
+    outlier_method : str or None
+        Method for outlier handling: 'iqr', 'zscore', or None
+    
+    Returns:
+    --------
+    dict : Dictionary with use case as key and monthly data as value
+    """
     df = df.copy()
     
-    # Ensure date column is datetime
-    if not pd.api.types.is_datetime64_any_dtype(df['date']):
-        df['date'] = pd.to_datetime(df['date'])
+    # Ensure date columns are datetime
+    df['Reported On'] = pd.to_datetime(df['Reported On'])
+    df['Date Closed-Accepted'] = pd.to_datetime(df['Date Closed-Accepted'])
     
-    # Standardize status values
-    df['status'] = df['status'].str.title()  # Convert to 'Open' and 'Closed'
+    use_cases = df['Use Case'].unique()
+    use_case_data = {}
     
-    # Sort by date and status
-    df = df.sort_values(['date', 'status']).reset_index(drop=True)
+    print(f"\n      Outlier handling: {outlier_method if outlier_method else 'disabled'}")
     
-    print(f"✓ Data validated: {len(df)} rows")
-    print(f"  Date range: {df['date'].min().date()} to {df['date'].max().date()}")
-    print(f"  Status types: {sorted(df['status'].unique())}")
-    print(f"  Value range: {df['value'].min():.2f} to {df['value'].max():.2f}")
-    
-    return df
-
-# ============================================================================
-# FORECASTING FUNCTIONS (SERIALIZABLE)
-# ============================================================================
-def forecast_with_naive(y_train_values, y_train_dates):
-    """NaiveForecaster - uses last value"""
-    try:
-        y_train = pd.Series(y_train_values, index=pd.DatetimeIndex(y_train_dates))
-        model = NaiveForecaster(strategy="last")
-        model.fit(y_train)
-        fh = ForecastingHorizon([1], is_relative=True)
-        prediction = model.predict(fh)
-        return float(prediction.iloc[0])
-    except Exception as e:
-        return float(y_train_values[-1])  # Fallback to last value
-
-def forecast_with_croston(y_train_values, y_train_dates):
-    """Croston's method for intermittent demand"""
-    try:
-        y_train = pd.Series(y_train_values, index=pd.DatetimeIndex(y_train_dates))
-        model = Croston()
-        model.fit(y_train)
-        fh = ForecastingHorizon([1], is_relative=True)
-        prediction = model.predict(fh)
-        return float(prediction.iloc[0])
-    except Exception as e:
-        return float(y_train_values[-1])  # Fallback
-
-def forecast_with_grandmean(y_train_values, y_train_dates):
-    """Grand mean of all historical values"""
-    return float(np.mean(y_train_values))
-
-def forecast_with_autoarima(y_train_values, y_train_dates):
-    """AutoARIMA with seasonal components"""
-    try:
-        y_train = pd.Series(y_train_values, index=pd.DatetimeIndex(y_train_dates))
-        model = auto_arima(
-            y_train,
-            seasonal=True,
-            m=12,
-            suppress_warnings=True,
-            stepwise=True,
-            max_p=3,
-            max_q=3,
-            max_P=2,
-            max_Q=2,
-            max_order=5,
-            trace=False,
-            error_action='ignore'
+    for use_case in use_cases:
+        uc_df = df[df['Use Case'] == use_case].copy()
+        
+        # Count new issues per month
+        new_issues = uc_df.groupby(pd.Grouper(key='Reported On', freq='M')).size()
+        new_issues.name = 'new_issues'
+        
+        # Count closed issues per month (exclude NaT values)
+        closed_df = uc_df[uc_df['Date Closed-Accepted'].notna()]
+        closed_issues = closed_df.groupby(pd.Grouper(key='Date Closed-Accepted', freq='M')).size()
+        closed_issues.name = 'closed_issues'
+        
+        # Create a complete date range
+        all_dates = pd.date_range(
+            start=min(new_issues.index.min(), closed_issues.index.min() if len(closed_issues) > 0 else new_issues.index.min()),
+            end=max(new_issues.index.max(), closed_issues.index.max() if len(closed_issues) > 0 else new_issues.index.max()),
+            freq='M'
         )
-        prediction = model.predict(n_periods=1)
-        return float(prediction[0])
-    except Exception as e:
-        return float(y_train_values[-1])  # Fallback
+        
+        # Create monthly dataframe
+        monthly_df = pd.DataFrame(index=all_dates)
+        monthly_df['new_issues'] = new_issues.reindex(all_dates, fill_value=0)
+        monthly_df['closed_issues'] = closed_issues.reindex(all_dates, fill_value=0)
+        
+        # Store ORIGINAL values before any capping (for display)
+        monthly_df['new_issues_original'] = monthly_df['new_issues'].copy()
+        monthly_df['closed_issues_original'] = monthly_df['closed_issues'].copy()
+        
+        # Calculate ORIGINAL net_change and running_total (for display)
+        monthly_df['net_change_original'] = monthly_df['new_issues_original'] - monthly_df['closed_issues_original']
+        monthly_df['running_total_original'] = (
+            monthly_df['new_issues_original'].cumsum() - monthly_df['closed_issues_original'].cumsum()
+        )
+        
+        # Apply outlier capping if enabled (for model training only)
+        if outlier_method and len(monthly_df) > 0:
+            # Cap new_issues
+            capped_new, adjustments_new = cap_outliers(
+                monthly_df['new_issues'], 
+                method=outlier_method
+            )
+            if adjustments_new:
+                print(f"      {use_case} - new_issues outliers capped (for model training):")
+                for adj in adjustments_new:
+                    print(f"        {adj['date'].strftime('%Y-%m-%d')}: {adj['original']:.0f} -> {adj['capped']:.0f}")
+            monthly_df['new_issues'] = capped_new
+            
+            # Cap closed_issues
+            capped_closed, adjustments_closed = cap_outliers(
+                monthly_df['closed_issues'],
+                method=outlier_method
+            )
+            if adjustments_closed:
+                print(f"      {use_case} - closed_issues outliers capped (for model training):")
+                for adj in adjustments_closed:
+                    print(f"        {adj['date'].strftime('%Y-%m-%d')}: {adj['original']:.0f} -> {adj['capped']:.0f}")
+            monthly_df['closed_issues'] = capped_closed
+        
+        # Calculate CAPPED running total and net_change (for model training)
+        monthly_df['cumulative_new'] = monthly_df['new_issues'].cumsum()
+        monthly_df['cumulative_closed'] = monthly_df['closed_issues'].cumsum()
+        monthly_df['running_total'] = monthly_df['cumulative_new'] - monthly_df['cumulative_closed']
+        monthly_df['net_change'] = monthly_df['new_issues'] - monthly_df['closed_issues']
+        
+        # Also cap net_change for model training
+        if outlier_method and len(monthly_df) > 0:
+            capped_net, adjustments_net = cap_outliers(
+                monthly_df['net_change'],
+                method=outlier_method
+            )
+            if adjustments_net:
+                print(f"      {use_case} - net_change outliers capped (for model training):")
+                for adj in adjustments_net:
+                    print(f"        {adj['date'].strftime('%Y-%m-%d')}: {adj['original']:.0f} -> {adj['capped']:.0f}")
+            monthly_df['net_change'] = capped_net
+        
+        use_case_data[use_case] = monthly_df
+    
+    return use_case_data
 
-def forecast_with_timesfm(y_train_values, y_train_dates):
-    """TimeFM - placeholder (returns mean)"""
-    # TimeFM causes pickling issues in parallel processing
-    # Using simple mean as fallback
-    return float(np.mean(y_train_values))
 
-# ============================================================================
-# SINGLE FORECAST EXECUTION
-# ============================================================================
-def execute_single_forecast(args):
+# =============================================================================
+# ARIMA MODEL FUNCTIONS
+# =============================================================================
+
+def check_stationarity(series):
+    """Check if a series is stationary using ADF test."""
+    if len(series) < 8:
+        return False, 1
+    try:
+        result = adfuller(series.dropna(), autolag='AIC')
+        is_stationary = result[1] < 0.05
+        return is_stationary, 0 if is_stationary else 1
+    except:
+        return False, 1
+
+
+def fit_arima_model(series, order):
     """
-    Execute a single forecast task
-    Args: (forecast_date, status, model_name, model_func, train_values, train_dates)
+    Fit an ARIMA model with given order.
+    
+    Returns:
+    --------
+    model_fit or None if fitting fails
     """
-    forecast_date, status, model_name, model_func, train_values, train_dates = args
+    try:
+        model = ARIMA(series, order=order)
+        model_fit = model.fit()
+        return model_fit
+    except:
+        return None
+
+
+def evaluate_arima_order(args):
+    """
+    Evaluate a single ARIMA order configuration.
+    Used for parallel processing.
+    """
+    series, order, train_size = args
+    try:
+        train = series[:train_size]
+        test = series[train_size:]
+        
+        if len(train) < MIN_DATA_POINTS or len(test) == 0:
+            return order, float('inf'), float('inf')
+        
+        model = ARIMA(train, order=order)
+        model_fit = model.fit()
+        
+        # Forecast
+        predictions = model_fit.forecast(steps=len(test))
+        
+        # Calculate metrics
+        mae = mean_absolute_error(test, predictions)
+        rmse = np.sqrt(mean_squared_error(test, predictions))
+        aic = model_fit.aic
+        
+        return order, mae, aic
+    except:
+        return order, float('inf'), float('inf')
+
+
+def find_best_arima_order(series, p_range=ARIMA_P_RANGE, d_range=ARIMA_D_RANGE, 
+                          q_range=ARIMA_Q_RANGE, test_size=3):
+    """
+    Find the best ARIMA order using grid search with parallel processing.
+    """
+    if len(series) < MIN_DATA_POINTS + test_size:
+        return (1, 1, 1)  # Default order
+    
+    train_size = len(series) - test_size
+    orders = list(product(p_range, d_range, q_range))
+    
+    # Prepare arguments for parallel processing
+    args_list = [(series, order, train_size) for order in orders]
+    
+    # Parallel grid search
+    n_jobs = min(N_JOBS if N_JOBS > 0 else multiprocessing.cpu_count(), len(orders))
+    results = Parallel(n_jobs=n_jobs, prefer="threads")(
+        delayed(evaluate_arima_order)(args) for args in args_list
+    )
+    
+    # Find best order based on MAE (primary) and AIC (secondary)
+    valid_results = [(o, m, a) for o, m, a in results if m != float('inf')]
+    
+    if not valid_results:
+        return (1, 1, 1)  # Default order
+    
+    # Sort by MAE, then AIC
+    valid_results.sort(key=lambda x: (x[1], x[2]))
+    best_order = valid_results[0][0]
+    
+    return best_order
+
+
+# =============================================================================
+# BACKTESTING FUNCTIONS
+# =============================================================================
+
+def iterative_backtest_single_step(args):
+    """
+    Perform a single backtest step. Used for parallel processing.
+    """
+    series, train_end_idx, forecast_steps, order = args
     
     try:
-        # Call the forecasting function with numpy arrays
-        predicted_value = model_func(train_values, train_dates)
+        train = series[:train_end_idx]
+        test_end = min(train_end_idx + forecast_steps, len(series))
+        test = series[train_end_idx:test_end]
+        
+        if len(train) < MIN_DATA_POINTS or len(test) == 0:
+            return None
+        
+        model = ARIMA(train, order=order)
+        model_fit = model.fit()
+        
+        predictions = model_fit.forecast(steps=len(test))
         
         return {
-            'forecast_date': forecast_date,
-            'status': status,
-            'model': model_name,
-            'predicted_value': predicted_value,
-            'success': True
+            'train_end_date': series.index[train_end_idx - 1],
+            'actual': test.values,
+            'predicted': predictions.values,
+            'dates': test.index.tolist(),
+            'mae': mean_absolute_error(test, predictions),
+            'rmse': np.sqrt(mean_squared_error(test, predictions))
         }
-    except Exception as e:
-        return {
-            'forecast_date': forecast_date,
-            'status': status,
-            'model': model_name,
-            'predicted_value': None,
-            'success': False,
-            'error': str(e)
-        }
+    except:
+        return None
 
-# ============================================================================
-# MAIN FORECASTING FUNCTION
-# ============================================================================
-def run_iterative_forecasts(df):
+
+def iterative_backtest(series, backtest_months=BACKTEST_DURATION_MONTHS, 
+                       forecast_steps=FORECAST_HORIZON_MONTHS):
     """
-    Perform iterative walk-forward forecasts for Jan-Dec 2025
+    Perform iterative backtesting over a rolling window.
+    
+    This creates multiple train/test splits, finds optimal parameters
+    for each, and evaluates forecast performance.
     """
-    start_time = time.time()
+    if len(series) < MIN_DATA_POINTS + backtest_months:
+        return None, (1, 1, 1)
     
-    # Define forecast months (end of month dates)
-    forecast_months = pd.date_range(start='2025-01-31', end='2025-12-31', freq='ME')
+    # Determine backtest starting point
+    backtest_start_idx = len(series) - backtest_months
     
-    # Define models (function name -> function)
-    models = {
-        'NaiveForecaster': forecast_with_naive,
-        'Croston': forecast_with_croston,
-        'GrandMeanForecaster': forecast_with_grandmean,
-        'AutoARIMA': forecast_with_autoarima,
-        'TimeFM': forecast_with_timesfm
+    # First, find the best order using data before backtest period
+    initial_train = series[:backtest_start_idx]
+    best_order = find_best_arima_order(initial_train)
+    
+    # Prepare backtest steps
+    backtest_steps = []
+    for i in range(backtest_start_idx, len(series) - 1):
+        backtest_steps.append((series, i, forecast_steps, best_order))
+    
+    # Run backtests in parallel
+    n_jobs = min(N_JOBS if N_JOBS > 0 else multiprocessing.cpu_count(), len(backtest_steps))
+    results = Parallel(n_jobs=n_jobs, prefer="threads")(
+        delayed(iterative_backtest_single_step)(args) for args in backtest_steps
+    )
+    
+    # Filter valid results
+    valid_results = [r for r in results if r is not None]
+    
+    if not valid_results:
+        return None, best_order
+    
+    # Aggregate backtest metrics
+    avg_mae = np.mean([r['mae'] for r in valid_results])
+    avg_rmse = np.mean([r['rmse'] for r in valid_results])
+    
+    backtest_summary = {
+        'order': best_order,
+        'n_backtests': len(valid_results),
+        'avg_mae': avg_mae,
+        'avg_rmse': avg_rmse,
+        'detailed_results': valid_results
     }
     
-    print("\n" + "=" * 80)
-    print("PREPARING FORECAST TASKS")
-    print("=" * 80)
-    
-    # Prepare all tasks
-    tasks = []
-    for forecast_date in forecast_months:
-        for status in ['Open', 'Closed']:
-            # Filter data for this status
-            status_data = df[df['status'] == status].copy()
-            status_data = status_data.sort_values('date')
-            
-            # Get training data (all data before forecast month)
-            train_data = status_data[status_data['date'] < forecast_date]
-            
-            if len(train_data) == 0:
-                continue
-            
-            # Convert to numpy arrays (serializable)
-            train_values = train_data['value'].values
-            train_dates = train_data['date'].values
-            
-            # Create task for each model
-            for model_name, model_func in models.items():
-                tasks.append((
-                    forecast_date,
-                    status,
-                    model_name,
-                    model_func,
-                    train_values,
-                    train_dates
-                ))
-    
-    total_tasks = len(tasks)
-    print(f"Total forecast tasks: {total_tasks}")
-    print(f"  - Months: {len(forecast_months)}")
-    print(f"  - Status types: 2 (Open, Closed)")
-    print(f"  - Models: {len(models)}")
-    
-    print("\n" + "=" * 80)
-    print("EXECUTING FORECASTS (PARALLEL)")
-    print("=" * 80)
-    
-    # Execute forecasts in parallel using ThreadPoolExecutor
-    forecast_results = []
-    completed = 0
-    errors = 0
-    
-    with ThreadPoolExecutor(max_workers=8) as executor:
-        futures = [executor.submit(execute_single_forecast, task) for task in tasks]
-        
-        for future in as_completed(futures):
-            result = future.result()
-            completed += 1
-            
-            if result['success']:
-                forecast_results.append({
-                    'forecast_date': result['forecast_date'],
-                    'status': result['status'],
-                    'model': result['model'],
-                    'predicted_value': result['predicted_value']
-                })
-                
-                # Progress update every 12 completions
-                if completed % 12 == 0:
-                    pct = (completed / total_tasks) * 100
-                    print(f"Progress: {completed}/{total_tasks} ({pct:.1f}%) - "
-                          f"{result['forecast_date'].strftime('%Y-%m')} | "
-                          f"{result['status']:6s} | {result['model']:20s} | "
-                          f"{result['predicted_value']:8.2f}")
-            else:
-                errors += 1
-                if errors <= 5:  # Only show first 5 errors
-                    print(f"✗ ERROR: {result['status']:6s} | {result['model']:20s} - "
-                          f"{result.get('error', 'Unknown')[:40]}")
-    
-    elapsed = time.time() - start_time
-    print(f"\n✓ Forecasting complete!")
-    print(f"  Time: {elapsed:.2f} seconds")
-    print(f"  Successful: {len(forecast_results)}/{total_tasks}")
-    print(f"  Failed: {errors}")
-    
-    return pd.DataFrame(forecast_results)
+    return backtest_summary, best_order
 
-# ============================================================================
-# PERFORMANCE METRICS
-# ============================================================================
-def calculate_performance_metrics(df, forecast_df):
-    """
-    Calculate MAE, RMSE, MAPE for each model and status
-    """
-    start_time = time.time()
-    print("\n" + "=" * 80)
-    print("CALCULATING PERFORMANCE METRICS")
-    print("=" * 80)
-    
-    # Get actual 2025 values
-    actual_2025 = df[df['date'].dt.year == 2025].copy()
-    
-    performance_results = []
-    
-    for status in ['Open', 'Closed']:
-        status_actual = actual_2025[actual_2025['status'] == status]
-        status_forecasts = forecast_df[forecast_df['status'] == status]
-        
-        for model in forecast_df['model'].unique():
-            model_forecasts = status_forecasts[status_forecasts['model'] == model]
-            
-            # Merge actual and predicted
-            merged = pd.merge(
-                status_actual[['date', 'value']],
-                model_forecasts[['forecast_date', 'predicted_value']],
-                left_on='date',
-                right_on='forecast_date',
-                how='inner'
-            )
-            
-            if len(merged) == 0:
-                continue
-            
-            actual = merged['value'].values
-            predicted = merged['predicted_value'].values
-            
-            # Calculate metrics
-            mae = mean_absolute_error(actual, predicted)
-            rmse = np.sqrt(mean_squared_error(actual, predicted))
-            mape = np.mean(np.abs((actual - predicted) / actual)) * 100
-            
-            performance_results.append({
-                'status': status,
-                'model': model,
-                'MAE': mae,
-                'RMSE': rmse,
-                'MAPE (%)': mape
-            })
-            
-            print(f"  {status:6s} | {model:20s} | MAE: {mae:6.2f} | "
-                  f"RMSE: {rmse:6.2f} | MAPE: {mape:5.2f}%")
-    
-    elapsed = time.time() - start_time
-    print(f"\n✓ Metrics calculated in {elapsed:.2f} seconds")
-    
-    return pd.DataFrame(performance_results)
 
-# ============================================================================
-# MAIN EXECUTION
-# ============================================================================
-if __name__ == "__main__":
-    overall_start = time.time()
+# =============================================================================
+# FORECASTING FUNCTIONS
+# =============================================================================
+
+def forecast_series(series, order, forecast_horizon=FORECAST_HORIZON_MONTHS):
+    """
+    Generate forecast for a time series.
+    """
+    if len(series) < MIN_DATA_POINTS:
+        return None
     
-    # Validate that model_data exists
     try:
-        # Check if model_data exists in the namespace
-        df = model_data.copy()
-        print("\n✓ Using pre-processed data: model_data")
-    except NameError:
-        print("\n✗ ERROR: 'model_data' DataFrame not found!")
-        print("  Please ensure your data is loaded into a variable called 'model_data'")
-        print("  with columns: date, value, status")
-        raise
+        model = ARIMA(series, order=order)
+        model_fit = model.fit()
+        
+        # Generate forecast
+        forecast = model_fit.forecast(steps=forecast_horizon)
+        
+        # Generate confidence intervals
+        forecast_result = model_fit.get_forecast(steps=forecast_horizon)
+        conf_int = forecast_result.conf_int(alpha=0.05)
+        
+        # Create forecast dates (month end)
+        last_date = series.index[-1]
+        forecast_dates = pd.date_range(
+            start=last_date + relativedelta(months=1),
+            periods=forecast_horizon,
+            freq='M'
+        )
+        
+        forecast_df = pd.DataFrame({
+            'date': forecast_dates,
+            'forecast': forecast.values,
+            'lower_ci': conf_int.iloc[:, 0].values,
+            'upper_ci': conf_int.iloc[:, 1].values
+        })
+        forecast_df.set_index('date', inplace=True)
+        
+        return forecast_df
+    except Exception as e:
+        print(f"Forecast error: {e}")
+        return None
+
+
+def forecast_use_case(use_case, monthly_data, forecast_horizon=FORECAST_HORIZON_MONTHS,
+                      backtest_months=BACKTEST_DURATION_MONTHS):
+    """
+    Forecast new issues, closed issues, and running total for a single use case.
+    Includes backtesting to optimize model parameters.
+    """
+    results = {
+        'use_case': use_case,
+        'historical_data': monthly_data.copy(),
+        'forecasts': {},
+        'backtest_results': {}
+    }
     
-    # Validate and prepare data
-    print("\n" + "=" * 80)
-    print("STEP 1: DATA VALIDATION")
-    print("=" * 80)
-    df = validate_and_prepare_data(df)
+    # Series to forecast
+    series_to_forecast = ['new_issues', 'closed_issues', 'net_change']
     
-    # Run forecasts
-    print("\n" + "=" * 80)
-    print("STEP 2: ITERATIVE FORECASTING")
-    print("=" * 80)
-    forecast_df = run_iterative_forecasts(df)
+    for series_name in series_to_forecast:
+        series = monthly_data[series_name].astype(float)
+        
+        # Perform backtesting
+        backtest_result, best_order = iterative_backtest(
+            series, 
+            backtest_months=backtest_months,
+            forecast_steps=forecast_horizon
+        )
+        
+        results['backtest_results'][series_name] = {
+            'best_order': best_order,
+            'backtest_summary': backtest_result
+        }
+        
+        # Generate forecast
+        forecast_df = forecast_series(series, best_order, forecast_horizon)
+        results['forecasts'][series_name] = forecast_df
     
-    # Calculate metrics
-    print("\n" + "=" * 80)
-    print("STEP 3: PERFORMANCE EVALUATION")
-    print("=" * 80)
-    performance_df = calculate_performance_metrics(df, forecast_df)
+    # Calculate running total forecast
+    # Running total forecast = last running total + cumulative net change forecast
+    if results['forecasts']['net_change'] is not None:
+        last_running_total = monthly_data['running_total'].iloc[-1]
+        net_change_forecast = results['forecasts']['net_change']['forecast'].values
+        
+        # Cumulative sum of net changes
+        cumulative_net_change = np.cumsum(net_change_forecast)
+        running_total_forecast = last_running_total + cumulative_net_change
+        
+        # Ensure running total doesn't go negative
+        running_total_forecast = np.maximum(running_total_forecast, 0)
+        
+        forecast_dates = results['forecasts']['net_change'].index
+        results['forecasts']['running_total'] = pd.DataFrame({
+            'forecast': running_total_forecast,
+            'lower_ci': np.maximum(running_total_forecast * 0.8, 0),  # Simple CI estimate
+            'upper_ci': running_total_forecast * 1.2
+        }, index=forecast_dates)
     
-    # Display results
-    print("\n" + "=" * 80)
-    print("FORECAST RESULTS (120 PREDICTIONS)")
-    print("=" * 80)
-    print(forecast_df.to_string(index=False, max_rows=20))
-    if len(forecast_df) > 20:
-        print(f"\n... ({len(forecast_df) - 20} more rows)")
+    return results
+
+
+def forecast_all_use_cases_parallel(use_case_data, forecast_horizon=FORECAST_HORIZON_MONTHS,
+                                    backtest_months=BACKTEST_DURATION_MONTHS):
+    """
+    Forecast all use cases in parallel.
+    """
+    use_cases = list(use_case_data.keys())
     
-    print("\n" + "=" * 80)
-    print("MODEL PERFORMANCE SUMMARY")
-    print("=" * 80)
-    print(performance_df.to_string(index=False))
+    # Parallel processing of use cases
+    n_jobs = min(N_JOBS if N_JOBS > 0 else multiprocessing.cpu_count(), len(use_cases))
     
-    # Summary statistics
-    print("\n" + "=" * 80)
-    print("EXECUTION SUMMARY")
-    print("=" * 80)
-    total_time = time.time() - overall_start
-    print(f"Total execution time: {total_time:.2f} seconds")
-    print(f"Forecasts generated: {len(forecast_df)}")
-    print(f"Average time per forecast: {total_time/len(forecast_df):.3f} seconds")
-    print("=" * 80)
+    results = Parallel(n_jobs=n_jobs, prefer="threads")(
+        delayed(forecast_use_case)(
+            use_case, 
+            use_case_data[use_case],
+            forecast_horizon,
+            backtest_months
+        ) for use_case in use_cases
+    )
     
-    print("\n✓ All forecasts and metrics are stored in:")
-    print("  - forecast_df: Forecast results")
-    print("  - performance_df: Model performance metrics")
+    # Convert to dictionary
+    forecast_results = {r['use_case']: r for r in results}
+    
+    return forecast_results
+
+
+# =============================================================================
+# OUTPUT FUNCTIONS
+# =============================================================================
+
+def create_forecast_summary(forecast_results):
+    """
+    Create a summary DataFrame of all forecasts with running totals.
+    Uses original (uncapped) values for historical display.
+    """
+    summary_records = []
+    
+    for use_case, result in forecast_results.items():
+        historical = result['historical_data']
+        
+        # Add historical data - use ORIGINAL values for display
+        for date, row in historical.iterrows():
+            # Use original values if available, otherwise use the regular values
+            new_val = row.get('new_issues_original', row['new_issues'])
+            closed_val = row.get('closed_issues_original', row['closed_issues'])
+            net_val = row.get('net_change_original', row['net_change'])
+            running_val = row.get('running_total_original', row['running_total'])
+            
+            summary_records.append({
+                'use_case': use_case,
+                'date': date,
+                'type': 'historical',
+                'new_issues': new_val,
+                'closed_issues': closed_val,
+                'net_change': net_val,
+                'running_total': running_val
+            })
+        
+        # Add forecast data
+        if result['forecasts'].get('new_issues') is not None:
+            forecast_dates = result['forecasts']['new_issues'].index
+            
+            for date in forecast_dates:
+                new_issues = result['forecasts']['new_issues'].loc[date, 'forecast']
+                closed_issues = result['forecasts']['closed_issues'].loc[date, 'forecast']
+                net_change = result['forecasts']['net_change'].loc[date, 'forecast']
+                running_total = result['forecasts']['running_total'].loc[date, 'forecast']
+                
+                summary_records.append({
+                    'use_case': use_case,
+                    'date': date,
+                    'type': 'forecast',
+                    'new_issues': max(0, round(new_issues)),
+                    'closed_issues': max(0, round(closed_issues)),
+                    'net_change': round(net_change),
+                    'running_total': max(0, round(running_total)),
+                    'new_issues_lower': max(0, result['forecasts']['new_issues'].loc[date, 'lower_ci']),
+                    'new_issues_upper': result['forecasts']['new_issues'].loc[date, 'upper_ci'],
+                    'closed_issues_lower': max(0, result['forecasts']['closed_issues'].loc[date, 'lower_ci']),
+                    'closed_issues_upper': result['forecasts']['closed_issues'].loc[date, 'upper_ci'],
+                    'running_total_lower': result['forecasts']['running_total'].loc[date, 'lower_ci'],
+                    'running_total_upper': result['forecasts']['running_total'].loc[date, 'upper_ci']
+                })
+    
+    summary_df = pd.DataFrame(summary_records)
+    summary_df['date'] = pd.to_datetime(summary_df['date'])
+    summary_df.sort_values(['use_case', 'date'], inplace=True)
+    
+    return summary_df
+
+
+def create_backtest_summary(forecast_results):
+    """
+    Create a summary of backtest results for all use cases.
+    """
+    backtest_records = []
+    
+    for use_case, result in forecast_results.items():
+        for series_name, bt_result in result['backtest_results'].items():
+            if bt_result['backtest_summary'] is not None:
+                backtest_records.append({
+                    'use_case': use_case,
+                    'series': series_name,
+                    'best_order_p': bt_result['best_order'][0],
+                    'best_order_d': bt_result['best_order'][1],
+                    'best_order_q': bt_result['best_order'][2],
+                    'n_backtests': bt_result['backtest_summary']['n_backtests'],
+                    'avg_mae': round(bt_result['backtest_summary']['avg_mae'], 3),
+                    'avg_rmse': round(bt_result['backtest_summary']['avg_rmse'], 3)
+                })
+            else:
+                backtest_records.append({
+                    'use_case': use_case,
+                    'series': series_name,
+                    'best_order_p': bt_result['best_order'][0],
+                    'best_order_d': bt_result['best_order'][1],
+                    'best_order_q': bt_result['best_order'][2],
+                    'n_backtests': 0,
+                    'avg_mae': None,
+                    'avg_rmse': None
+                })
+    
+    return pd.DataFrame(backtest_records)
+
+
+def create_backtest_predictions(forecast_results):
+    """
+    Create a detailed DataFrame of backtest predictions vs actual values.
+    Shows historical value, predicted value, and difference for each backtested month.
+    Only includes 1-step ahead predictions for clean comparison.
+    Uses ORIGINAL (uncapped) values for actuals display.
+    """
+    prediction_records = []
+    
+    for use_case, result in forecast_results.items():
+        historical = result['historical_data']
+        
+        for series_name, bt_result in result['backtest_results'].items():
+            if bt_result['backtest_summary'] is not None:
+                detailed = bt_result['backtest_summary'].get('detailed_results', [])
+                
+                # Determine the original column name
+                original_col = f'{series_name}_original'
+                
+                for step in detailed:
+                    dates = step['dates']
+                    preds = step['predicted']
+                    
+                    # Only take the first prediction (1-step ahead)
+                    if len(dates) > 0:
+                        date = dates[0]
+                        pred_val = preds[0]
+                        
+                        # Get ORIGINAL actual value from historical data
+                        if date in historical.index:
+                            if original_col in historical.columns:
+                                actual_val = historical.loc[date, original_col]
+                            else:
+                                actual_val = historical.loc[date, series_name]
+                        else:
+                            actual_val = step['actual'][0]  # fallback to capped
+                        
+                        diff = actual_val - pred_val
+                        
+                        prediction_records.append({
+                            'use_case': use_case,
+                            'series': series_name,
+                            'date': date,
+                            'actual': round(actual_val, 2),
+                            'predicted': round(pred_val, 2),
+                            'difference': round(diff, 2)
+                        })
+    
+    predictions_df = pd.DataFrame(prediction_records)
+    if not predictions_df.empty:
+        predictions_df['date'] = pd.to_datetime(predictions_df['date'])
+        predictions_df.sort_values(['use_case', 'series', 'date'], inplace=True)
+    
+    return predictions_df
+
+
+# =============================================================================
+# MAIN EXECUTION
+# =============================================================================
+
+def run_forecast_pipeline(df, forecast_horizon=FORECAST_HORIZON_MONTHS,
+                          backtest_months=BACKTEST_DURATION_MONTHS):
+    """
+    Main function to run the complete forecasting pipeline.
+    
+    Parameters:
+    -----------
+    df : pd.DataFrame
+        Input dataframe with columns: ID, Use Case, Reported On, Date Closed-Accepted
+    forecast_horizon : int
+        Number of months to forecast
+    backtest_months : int
+        Number of months for iterative backtesting
+    
+    Returns:
+    --------
+    tuple: (forecast_summary_df, backtest_summary_df, backtest_predictions_df, detailed_results)
+    """
+    print(f"Starting ARIMA Forecasting Pipeline")
+    print(f"=" * 50)
+    print(f"Forecast Horizon: {forecast_horizon} months")
+    print(f"Backtest Duration: {backtest_months} months")
+    print(f"Parallel Jobs: {N_JOBS if N_JOBS > 0 else 'all cores'}")
+    print(f"=" * 50)
+    
+    # Step 1: Preprocess data
+    print("\n[1/5] Preprocessing data...")
+    use_case_data = preprocess_data(df)
+    print(f"      Found {len(use_case_data)} use cases")
+    
+    # Step 2: Run forecasts with backtesting (parallel)
+    print("\n[2/5] Running backtests and forecasts (parallel processing)...")
+    forecast_results = forecast_all_use_cases_parallel(
+        use_case_data, 
+        forecast_horizon, 
+        backtest_months
+    )
+    
+    # Step 3: Create summary outputs
+    print("\n[3/5] Creating forecast summary...")
+    forecast_summary = create_forecast_summary(forecast_results)
+    
+    print("\n[4/5] Creating backtest summary...")
+    backtest_summary = create_backtest_summary(forecast_results)
+    
+    print("\n[5/5] Creating backtest predictions...")
+    backtest_predictions = create_backtest_predictions(forecast_results)
+    
+    print("\n" + "=" * 50)
+    print("Pipeline Complete!")
+    print(f"Forecast records: {len(forecast_summary)}")
+    print(f"Backtest summary records: {len(backtest_summary)}")
+    print(f"Backtest prediction records: {len(backtest_predictions)}")
+    
+    return forecast_summary, backtest_summary, backtest_predictions, forecast_results
+
+
+# =============================================================================
+# EXECUTION
+# =============================================================================
+
+# Assumes df already exists with columns: ID, Use Case, Reported On, Date Closed-Accepted
+
+# Run the forecast pipeline
+forecast_summary, backtest_summary, backtest_predictions, detailed_results = run_forecast_pipeline(
+    df,
+    forecast_horizon=FORECAST_HORIZON_MONTHS,
+    backtest_months=BACKTEST_DURATION_MONTHS
+)
+
+# Display results
+print("\n" + "=" * 70)
+print("FORECAST SUMMARY (Last Historical + All Forecasts)")
+print("=" * 70)
+
+for use_case in forecast_summary['use_case'].unique():
+    uc_data = forecast_summary[forecast_summary['use_case'] == use_case]
+    historical = uc_data[uc_data['type'] == 'historical'].tail(3)
+    forecasted = uc_data[uc_data['type'] == 'forecast']
+    
+    print(f"\n{use_case}:")
+    print("-" * 70)
+    combined = pd.concat([historical, forecasted])
+    print(combined[['date', 'type', 'new_issues', 'closed_issues', 'running_total']].to_string(index=False))
+
+print("\n" + "=" * 70)
+print("BACKTEST SUMMARY (Model Performance Metrics)")
+print("=" * 70)
+print(backtest_summary.to_string(index=False))
+
+print("\n" + "=" * 70)
+print("FULL FORECAST DATA (with Backtest Predictions)")
+print("=" * 70)
+
+# Merge backtest predictions into forecast summary
+if not backtest_predictions.empty:
+    # Pivot backtest predictions to wide format
+    bt_pivot = backtest_predictions.pivot_table(
+        index=['use_case', 'date'],
+        columns='series',
+        values=['predicted', 'difference'],
+        aggfunc='first'
+    )
+    # Flatten column names
+    bt_pivot.columns = [f'{col[1]}_{col[0]}' for col in bt_pivot.columns]
+    bt_pivot = bt_pivot.reset_index()
+    
+    # Merge with forecast summary
+    full_data = forecast_summary.merge(
+        bt_pivot,
+        on=['use_case', 'date'],
+        how='left'
+    )
+else:
+    full_data = forecast_summary.copy()
+
+# Display columns in logical order
+display_cols = ['use_case', 'date', 'type', 
+                'new_issues', 'new_issues_predicted', 'new_issues_difference',
+                'closed_issues', 'closed_issues_predicted', 'closed_issues_difference',
+                'running_total']
+
+# Only include columns that exist
+display_cols = [c for c in display_cols if c in full_data.columns]
+print(full_data[display_cols].to_string(index=False))
+
+# =============================================================================
+# FINAL OUTPUT DATAFRAME
+# =============================================================================
+
+print("\n" + "=" * 70)
+print("FINAL OUTPUT")
+print("=" * 70)
+
+# Create final output with correct running total calculation
+final_records = []
+
+for use_case in forecast_summary['use_case'].unique():
+    uc_data = forecast_summary[forecast_summary['use_case'] == use_case].sort_values('date')
+    
+    # Split into historical and forecast
+    hist_data = uc_data[uc_data['type'] == 'historical']
+    fcst_data = uc_data[uc_data['type'] == 'forecast']
+    
+    # Get backtest predictions for this use case
+    if not backtest_predictions.empty:
+        uc_backtest = backtest_predictions[backtest_predictions['use_case'] == use_case]
+    else:
+        uc_backtest = pd.DataFrame()
+    
+    # Add historical rows with their original running totals
+    for _, row in hist_data.iterrows():
+        final_records.append({
+            'Month': row['date'],
+            'Use Case': use_case,
+            'Type': 'Historical',
+            'New Issues': int(row['new_issues']),
+            'Closed Issues': int(row['closed_issues']),
+            'Running Total': int(row['running_total'])
+        })
+    
+    # Add backtest predicted rows
+    if not uc_backtest.empty:
+        # Pivot backtest to get new_issues and closed_issues predictions per date
+        bt_new = uc_backtest[uc_backtest['series'] == 'new_issues'][['date', 'predicted']].copy()
+        bt_new = bt_new.rename(columns={'predicted': 'new_issues_pred'})
+        
+        bt_closed = uc_backtest[uc_backtest['series'] == 'closed_issues'][['date', 'predicted']].copy()
+        bt_closed = bt_closed.rename(columns={'predicted': 'closed_issues_pred'})
+        
+        # Merge predictions
+        bt_merged = bt_new.merge(bt_closed, on='date', how='outer').sort_values('date')
+        
+        # Get the running total base: use the last historical value BEFORE the first backtest date
+        if len(bt_merged) > 0:
+            first_bt_date = bt_merged['date'].min()
+            hist_before_bt = hist_data[hist_data['date'] < first_bt_date]
+            if len(hist_before_bt) > 0:
+                bt_running_total = int(hist_before_bt.iloc[-1]['running_total'])
+            else:
+                bt_running_total = 0
+            
+            # Add backtest predicted rows
+            for _, bt_row in bt_merged.iterrows():
+                new_pred = int(round(bt_row.get('new_issues_pred', 0) or 0))
+                closed_pred = int(round(bt_row.get('closed_issues_pred', 0) or 0))
+                bt_running_total = bt_running_total + new_pred - closed_pred
+                bt_running_total = max(0, bt_running_total)
+                
+                final_records.append({
+                    'Month': bt_row['date'],
+                    'Use Case': use_case,
+                    'Type': 'Predicted',
+                    'New Issues': new_pred,
+                    'Closed Issues': closed_pred,
+                    'Running Total': bt_running_total
+                })
+    
+    # Get last historical running total as base for forecasts
+    if len(hist_data) > 0:
+        last_hist_running_total = int(hist_data.iloc[-1]['running_total'])
+    else:
+        last_hist_running_total = 0
+    
+    # Add forecast rows with running total built from last historical
+    forecast_running_total = last_hist_running_total
+    for _, row in fcst_data.iterrows():
+        new_issues = int(row['new_issues'])
+        closed_issues = int(row['closed_issues'])
+        forecast_running_total = forecast_running_total + new_issues - closed_issues
+        forecast_running_total = max(0, forecast_running_total)  # Don't go negative
+        
+        final_records.append({
+            'Month': row['date'],
+            'Use Case': use_case,
+            'Type': 'Forecast',
+            'New Issues': new_issues,
+            'Closed Issues': closed_issues,
+            'Running Total': forecast_running_total
+        })
+
+# Create final DataFrame
+final_output = pd.DataFrame(final_records)
+final_output['Month'] = pd.to_datetime(final_output['Month']).dt.strftime('%Y-%m-%d')
+
+# Sort by Use Case, Month, then Type (Historical before Predicted before Forecast)
+type_order = {'Historical': 0, 'Predicted': 1, 'Forecast': 2}
+final_output['_type_sort'] = final_output['Type'].map(type_order)
+final_output = final_output.sort_values(['Use Case', 'Month', '_type_sort']).drop(columns=['_type_sort'])
+
+print(final_output.to_string(index=False))
