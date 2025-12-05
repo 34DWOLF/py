@@ -16,6 +16,8 @@ Input DataFrame format:
 - Month: Month-end date (YYYY-MM-DD)
 - Open Count: Number of new issues opened that month
 - Closed Count: Number of issues closed that month
+
+Required packages: pandas, numpy, statsmodels, scikit-learn, joblib, python-dateutil
 """
 
 import pandas as pd
@@ -57,7 +59,7 @@ MIN_DATA_POINTS = 12
 # NOTE: Outlier capping is applied ONLY for model training to prevent spikes/drops
 # from overly influencing predictions. All outputs display ORIGINAL values.
 OUTLIER_METHOD = 'iqr'            # 'iqr', 'zscore', or None
-IQR_MULTIPLIER = 5.0             # For IQR method: values outside Q1/Q3 +/- multiplier*IQR
+IQR_MULTIPLIER = 10              # For IQR method: values outside Q1/Q3 +/- multiplier*IQR
 ZSCORE_THRESHOLD = 3.0            # For zscore method: values with |z| > threshold
 
 # =============================================================================
@@ -339,13 +341,16 @@ def iterative_backtest_single_step(args):
         
         predictions = model_fit.forecast(steps=len(test))
         
+        # Floor predictions at 0 (counts can't be negative)
+        predictions_floored = np.maximum(predictions.values, 0)
+        
         return {
             'train_end_date': series.index[train_end_idx - 1],
             'actual': test.values,
-            'predicted': predictions.values,
+            'predicted': predictions_floored,
             'dates': test.index.tolist(),
-            'mae': mean_absolute_error(test, predictions),
-            'rmse': np.sqrt(mean_squared_error(test, predictions))
+            'mae': mean_absolute_error(test, predictions_floored),
+            'rmse': np.sqrt(mean_squared_error(test, predictions_floored))
         }
     except:
         return None
@@ -431,11 +436,12 @@ def forecast_series(series, order, forecast_horizon=FORECAST_HORIZON_MONTHS):
             freq='M'
         )
         
+        # Floor forecast and confidence intervals at 0 (counts can't be negative)
         forecast_df = pd.DataFrame({
             'date': forecast_dates,
-            'forecast': forecast.values,
-            'lower_ci': conf_int.iloc[:, 0].values,
-            'upper_ci': conf_int.iloc[:, 1].values
+            'forecast': np.maximum(forecast.values, 0),
+            'lower_ci': np.maximum(conf_int.iloc[:, 0].values, 0),
+            'upper_ci': np.maximum(conf_int.iloc[:, 1].values, 0)
         })
         forecast_df.set_index('date', inplace=True)
         
